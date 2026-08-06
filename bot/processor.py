@@ -6,17 +6,18 @@ import math
 from collections import defaultdict
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import Message, User
 
 from .config import Settings
 from .gemini import GeminiRequestError, GeminiService
+from .markdown import FormattedChunk, render_markdown_chunks
 from .media import MediaExtractor
 from .rate_limit import SlidingWindowRateLimiter
 from .scope import build_scope_key
 from .storage import Storage
-from .text_utils import remove_command, split_text, strip_bot_mention
-from .typing_action import keep_typing
+from .text_utils import remove_command, strip_bot_mention
+from .typing_action import show_progress
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +92,7 @@ class MessageProcessor:
                 self._active_tasks[scope_key] = current_task
             try:
                 previous_id = await self.storage.get_interaction_id(scope_key)
-                async with keep_typing(lead):
+                async with show_progress(lead):
                     bundle = await self.media.prepare(
                         bot=self.bot, messages=ordered, user_text=clean_text
                     )
@@ -186,19 +187,32 @@ class MessageProcessor:
         return True
 
     async def reply(self, message: Message, text: str) -> None:
-        chunks = split_text(text, self.settings.reply_chunk_size)
+        chunks = render_markdown_chunks(text, self.settings.reply_chunk_size)
         if not chunks:
-            chunks = ["Gemini не вернул текстовый ответ."]
+            chunks = [FormattedChunk("Gemini не вернул текстовый ответ.")]
         for index, chunk in enumerate(chunks):
+            entities = list(chunk.entities) or None
             while True:
                 try:
                     if index == 0:
-                        await message.reply(chunk, allow_sending_without_reply=True)
+                        await message.reply(
+                            chunk.text,
+                            entities=entities,
+                            allow_sending_without_reply=True,
+                        )
                     else:
-                        await message.answer(chunk)
+                        await message.answer(chunk.text, entities=entities)
                     break
                 except TelegramRetryAfter as exc:
                     await asyncio.sleep(max(0.1, float(exc.retry_after)))
+                except TelegramBadRequest as exc:
+                    if entities is None:
+                        raise
+                    logger.warning(
+                        "Telegram rejected formatted entities; retrying as plain text: %s",
+                        type(exc).__name__,
+                    )
+                    entities = None
             if index + 1 < len(chunks):
                 await asyncio.sleep(0.05)
 
