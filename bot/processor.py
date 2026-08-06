@@ -198,9 +198,10 @@ class MessageProcessor:
         connection = await self.storage.get_business_connection(connection_id)
         if connection is None:
             return True
-        return await self.storage.get_business_auto_reply_enabled(
-            connection.owner_user_id,
-            self.settings.business_auto_reply_enabled,
+        return await self.storage.get_effective_business_auto_reply_enabled(
+            owner_user_id=connection.owner_user_id,
+            chat_id=message.chat.id,
+            global_default=self.settings.business_auto_reply_enabled,
         )
 
     def _is_chat_allowed(self, message: Message) -> bool:

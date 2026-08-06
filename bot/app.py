@@ -89,6 +89,7 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="reset", description="Сбросить контекст"),
         BotCommand(command="cancel", description="Остановить запрос"),
         BotCommand(command="autoreply", description="Business-автоответы on/off"),
+        BotCommand(command="chats", description="Настроить отдельные Business-чаты"),
         BotCommand(command="status", description="Модель и состояние"),
     ]
     group_commands = private_commands + [

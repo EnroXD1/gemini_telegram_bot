@@ -174,6 +174,56 @@ class BusinessStorageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(await processor.can_respond(make_message(text="Вопрос")))
 
+    async def test_selected_business_chat_can_use_monitoring_only_mode(self) -> None:
+        await self.storage.save_business_connection(
+            connection_id="connection-1",
+            owner_user_id=100,
+            owner_chat_id=100,
+            is_enabled=True,
+        )
+        processor = object.__new__(MessageProcessor)
+        processor.storage = self.storage
+        processor.settings = SimpleNamespace(business_auto_reply_enabled=True)
+
+        self.assertTrue(await processor.can_respond(make_message(text="Вопрос")))
+
+        await self.storage.set_business_chat_auto_reply_enabled(100, 200, False)
+
+        self.assertFalse(await processor.can_respond(make_message(text="Вопрос")))
+        self.assertTrue(
+            await self.storage.get_effective_business_auto_reply_enabled(
+                owner_user_id=100,
+                chat_id=201,
+                global_default=True,
+            )
+        )
+
+    async def test_business_chat_list_contains_latest_contact_and_mode(self) -> None:
+        await self.storage.save_business_connection(
+            connection_id="connection-1",
+            owner_user_id=100,
+            owner_chat_id=100,
+            is_enabled=True,
+        )
+        await self.storage.upsert_business_message(
+            BusinessMessageRecord(
+                connection_id="connection-1",
+                chat_id=200,
+                message_id=10,
+                sender_user_id=200,
+                sender_name="Иван",
+                is_incoming=True,
+                content="Привет",
+            )
+        )
+        await self.storage.set_business_chat_auto_reply_enabled(100, 200, False)
+
+        chats = await self.storage.list_business_chats(100)
+
+        self.assertEqual(len(chats), 1)
+        self.assertEqual(chats[0].sender_name, "Иван")
+        self.assertFalse(chats[0].auto_reply_enabled)
+
 
 class BusinessMonitorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -269,6 +319,16 @@ class BusinessMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(welcomed)
         self.assertEqual(len(self.bot.sent_messages), 1)
         self.assertIn("удалил", self.bot.sent_messages[0]["text"])
+
+    async def test_selected_chat_monitoring_only_disables_welcome(self) -> None:
+        await self.storage.set_business_chat_auto_reply_enabled(100, 200, False)
+
+        welcomed = await self.monitor.welcome_contact(
+            make_message(text="Здравствуйте")
+        )
+
+        self.assertFalse(welcomed)
+        self.assertEqual(self.bot.sent_messages, [])
 
 
 if __name__ == "__main__":

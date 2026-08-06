@@ -31,6 +31,14 @@ class BusinessMessageRecord:
     deleted_at: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class BusinessChatRecord:
+    chat_id: int
+    sender_name: str
+    updated_at: int
+    auto_reply_enabled: bool
+
+
 class Storage:
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -106,6 +114,14 @@ class Storage:
                 owner_user_id INTEGER PRIMARY KEY,
                 auto_reply_enabled INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS business_chat_settings (
+                owner_user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                auto_reply_enabled INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(owner_user_id, chat_id)
             );
             """
         )
@@ -369,6 +385,129 @@ class Storage:
                 (owner_user_id, int(enabled), int(time.time())),
             )
             await db.commit()
+
+    async def get_business_chat_auto_reply_enabled(
+        self, owner_user_id: int, chat_id: int, default: bool = True
+    ) -> bool:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT auto_reply_enabled
+                FROM business_chat_settings
+                WHERE owner_user_id = ? AND chat_id = ?
+                """,
+                (owner_user_id, chat_id),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return default if row is None else bool(row["auto_reply_enabled"])
+
+    async def set_business_chat_auto_reply_enabled(
+        self, owner_user_id: int, chat_id: int, enabled: bool
+    ) -> None:
+        db = self._connection()
+        async with self._lock:
+            await db.execute(
+                """
+                INSERT INTO business_chat_settings(
+                    owner_user_id, chat_id, auto_reply_enabled, updated_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(owner_user_id, chat_id) DO UPDATE SET
+                    auto_reply_enabled = excluded.auto_reply_enabled,
+                    updated_at = excluded.updated_at
+                """,
+                (owner_user_id, chat_id, int(enabled), int(time.time())),
+            )
+            await db.commit()
+
+    async def get_effective_business_auto_reply_enabled(
+        self,
+        *,
+        owner_user_id: int,
+        chat_id: int,
+        global_default: bool,
+    ) -> bool:
+        owner_enabled = await self.get_business_auto_reply_enabled(
+            owner_user_id, global_default
+        )
+        if not owner_enabled:
+            return False
+        return await self.get_business_chat_auto_reply_enabled(
+            owner_user_id, chat_id
+        )
+
+    async def is_known_business_chat(self, owner_user_id: int, chat_id: int) -> bool:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT 1
+                FROM business_messages AS message
+                JOIN business_connections AS connection
+                  ON connection.connection_id = message.connection_id
+                WHERE connection.owner_user_id = ?
+                  AND message.chat_id = ?
+                  AND message.is_incoming = 1
+                LIMIT 1
+                """,
+                (owner_user_id, chat_id),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return row is not None
+
+    async def list_business_chats(
+        self, owner_user_id: int, limit: int = 20
+    ) -> list[BusinessChatRecord]:
+        if limit <= 0:
+            return []
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                WITH recent AS (
+                    SELECT
+                        message.chat_id,
+                        message.sender_name,
+                        message.updated_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY message.chat_id
+                            ORDER BY message.updated_at DESC, message.message_id DESC
+                        ) AS position
+                    FROM business_messages AS message
+                    JOIN business_connections AS connection
+                      ON connection.connection_id = message.connection_id
+                    WHERE connection.owner_user_id = ?
+                      AND message.is_incoming = 1
+                )
+                SELECT
+                    recent.chat_id,
+                    recent.sender_name,
+                    recent.updated_at,
+                    COALESCE(setting.auto_reply_enabled, 1) AS auto_reply_enabled
+                FROM recent
+                LEFT JOIN business_chat_settings AS setting
+                  ON setting.owner_user_id = ?
+                 AND setting.chat_id = recent.chat_id
+                WHERE recent.position = 1
+                ORDER BY recent.updated_at DESC
+                LIMIT ?
+                """,
+                (owner_user_id, owner_user_id, limit),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [
+            BusinessChatRecord(
+                chat_id=int(row["chat_id"]),
+                sender_name=str(row["sender_name"]),
+                updated_at=int(row["updated_at"]),
+                auto_reply_enabled=bool(row["auto_reply_enabled"]),
+            )
+            for row in rows
+        ]
 
     async def claim_business_greeting(
         self, *, connection_id: str, chat_id: int

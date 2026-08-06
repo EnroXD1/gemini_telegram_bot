@@ -1,9 +1,16 @@
 from __future__ import annotations
 
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.filters.command import CommandObject
-from aiogram.types import BusinessConnection, BusinessMessagesDeleted, Message
+from aiogram.types import (
+    BusinessConnection,
+    BusinessMessagesDeleted,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from .album import AlbumBuffer
 from .business import BusinessMessageCaptureMiddleware, BusinessMonitor
@@ -60,7 +67,9 @@ def create_router(
             "/reset — начать диалог с чистым контекстом\n"
             "/cancel — остановить текущий запрос\n"
             "/status — показать модель и режим этого чата\n"
-            "/mode mentions|all|off — режим группы (только администратор)\n\n"
+            "/mode mentions|all|off — режим группы (только администратор)\n"
+            "/autoreply on|off — общие Business-автоответы (только владелец)\n"
+            "/chats — режимы отдельных Business-собеседников\n\n"
             "Telegram Business: сохраняю исходный текст входящих сообщений на 30 "
             "дней, уведомляю об изменениях и удалениях и сразу отправляю вам копию "
             "входящих медиа. Секретные чаты обычным ботам недоступны.\n\n"
@@ -190,7 +199,8 @@ def create_router(
                 f"Автоответы в ваших Business-чатах: {state}.\n"
                 "Мониторинг удалений, изменений и сохранение медиа управляются "
                 "отдельно и продолжают работать.\n\n"
-                "Использование: /autoreply on или /autoreply off"
+                "Использование: /autoreply on или /autoreply off\n"
+                "/chats — индивидуальные настройки собеседников"
             )
             return
 
@@ -205,7 +215,8 @@ def create_router(
         await processor.storage.set_business_auto_reply_enabled(user.id, enabled)
         if enabled:
             await message.reply(
-                "Автоответы и приветствие в ваших Business-чатах включены."
+                "Общие Business-автоответы включены. Чаты, которые вы отдельно "
+                "перевели в режим мониторинга через /chats, останутся без ответов."
             )
         else:
             await message.reply(
@@ -213,6 +224,60 @@ def create_router(
                 "собеседникам и отправлять приветствие, но продолжу сохранять "
                 "медиа и уведомлять вас об изменённых и удалённых сообщениях."
             )
+
+    @router.message(Command("chats"))
+    async def business_chats_handler(message: Message) -> None:
+        if message.chat.type != "private":
+            await message.reply(
+                "Список Business-чатов доступен в личном чате с ботом."
+            )
+            return
+        user = message.from_user
+        if user is None or not await _is_business_owner(processor, user.id):
+            await message.reply(
+                "Эта настройка доступна владельцу подключённого Telegram Business."
+            )
+            return
+        text, keyboard = await _business_chats_menu(processor, user.id)
+        await message.reply(text, reply_markup=keyboard)
+
+    @router.callback_query(F.data.startswith("biz_ar:"))
+    async def business_chat_toggle_handler(callback: CallbackQuery) -> None:
+        user = callback.from_user
+        if not await _is_business_owner(processor, user.id):
+            await callback.answer("Недостаточно прав.", show_alert=True)
+            return
+        try:
+            chat_id = int((callback.data or "").removeprefix("biz_ar:"))
+        except ValueError:
+            await callback.answer("Некорректная настройка.", show_alert=True)
+            return
+        if not await processor.storage.is_known_business_chat(user.id, chat_id):
+            await callback.answer("Этот чат больше недоступен.", show_alert=True)
+            return
+
+        global_enabled = await processor.storage.get_business_auto_reply_enabled(
+            user.id, processor.settings.business_auto_reply_enabled
+        )
+        if not global_enabled:
+            await callback.answer(
+                "Сначала включите общие ответы командой /autoreply on.",
+                show_alert=True,
+            )
+            return
+
+        current = await processor.storage.get_business_chat_auto_reply_enabled(
+            user.id, chat_id
+        )
+        enabled = not current
+        await processor.storage.set_business_chat_auto_reply_enabled(
+            user.id, chat_id, enabled
+        )
+        text, keyboard = await _business_chats_menu(processor, user.id)
+        if isinstance(callback.message, Message):
+            await callback.message.edit_text(text, reply_markup=keyboard)
+        state = "автоответы включены" if enabled else "только мониторинг"
+        await callback.answer(state)
 
     @router.message(Command("status"))
     @router.business_message(Command("status"))
@@ -290,3 +355,56 @@ async def _is_business_owner(processor: MessageProcessor, user_id: int) -> bool:
     if user_id in processor.settings.owner_ids:
         return True
     return await processor.storage.is_business_owner(user_id)
+
+
+async def _business_chats_menu(
+    processor: MessageProcessor, owner_user_id: int
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    global_enabled = await processor.storage.get_business_auto_reply_enabled(
+        owner_user_id, processor.settings.business_auto_reply_enabled
+    )
+    chats = await processor.storage.list_business_chats(owner_user_id, limit=20)
+    global_state = "включены" if global_enabled else "выключены для всех чатов"
+    if not chats:
+        return (
+            f"Общие Business-автоответы: {global_state}.\n\n"
+            "Список пока пуст. Он появится после первого входящего сообщения "
+            "в подключённом Business-чате.",
+            None,
+        )
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for chat in chats:
+        if not global_enabled:
+            icon = "⏸"
+            state = "глобально выкл."
+        elif chat.auto_reply_enabled:
+            icon = "✅"
+            state = "отвечает"
+        else:
+            icon = "🔕"
+            state = "мониторинг"
+        name = _truncate_button_text(chat.sender_name, 32)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{icon} {name} — {state}",
+                    callback_data=f"biz_ar:{chat.chat_id}",
+                )
+            ]
+        )
+
+    text = (
+        f"Общие Business-автоответы: {global_state}.\n\n"
+        "Нажмите на собеседника, чтобы переключить его чат.\n"
+        "✅ — автоответы; 🔕 — только мониторинг.\n"
+        "Показаны последние 20 диалогов."
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _truncate_button_text(value: str, limit: int) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1] + "…"
