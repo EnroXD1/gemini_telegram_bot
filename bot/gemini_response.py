@@ -45,3 +45,14 @@ def extract_interaction_text(interaction: Any) -> str:
 def extract_interaction_id(interaction: Any) -> str | None:
     value = _value(interaction, "id")
     return str(value) if value else None
+
+
+def extract_interaction_status(interaction: Any) -> str | None:
+    value = _value(interaction, "status")
+    if value is None:
+        return None
+    enum_value = getattr(value, "value", value)
+    normalized = str(enum_value).strip().lower()
+    if not normalized:
+        return None
+    return normalized.rsplit(".", 1)[-1]

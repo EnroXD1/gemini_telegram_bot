@@ -489,6 +489,65 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
             base64.b64decode(request_input[1]["data"]), b"image-bytes"
         )
 
+    async def test_google_interaction_continues_incomplete_response(self) -> None:
+        service = make_service(
+            [
+                SimpleNamespace(
+                    id="partial-id",
+                    output_text="Первая часть Gemini",
+                    status="incomplete",
+                ),
+                SimpleNamespace(
+                    id="final-id",
+                    output_text="Финал Gemini",
+                    status="completed",
+                ),
+            ]
+        )
+
+        result = await service.generate(PromptBundle(prompt="реши всё"), None)
+
+        self.assertEqual(
+            result.text, "Первая часть Gemini\n\nФинал Gemini"
+        )
+        self.assertEqual(result.interaction_id, "final-id")
+        self.assertFalse(result.truncated)
+        calls = service._client.aio.interactions.calls
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["previous_interaction_id"], "partial-id")
+        self.assertIn("Не повторяй", calls[1]["input"])
+
+    async def test_google_generate_content_continues_max_tokens(self) -> None:
+        service = make_service(
+            [],
+            [
+                SimpleNamespace(
+                    text="Первая часть generateContent",
+                    candidates=[SimpleNamespace(finish_reason="MAX_TOKENS")],
+                ),
+                SimpleNamespace(
+                    text="Финал generateContent",
+                    candidates=[SimpleNamespace(finish_reason="STOP")],
+                ),
+            ],
+        )
+        service._interactions_available = False
+
+        result = await service.generate(PromptBundle(prompt="реши всё"), None)
+
+        self.assertEqual(
+            result.text,
+            "Первая часть generateContent\n\nФинал generateContent",
+        )
+        self.assertFalse(result.truncated)
+        calls = service._client.aio.models.calls
+        self.assertEqual(len(calls), 2)
+        continuation_contents = calls[1]["contents"]
+        self.assertEqual(
+            [content.role for content in continuation_contents],
+            ["user", "model", "user"],
+        )
+
     async def test_expired_context_is_retried_without_previous_id(self) -> None:
         service = make_service(
             [

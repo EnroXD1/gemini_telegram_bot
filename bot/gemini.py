@@ -13,7 +13,11 @@ from google import genai
 from google.genai import types
 
 from .config import Settings
-from .gemini_response import extract_interaction_id, extract_interaction_text
+from .gemini_response import (
+    extract_interaction_id,
+    extract_interaction_status,
+    extract_interaction_text,
+)
 from .models import ConversationMessage, GeminiResult, PromptBundle
 
 logger = logging.getLogger(__name__)
@@ -32,6 +36,7 @@ _INCOMPLETE_FINISH_REASONS = {
     "error",
     "provider_error",
 }
+_INCOMPLETE_INTERACTION_STATUSES = {"incomplete", "budget_exceeded"}
 _CONTINUATION_PROMPT = (
     "Продолжи предыдущий ответ точно с места остановки. Не повторяй уже "
     "написанное и не начинай решение заново. Верни только продолжение. "
@@ -185,7 +190,9 @@ class GeminiService:
                 is_fallback=False,
             )
 
-        request_input = _build_input(bundle)
+        base_request_input = _build_input(bundle)
+        request_input = base_request_input
+        generate_contents = _build_generate_content(bundle)
         current_previous_id = (
             previous_interaction_id
             if self._settings.gemini_store_interactions
@@ -194,6 +201,9 @@ class GeminiService:
         context_was_reset = bool(
             previous_interaction_id and not self._settings.gemini_store_interactions
         )
+        combined_text = ""
+        continuation_count = 0
+        interaction_id: str | None = None
         attempt = 0
 
         async with self._semaphore:
@@ -225,10 +235,14 @@ class GeminiService:
                                 if self._settings.gemini_store_interactions
                                 else None
                             )
+                            finish_reason = extract_interaction_status(interaction)
+                            truncated = (
+                                finish_reason in _INCOMPLETE_INTERACTION_STATUSES
+                            )
                         else:
                             response = await self._client.aio.models.generate_content(
                                 model=self._model,
-                                contents=_build_generate_content(bundle),
+                                contents=generate_contents,
                                 config=types.GenerateContentConfig(
                                     system_instruction=(
                                         self._settings.gemini_system_prompt
@@ -241,21 +255,74 @@ class GeminiService:
                             )
                             text = str(getattr(response, "text", "") or "").strip()
                             interaction_id = None
+                            finish_reason = _extract_google_finish_reason(response)
+                            truncated = _needs_continuation(finish_reason)
 
                     if not text:
                         raise GeminiRequestError(
                             "Gemini обработал запрос, но не вернул текстовый ответ. "
                             "Попробуйте переформулировать сообщение."
                         )
+                    combined_text = _merge_continuation(combined_text, text)
+                    logger.info(
+                        "Gemini completion model=%s finish_reason=%s "
+                        "continuation=%s",
+                        self._model,
+                        finish_reason,
+                        continuation_count,
+                    )
+                    if truncated and continuation_count < _max_continuations(
+                        self._settings
+                    ):
+                        continuation_count += 1
+                        if self._interactions_available:
+                            if interaction_id:
+                                current_previous_id = interaction_id
+                                request_input = _CONTINUATION_PROMPT
+                            else:
+                                current_previous_id = None
+                                request_input = _standalone_continuation_input(
+                                    combined_text
+                                )
+                        else:
+                            generate_contents = _build_generate_content_continuation(
+                                bundle, combined_text
+                            )
+                        attempt = 0
+                        logger.info(
+                            "Continuing truncated Gemini response part=%s",
+                            continuation_count + 1,
+                        )
+                        continue
                     return GeminiResult(
-                        text=text,
+                        text=_finish_text(combined_text, truncated),
                         interaction_id=interaction_id,
                         context_was_reset=context_was_reset,
                         provider="google",
+                        truncated=truncated,
                     )
                 except GeminiRequestError:
+                    if combined_text:
+                        return GeminiResult(
+                            text=_finish_text(combined_text, True),
+                            interaction_id=interaction_id,
+                            context_was_reset=context_was_reset,
+                            provider="google",
+                            truncated=True,
+                        )
                     raise
                 except TimeoutError as exc:
+                    if combined_text:
+                        logger.warning(
+                            "Gemini continuation timed out after partial response"
+                        )
+                        return GeminiResult(
+                            text=_finish_text(combined_text, True),
+                            interaction_id=interaction_id,
+                            context_was_reset=context_was_reset,
+                            provider="google",
+                            truncated=True,
+                        )
                     raise GeminiRequestError(
                         "Gemini не успел ответить за отведённое время. "
                         "Попробуйте ещё раз или отправьте файл меньшего размера."
@@ -272,12 +339,21 @@ class GeminiService:
                         context_was_reset = context_was_reset or bool(
                             previous_interaction_id
                         )
+                        if combined_text:
+                            generate_contents = _build_generate_content_continuation(
+                                bundle, combined_text
+                            )
                         attempt = 0
                         continue
                     if current_previous_id and _is_expired_context_error(exc, code):
                         logger.info("Gemini conversation context expired; starting a new one")
                         current_previous_id = None
                         context_was_reset = True
+                        request_input = (
+                            _standalone_continuation_input(combined_text)
+                            if combined_text
+                            else base_request_input
+                        )
                         continue
 
                     attempt += 1
@@ -300,6 +376,14 @@ class GeminiService:
                         code,
                         type(exc).__name__,
                     )
+                    if combined_text:
+                        return GeminiResult(
+                            text=_finish_text(combined_text, True),
+                            interaction_id=interaction_id,
+                            context_was_reset=context_was_reset,
+                            provider="google",
+                            truncated=True,
+                        )
                     raise GeminiRequestError(_friendly_error(code)) from exc
 
     async def _generate_openrouter(
@@ -672,6 +756,49 @@ def _build_generate_content(bundle: PromptBundle) -> str | list[types.Part]:
     return parts
 
 
+def _build_generate_content_continuation(
+    bundle: PromptBundle, combined_text: str
+) -> list[types.Content]:
+    original = _build_generate_content(bundle)
+    user_parts = (
+        [types.Part.from_text(text=original)]
+        if isinstance(original, str)
+        else original
+    )
+    return [
+        types.Content(role="user", parts=user_parts),
+        types.Content(
+            role="model",
+            parts=[types.Part.from_text(text=combined_text)],
+        ),
+        types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=_CONTINUATION_PROMPT)],
+        ),
+    ]
+
+
+def _standalone_continuation_input(combined_text: str) -> str:
+    return (
+        "Ниже приведена уже полученная часть ответа. Продолжи её строго с места "
+        "остановки.\n\n"
+        f"{combined_text}\n\n{_CONTINUATION_PROMPT}"
+    )
+
+
+def _extract_google_finish_reason(response: object) -> str | None:
+    candidates = _field(response, "candidates", []) or []
+    if not isinstance(candidates, (list, tuple)) or not candidates:
+        return None
+    return _optional_string(_field(candidates[0], "finish_reason"))
+
+
+def _field(obj: object, name: str, default: object = None) -> object:
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
 def _build_openrouter_content(bundle: PromptBundle) -> str | list[dict[str, Any]]:
     if not bundle.media:
         return bundle.prompt
@@ -782,16 +909,18 @@ def _extract_chat_completion(payload: dict[str, Any]) -> _ChatCompletion:
 
 
 def _optional_string(value: object) -> str | None:
-    if not isinstance(value, str):
+    if value is None:
         return None
-    normalized = value.strip()
+    enum_value = getattr(value, "value", value)
+    normalized = str(enum_value).strip()
     return normalized or None
 
 
 def _needs_continuation(finish_reason: str | None) -> bool:
     if finish_reason is None:
         return False
-    return finish_reason.strip().lower() in _INCOMPLETE_FINISH_REASONS
+    normalized = finish_reason.strip().lower().rsplit(".", 1)[-1]
+    return normalized in _INCOMPLETE_FINISH_REASONS
 
 
 def _max_continuations(settings: object) -> int:

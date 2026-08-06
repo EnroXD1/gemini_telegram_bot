@@ -1,7 +1,11 @@
 import unittest
 from types import SimpleNamespace
 
-from bot.gemini_response import extract_interaction_id, extract_interaction_text
+from bot.gemini_response import (
+    extract_interaction_id,
+    extract_interaction_status,
+    extract_interaction_text,
+)
 
 
 class GeminiResponseTests(unittest.TestCase):
@@ -29,6 +33,13 @@ class GeminiResponseTests(unittest.TestCase):
     def test_empty_response(self) -> None:
         self.assertEqual(extract_interaction_text({"steps": []}), "")
         self.assertIsNone(extract_interaction_id({}))
+
+    def test_interaction_status_is_normalized(self) -> None:
+        self.assertEqual(
+            extract_interaction_status({"status": "INCOMPLETE"}),
+            "incomplete",
+        )
+        self.assertIsNone(extract_interaction_status({}))
 
 
 if __name__ == "__main__":
