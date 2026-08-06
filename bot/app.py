@@ -55,6 +55,11 @@ async def run_bot(settings: Settings) -> None:
         )
         monitor = BusinessMonitor(bot=bot, settings=settings, storage=storage)
         dispatcher.include_router(create_router(processor, albums, monitor, usage))
+        media_removed = await monitor.prune_archived_media(
+            settings.business_message_retention_days
+        )
+        if media_removed:
+            logger.info("Pruned %s expired business media archives", media_removed)
         removed = await storage.prune_business_messages(
             settings.business_message_retention_days
         )

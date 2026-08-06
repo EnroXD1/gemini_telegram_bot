@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import logging
+import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from aiogram import Bot
@@ -21,6 +24,7 @@ from aiogram.types import (
 from .config import Settings
 from .storage import (
     BusinessConnectionRecord,
+    BusinessMediaArchiveRecord,
     BusinessMessageRecord,
     Storage,
 )
@@ -65,6 +69,7 @@ class BusinessMonitor:
         self.settings = settings
         self.storage = storage
         self._chat_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._archive_root = settings.database_path.parent / "business_media"
 
     async def handle_connection(self, connection: BusinessConnection) -> None:
         await self.storage.save_business_connection(
@@ -91,13 +96,15 @@ class BusinessMonitor:
             return
 
         record = _record_from_message(message, connection)
+        attachment = archive_attachment_from_message(message)
         async with self._chat_locks[_chat_key(connection_id, message.chat.id)]:
             await self.storage.upsert_business_message(record)
-        if not record.is_incoming or not self.settings.business_archive_media:
-            return
-        attachment = archive_attachment_from_message(message)
-        if attachment is not None:
-            await self._archive_attachment(message, connection, attachment)
+            if (
+                record.is_incoming
+                and self.settings.business_archive_media
+                and attachment is not None
+            ):
+                await self._archive_attachment(message, connection, attachment)
 
     async def welcome_contact(self, message: Message) -> bool:
         """Send the configured disclosure once to each Business interlocutor."""
@@ -196,30 +203,55 @@ class BusinessMonitor:
                 chat_id=event.chat.id,
                 message_ids=event.message_ids,
             )
-        delivered = 0
-        for record in records:
-            if not record.is_incoming or record.deleted_at is not None:
-                continue
-            text = (
-                f"🗑 {record.sender_name} удалил(а) сообщение.\n\n"
-                f"Удалённое содержимое:\n{record.content}"
+            archives = await self.storage.get_business_media_archives(
+                connection_id=event.business_connection_id,
+                chat_id=event.chat.id,
+                message_ids=event.message_ids,
             )
-            if await self._send_notification(connection.owner_chat_id, text):
-                delivered += 1
-                await self.storage.mark_business_message_deleted(
-                    connection_id=record.connection_id,
-                    chat_id=record.chat_id,
-                    message_id=record.message_id,
+            archive_by_message_id = {archive.message_id: archive for archive in archives}
+            delivered = 0
+            for record in records:
+                if not record.is_incoming or record.deleted_at is not None:
+                    continue
+                archive = archive_by_message_id.get(record.message_id)
+                media_delivered = False
+                if archive is not None:
+                    media_delivered = await self._send_deleted_media(
+                        chat_id=connection.owner_chat_id,
+                        record=record,
+                        archive=archive,
+                    )
+                    if media_delivered:
+                        await self._remove_archived_media(archive)
+
+                notification_delivered = False
+                if not media_delivered:
+                    notification_delivered = await self._send_notification(
+                        connection.owner_chat_id,
+                        _deleted_message_text(record),
+                    )
+                if media_delivered or notification_delivered:
+                    delivered += 1
+                    await self.storage.mark_business_message_deleted(
+                        connection_id=record.connection_id,
+                        chat_id=record.chat_id,
+                        message_id=record.message_id,
+                    )
+
+            known_ids = {record.message_id for record in records}
+            missing_ids = [item for item in event.message_ids if item not in known_ids]
+            if missing_ids and delivered == 0:
+                await self._send_notification(
+                    connection.owner_chat_id,
+                    "🗑 Telegram сообщил об удалении сообщения в Business-чате, но "
+                    "автор и исходная версия неизвестны (бот мог быть выключен).",
                 )
 
-        known_ids = {record.message_id for record in records}
-        missing_ids = [item for item in event.message_ids if item not in known_ids]
-        if missing_ids and delivered == 0:
-            await self._send_notification(
-                connection.owner_chat_id,
-                "🗑 Telegram сообщил об удалении сообщения в Business-чате, но "
-                "автор и исходная версия неизвестны (бот мог быть выключен).",
-            )
+    async def prune_archived_media(self, retention_days: int) -> int:
+        archives = await self.storage.pop_expired_business_media_archives(retention_days)
+        for archive in archives:
+            await self._unlink_archive_file(archive)
+        return len(archives)
 
     async def _resolve_connection(
         self, connection_id: str
@@ -252,10 +284,13 @@ class BusinessMonitor:
     ) -> None:
         limit = self.settings.business_archive_max_bytes
         if attachment.file_size is not None and attachment.file_size > limit:
-            await self._send_notification(
-                connection.owner_chat_id,
-                f"⚠️ Не удалось сохранить {_kind_label(attachment.kind)} от "
-                f"{_sender_name(message)}: размер превышает {_human_size(limit)}.",
+            logger.info(
+                "Skipping oversized business media chat_id=%s message_id=%s "
+                "size=%s limit=%s",
+                message.chat.id,
+                message.message_id,
+                attachment.file_size,
+                limit,
             )
             return
 
@@ -267,23 +302,56 @@ class BusinessMonitor:
             )
             data = destination.getvalue()
             if len(data) > limit:
-                await self._send_notification(
-                    connection.owner_chat_id,
-                    f"⚠️ Не удалось сохранить {_kind_label(attachment.kind)} от "
-                    f"{_sender_name(message)}: размер превышает {_human_size(limit)}.",
+                logger.info(
+                    "Skipping oversized downloaded business media chat_id=%s "
+                    "message_id=%s size=%s limit=%s",
+                    message.chat.id,
+                    message.message_id,
+                    len(data),
+                    limit,
                 )
                 return
-            await self._send_archived_media(
-                chat_id=connection.owner_chat_id,
-                message=message,
-                attachment=attachment,
-                data=data,
+            relative_path = _archive_relative_path(
+                connection.connection_id,
+                message.chat.id,
+                message.message_id,
+                attachment.file_name,
+            )
+            archive_path = self._resolve_archive_path(relative_path)
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = archive_path.with_name(f"{archive_path.name}.part")
+            try:
+                await asyncio.to_thread(temporary_path.write_bytes, data)
+                await asyncio.to_thread(temporary_path.replace, archive_path)
+            finally:
+                if temporary_path.exists():
+                    await asyncio.to_thread(temporary_path.unlink)
+
+            previous = await self.storage.upsert_business_media_archive(
+                BusinessMediaArchiveRecord(
+                    connection_id=connection.connection_id,
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    kind=attachment.kind,
+                    file_name=_safe_file_name(attachment.file_name),
+                    file_path=relative_path,
+                    file_size=len(data),
+                    created_at=int(time.time()),
+                )
+            )
+            if previous is not None and previous.file_path != relative_path:
+                await self._unlink_archive_file(previous)
+            logger.info(
+                "Archived business media silently chat_id=%s message_id=%s kind=%s",
+                message.chat.id,
+                message.message_id,
+                attachment.kind,
             )
         except TimeoutError:
-            await self._send_notification(
-                connection.owner_chat_id,
-                f"⚠️ Не удалось вовремя скачать {_kind_label(attachment.kind)} от "
-                f"{_sender_name(message)}.",
+            logger.warning(
+                "Timed out archiving business media chat_id=%s message_id=%s",
+                message.chat.id,
+                message.message_id,
             )
         except Exception as exc:
             logger.warning(
@@ -292,39 +360,72 @@ class BusinessMonitor:
                 message.message_id,
                 type(exc).__name__,
             )
-            await self._send_notification(
-                connection.owner_chat_id,
-                f"⚠️ Telegram не позволил сохранить {_kind_label(attachment.kind)} "
-                f"от {_sender_name(message)}.",
-            )
 
-    async def _send_archived_media(
+    async def _send_deleted_media(
         self,
         *,
         chat_id: int,
-        message: Message,
-        attachment: ArchiveAttachment,
-        data: bytes,
-    ) -> None:
-        caption = _archive_caption(message, attachment.kind)
-        upload = BufferedInputFile(data, filename=_safe_file_name(attachment.file_name))
-        if attachment.kind == "photo":
-            await self.bot.send_photo(chat_id=chat_id, photo=upload, caption=caption)
-        elif attachment.kind == "video":
-            await self.bot.send_video(chat_id=chat_id, video=upload, caption=caption)
-        elif attachment.kind == "voice":
-            await self.bot.send_voice(chat_id=chat_id, voice=upload, caption=caption)
-        elif attachment.kind == "video_note":
-            await self.bot.send_message(chat_id=chat_id, text=caption)
-            await self.bot.send_video_note(chat_id=chat_id, video_note=upload)
-        elif attachment.kind == "animation":
-            await self.bot.send_animation(
-                chat_id=chat_id, animation=upload, caption=caption
+        record: BusinessMessageRecord,
+        archive: BusinessMediaArchiveRecord,
+    ) -> bool:
+        try:
+            archive_path = self._resolve_archive_path(archive.file_path)
+            data = await asyncio.to_thread(archive_path.read_bytes)
+            upload = BufferedInputFile(data, filename=archive.file_name)
+            caption = _deleted_media_caption(record, archive.kind)
+            if archive.kind == "photo":
+                await self.bot.send_photo(chat_id=chat_id, photo=upload, caption=caption)
+            elif archive.kind == "video":
+                await self.bot.send_video(chat_id=chat_id, video=upload, caption=caption)
+            elif archive.kind == "voice":
+                await self.bot.send_voice(chat_id=chat_id, voice=upload, caption=caption)
+            elif archive.kind == "video_note":
+                await self.bot.send_video_note(chat_id=chat_id, video_note=upload)
+                await self._send_notification(chat_id, caption)
+            elif archive.kind == "animation":
+                await self.bot.send_animation(
+                    chat_id=chat_id, animation=upload, caption=caption
+                )
+            elif archive.kind == "audio":
+                await self.bot.send_audio(chat_id=chat_id, audio=upload, caption=caption)
+            else:
+                await self.bot.send_document(chat_id=chat_id, document=upload, caption=caption)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Could not deliver deleted business media chat_id=%s message_id=%s: %s",
+                record.chat_id,
+                record.message_id,
+                type(exc).__name__,
             )
-        elif attachment.kind == "audio":
-            await self.bot.send_audio(chat_id=chat_id, audio=upload, caption=caption)
-        else:
-            await self.bot.send_document(chat_id=chat_id, document=upload, caption=caption)
+            return False
+
+    async def _remove_archived_media(self, archive: BusinessMediaArchiveRecord) -> None:
+        await self._unlink_archive_file(archive)
+        await self.storage.delete_business_media_archive(
+            connection_id=archive.connection_id,
+            chat_id=archive.chat_id,
+            message_id=archive.message_id,
+        )
+
+    async def _unlink_archive_file(self, archive: BusinessMediaArchiveRecord) -> None:
+        try:
+            archive_path = self._resolve_archive_path(archive.file_path)
+            await asyncio.to_thread(archive_path.unlink, missing_ok=True)
+        except Exception as exc:
+            logger.warning(
+                "Could not remove archived media chat_id=%s message_id=%s: %s",
+                archive.chat_id,
+                archive.message_id,
+                type(exc).__name__,
+            )
+
+    def _resolve_archive_path(self, relative_path: str) -> Path:
+        archive_root = self._archive_root.resolve()
+        archive_path = (archive_root / relative_path).resolve()
+        if archive_path != archive_root and archive_root not in archive_path.parents:
+            raise ValueError("Unsafe business archive path")
+        return archive_path
 
     async def _send_notification(self, chat_id: int, text: str) -> bool:
         try:
@@ -433,19 +534,31 @@ def _message_content(
     return "\n".join(parts)
 
 
-def _archive_caption(message: Message, kind: str) -> str:
-    chat_label = message.chat.title or getattr(message.chat, "full_name", None)
-    if not chat_label:
-        chat_label = str(message.chat.id)
-    caption = (
-        f"⏳ Сохранено: {_kind_label(kind)}\n"
-        f"От: {_sender_name(message)}\n"
-        f"Чат: {chat_label}"
+def _deleted_message_text(record: BusinessMessageRecord) -> str:
+    return (
+        f"🗑 {record.sender_name} удалил(а) сообщение.\n\n"
+        f"Удалённое содержимое:\n{record.content}"
     )
-    original_caption = (message.caption or "").strip()
-    if original_caption:
-        caption += f"\n\nПодпись:\n{original_caption}"
-    return _truncate(caption, 1024)
+
+
+def _deleted_media_caption(record: BusinessMessageRecord, kind: str) -> str:
+    return _truncate(
+        f"🗑 {record.sender_name} удалил(а) {_kind_label(kind)}.\n"
+        f"Чат: {record.chat_id}\n\n"
+        f"Удалённое содержимое:\n{record.content}",
+        1024,
+    )
+
+
+def _archive_relative_path(
+    connection_id: str,
+    chat_id: int,
+    message_id: int,
+    file_name: str,
+) -> str:
+    connection_key = hashlib.sha256(connection_id.encode("utf-8")).hexdigest()[:16]
+    suffix = Path(_safe_file_name(file_name)).suffix[:16] or ".bin"
+    return str(Path(connection_key) / str(chat_id) / f"{message_id}{suffix}")
 
 
 def _sender_name(message: Message) -> str:
@@ -485,12 +598,3 @@ def _truncate(value: str, limit: int) -> str:
         return value
     suffix = "\n…"
     return value[: limit - len(suffix)] + suffix
-
-
-def _human_size(value: int) -> str:
-    size = float(value)
-    for unit in ("Б", "КБ", "МБ", "ГБ"):
-        if size < 1024 or unit == "ГБ":
-            return f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{value} Б"

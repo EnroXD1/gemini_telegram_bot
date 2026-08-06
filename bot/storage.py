@@ -32,6 +32,18 @@ class BusinessMessageRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class BusinessMediaArchiveRecord:
+    connection_id: str
+    chat_id: int
+    message_id: int
+    kind: str
+    file_name: str
+    file_path: str
+    file_size: int
+    created_at: int
+
+
+@dataclass(frozen=True, slots=True)
 class BusinessChatRecord:
     chat_id: int
     sender_name: str
@@ -134,6 +146,22 @@ class Storage:
 
             CREATE INDEX IF NOT EXISTS idx_business_messages_updated_at
             ON business_messages(updated_at);
+
+            CREATE TABLE IF NOT EXISTS business_media_archives (
+                connection_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(connection_id, chat_id, message_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_business_media_archives_updated_at
+            ON business_media_archives(updated_at);
 
             CREATE TABLE IF NOT EXISTS business_greetings (
                 connection_id TEXT NOT NULL,
@@ -917,6 +945,137 @@ class Storage:
         order = {message_id: index for index, message_id in enumerate(message_ids)}
         return sorted(records, key=lambda item: order.get(item.message_id, len(order)))
 
+    async def get_business_media_archive(
+        self, *, connection_id: str, chat_id: int, message_id: int
+    ) -> BusinessMediaArchiveRecord | None:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT connection_id, chat_id, message_id, kind, file_name,
+                       file_path, file_size, created_at
+                FROM business_media_archives
+                WHERE connection_id = ? AND chat_id = ? AND message_id = ?
+                """,
+                (connection_id, chat_id, message_id),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return None if row is None else _business_media_archive_from_row(row)
+
+    async def get_business_media_archives(
+        self,
+        *,
+        connection_id: str,
+        chat_id: int,
+        message_ids: list[int],
+    ) -> list[BusinessMediaArchiveRecord]:
+        if not message_ids:
+            return []
+        db = self._connection()
+        placeholders = ", ".join("?" for _ in message_ids)
+        query = f"""
+            SELECT connection_id, chat_id, message_id, kind, file_name,
+                   file_path, file_size, created_at
+            FROM business_media_archives
+            WHERE connection_id = ? AND chat_id = ?
+              AND message_id IN ({placeholders})
+        """
+        parameters = (connection_id, chat_id, *message_ids)
+        async with self._lock:
+            cursor = await db.execute(query, parameters)
+            rows = await cursor.fetchall()
+            await cursor.close()
+        archives = [_business_media_archive_from_row(row) for row in rows]
+        order = {message_id: index for index, message_id in enumerate(message_ids)}
+        return sorted(archives, key=lambda item: order.get(item.message_id, len(order)))
+
+    async def upsert_business_media_archive(
+        self, record: BusinessMediaArchiveRecord
+    ) -> BusinessMediaArchiveRecord | None:
+        db = self._connection()
+        now = int(time.time())
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT connection_id, chat_id, message_id, kind, file_name,
+                       file_path, file_size, created_at
+                FROM business_media_archives
+                WHERE connection_id = ? AND chat_id = ? AND message_id = ?
+                """,
+                (record.connection_id, record.chat_id, record.message_id),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            previous = None if row is None else _business_media_archive_from_row(row)
+            await db.execute(
+                """
+                INSERT INTO business_media_archives(
+                    connection_id, chat_id, message_id, kind, file_name,
+                    file_path, file_size, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(connection_id, chat_id, message_id) DO UPDATE SET
+                    kind = excluded.kind,
+                    file_name = excluded.file_name,
+                    file_path = excluded.file_path,
+                    file_size = excluded.file_size,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    record.connection_id,
+                    record.chat_id,
+                    record.message_id,
+                    record.kind,
+                    record.file_name,
+                    record.file_path,
+                    record.file_size,
+                    record.created_at,
+                    now,
+                ),
+            )
+            await db.commit()
+        return previous
+
+    async def delete_business_media_archive(
+        self, *, connection_id: str, chat_id: int, message_id: int
+    ) -> None:
+        db = self._connection()
+        async with self._lock:
+            await db.execute(
+                """
+                DELETE FROM business_media_archives
+                WHERE connection_id = ? AND chat_id = ? AND message_id = ?
+                """,
+                (connection_id, chat_id, message_id),
+            )
+            await db.commit()
+
+    async def pop_expired_business_media_archives(
+        self, retention_days: int
+    ) -> list[BusinessMediaArchiveRecord]:
+        db = self._connection()
+        cutoff = int(time.time()) - retention_days * 86_400
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT connection_id, chat_id, message_id, kind, file_name,
+                       file_path, file_size, created_at
+                FROM business_media_archives
+                WHERE updated_at < ?
+                """,
+                (cutoff,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            await db.execute(
+                "DELETE FROM business_media_archives WHERE updated_at < ?",
+                (cutoff,),
+            )
+            await db.commit()
+        return [_business_media_archive_from_row(row) for row in rows]
+
     async def mark_business_message_deleted(
         self, *, connection_id: str, chat_id: int, message_id: int
     ) -> None:
@@ -967,6 +1126,21 @@ def _business_message_from_row(row: aiosqlite.Row) -> BusinessMessageRecord:
         content=str(row["content"]),
         media_kind=None if row["media_kind"] is None else str(row["media_kind"]),
         deleted_at=None if deleted_at is None else int(deleted_at),
+    )
+
+
+def _business_media_archive_from_row(
+    row: aiosqlite.Row,
+) -> BusinessMediaArchiveRecord:
+    return BusinessMediaArchiveRecord(
+        connection_id=str(row["connection_id"]),
+        chat_id=int(row["chat_id"]),
+        message_id=int(row["message_id"]),
+        kind=str(row["kind"]),
+        file_name=str(row["file_name"]),
+        file_path=str(row["file_path"]),
+        file_size=int(row["file_size"]),
+        created_at=int(row["created_at"]),
     )
 
 
