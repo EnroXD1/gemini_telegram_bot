@@ -39,6 +39,36 @@ class BusinessChatRecord:
     auto_reply_enabled: bool
 
 
+@dataclass(frozen=True, slots=True)
+class BotUserRecord:
+    user_id: int
+    username: str | None
+    display_name: str
+    first_seen_at: int
+    last_seen_at: int
+    last_chat_id: int
+    last_chat_type: str
+    last_chat_title: str | None
+    interaction_count: int
+    ai_request_count: int
+    openrouter_request_count: int
+    google_request_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class BotUsageStats:
+    total_users: int
+    active_24h: int
+    active_7d: int
+    active_30d: int
+    private_users: int
+    group_users: int
+    interaction_count: int
+    ai_request_count: int
+    openrouter_request_count: int
+    google_request_count: int
+
+
 class Storage:
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -123,6 +153,24 @@ class Storage:
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY(owner_user_id, chat_id)
             );
+
+            CREATE TABLE IF NOT EXISTS bot_users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                display_name TEXT NOT NULL,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                last_chat_id INTEGER NOT NULL,
+                last_chat_type TEXT NOT NULL,
+                last_chat_title TEXT,
+                interaction_count INTEGER NOT NULL,
+                ai_request_count INTEGER NOT NULL,
+                openrouter_request_count INTEGER NOT NULL,
+                google_request_count INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_bot_users_last_seen
+            ON bot_users(last_seen_at DESC);
             """
         )
         await self._db.commit()
@@ -337,6 +385,10 @@ class Storage:
                     int(time.time()),
                 ),
             )
+            await db.execute(
+                "DELETE FROM bot_users WHERE user_id = ?",
+                (owner_user_id,),
+            )
             await db.commit()
 
     async def is_business_owner(self, user_id: int) -> bool:
@@ -349,6 +401,149 @@ class Storage:
             row = await cursor.fetchone()
             await cursor.close()
         return row is not None
+
+    async def list_business_owner_chat_ids(self) -> list[int]:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT DISTINCT owner_chat_id
+                FROM business_connections
+                WHERE is_enabled = 1
+                """
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [int(row["owner_chat_id"]) for row in rows]
+
+    async def record_bot_user_activity(
+        self,
+        *,
+        user_id: int,
+        username: str | None,
+        display_name: str,
+        chat_id: int,
+        chat_type: str,
+        chat_title: str | None,
+        ai_provider: str | None,
+    ) -> bool:
+        """Record one handled interaction and return True for a new user."""
+        db = self._connection()
+        now = int(time.time())
+        ai_increment = int(ai_provider is not None)
+        openrouter_increment = int(ai_provider == "openrouter")
+        google_increment = int(ai_provider == "google")
+        async with self._lock:
+            cursor = await db.execute(
+                "SELECT 1 FROM bot_users WHERE user_id = ?",
+                (user_id,),
+            )
+            is_new = await cursor.fetchone() is None
+            await cursor.close()
+            await db.execute(
+                """
+                INSERT INTO bot_users(
+                    user_id, username, display_name, first_seen_at, last_seen_at,
+                    last_chat_id, last_chat_type, last_chat_title,
+                    interaction_count, ai_request_count,
+                    openrouter_request_count, google_request_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = excluded.username,
+                    display_name = excluded.display_name,
+                    last_seen_at = excluded.last_seen_at,
+                    last_chat_id = excluded.last_chat_id,
+                    last_chat_type = excluded.last_chat_type,
+                    last_chat_title = excluded.last_chat_title,
+                    interaction_count = bot_users.interaction_count + 1,
+                    ai_request_count = bot_users.ai_request_count + excluded.ai_request_count,
+                    openrouter_request_count = (
+                        bot_users.openrouter_request_count
+                        + excluded.openrouter_request_count
+                    ),
+                    google_request_count = (
+                        bot_users.google_request_count
+                        + excluded.google_request_count
+                    )
+                """,
+                (
+                    user_id,
+                    username,
+                    display_name,
+                    now,
+                    now,
+                    chat_id,
+                    chat_type,
+                    chat_title,
+                    ai_increment,
+                    openrouter_increment,
+                    google_increment,
+                ),
+            )
+            await db.commit()
+        return is_new
+
+    async def list_bot_users(self, limit: int = 15) -> list[BotUserRecord]:
+        if limit <= 0:
+            return []
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT
+                    user_id, username, display_name, first_seen_at, last_seen_at,
+                    last_chat_id, last_chat_type, last_chat_title,
+                    interaction_count, ai_request_count,
+                    openrouter_request_count, google_request_count
+                FROM bot_users
+                ORDER BY last_seen_at DESC, user_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [_bot_user_from_row(row) for row in rows]
+
+    async def get_bot_usage_stats(self) -> BotUsageStats:
+        db = self._connection()
+        now = int(time.time())
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_users,
+                    COALESCE(SUM(last_seen_at >= ?), 0) AS active_24h,
+                    COALESCE(SUM(last_seen_at >= ?), 0) AS active_7d,
+                    COALESCE(SUM(last_seen_at >= ?), 0) AS active_30d,
+                    COALESCE(SUM(last_chat_type = 'private'), 0) AS private_users,
+                    COALESCE(SUM(last_chat_type IN ('group', 'supergroup')), 0)
+                        AS group_users,
+                    COALESCE(SUM(interaction_count), 0) AS interaction_count,
+                    COALESCE(SUM(ai_request_count), 0) AS ai_request_count,
+                    COALESCE(SUM(openrouter_request_count), 0)
+                        AS openrouter_request_count,
+                    COALESCE(SUM(google_request_count), 0) AS google_request_count
+                FROM bot_users
+                """,
+                (now - 86_400, now - 7 * 86_400, now - 30 * 86_400),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        assert row is not None
+        return BotUsageStats(
+            total_users=int(row["total_users"]),
+            active_24h=int(row["active_24h"]),
+            active_7d=int(row["active_7d"]),
+            active_30d=int(row["active_30d"]),
+            private_users=int(row["private_users"]),
+            group_users=int(row["group_users"]),
+            interaction_count=int(row["interaction_count"]),
+            ai_request_count=int(row["ai_request_count"]),
+            openrouter_request_count=int(row["openrouter_request_count"]),
+            google_request_count=int(row["google_request_count"]),
+        )
 
     async def get_business_auto_reply_enabled(
         self, owner_user_id: int, default: bool
@@ -686,6 +881,25 @@ def _business_message_from_row(row: aiosqlite.Row) -> BusinessMessageRecord:
         content=str(row["content"]),
         media_kind=None if row["media_kind"] is None else str(row["media_kind"]),
         deleted_at=None if deleted_at is None else int(deleted_at),
+    )
+
+
+def _bot_user_from_row(row: aiosqlite.Row) -> BotUserRecord:
+    return BotUserRecord(
+        user_id=int(row["user_id"]),
+        username=None if row["username"] is None else str(row["username"]),
+        display_name=str(row["display_name"]),
+        first_seen_at=int(row["first_seen_at"]),
+        last_seen_at=int(row["last_seen_at"]),
+        last_chat_id=int(row["last_chat_id"]),
+        last_chat_type=str(row["last_chat_type"]),
+        last_chat_title=(
+            None if row["last_chat_title"] is None else str(row["last_chat_title"])
+        ),
+        interaction_count=int(row["interaction_count"]),
+        ai_request_count=int(row["ai_request_count"]),
+        openrouter_request_count=int(row["openrouter_request_count"]),
+        google_request_count=int(row["google_request_count"]),
     )
 
 

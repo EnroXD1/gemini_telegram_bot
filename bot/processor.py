@@ -19,6 +19,7 @@ from .scope import build_scope_key
 from .storage import Storage
 from .text_utils import remove_command, strip_bot_mention
 from .typing_action import show_progress
+from .usage import UsageTracker
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ class MessageProcessor:
         storage: Storage,
         gemini: GeminiService,
         media: MediaExtractor,
+        usage: UsageTracker,
     ) -> None:
         self.bot = bot
         self.bot_user = bot_user
@@ -40,6 +42,7 @@ class MessageProcessor:
         self.storage = storage
         self.gemini = gemini
         self.media = media
+        self.usage = usage
         self._rate_limiter = SlidingWindowRateLimiter(
             settings.rate_limit_requests, settings.rate_limit_window_seconds
         )
@@ -111,6 +114,9 @@ class MessageProcessor:
                 async with show_progress(lead):
                     bundle = await self.media.prepare(
                         bot=self.bot, messages=ordered, user_text=clean_text
+                    )
+                    await self.usage.record(
+                        lead, ai_provider=self.settings.ai_provider
                     )
                     result = await self.gemini.generate(
                         bundle, previous_id, history=history

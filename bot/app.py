@@ -10,6 +10,7 @@ from aiogram.types import (
     BotCommandScopeAllPrivateChats,
 )
 
+from . import __version__
 from .album import AlbumBuffer
 from .business import BusinessMonitor
 from .config import Settings
@@ -18,6 +19,7 @@ from .handlers import create_router
 from .media import MediaExtractor
 from .processor import MessageProcessor
 from .storage import Storage
+from .usage import UsageTracker
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,7 @@ async def run_bot(settings: Settings) -> None:
     try:
         await storage.open()
         bot_user = await bot.get_me()
+        usage = UsageTracker(bot=bot, settings=settings, storage=storage)
         processor = MessageProcessor(
             bot=bot,
             bot_user=bot_user,
@@ -39,9 +42,10 @@ async def run_bot(settings: Settings) -> None:
             storage=storage,
             gemini=gemini,
             media=MediaExtractor(settings),
+            usage=usage,
         )
         monitor = BusinessMonitor(bot=bot, settings=settings, storage=storage)
-        dispatcher.include_router(create_router(processor, albums, monitor))
+        dispatcher.include_router(create_router(processor, albums, monitor, usage))
         removed = await storage.prune_business_messages(
             settings.business_message_retention_days
         )
@@ -58,8 +62,9 @@ async def run_bot(settings: Settings) -> None:
         await bot.delete_webhook(drop_pending_updates=settings.drop_pending_updates)
 
         logger.info(
-            "Starting @%s with provider=%s model=%s",
+            "Starting @%s v%s with provider=%s model=%s",
             bot_user.username,
+            __version__,
             settings.ai_provider,
             settings.active_model,
         )
@@ -90,6 +95,8 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="cancel", description="Остановить запрос"),
         BotCommand(command="autoreply", description="Business-автоответы on/off"),
         BotCommand(command="chats", description="Настроить отдельные Business-чаты"),
+        BotCommand(command="users", description="Кто пользуется ботом"),
+        BotCommand(command="stats", description="Статистика использования"),
         BotCommand(command="status", description="Модель и состояние"),
     ]
     group_commands = private_commands + [

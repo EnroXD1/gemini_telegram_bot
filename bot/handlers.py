@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.filters.command import CommandObject
@@ -12,15 +14,22 @@ from aiogram.types import (
     Message,
 )
 
+from . import __version__
 from .album import AlbumBuffer
 from .business import BusinessMessageCaptureMiddleware, BusinessMonitor
 from .processor import MessageProcessor
+from .storage import BotUserRecord
+from .usage import BotUsageMiddleware, UsageTracker
 
 
 def create_router(
-    processor: MessageProcessor, albums: AlbumBuffer, monitor: BusinessMonitor
+    processor: MessageProcessor,
+    albums: AlbumBuffer,
+    monitor: BusinessMonitor,
+    usage: UsageTracker,
 ) -> Router:
     router = Router(name="gemini-assistant")
+    router.message.outer_middleware(BotUsageMiddleware(usage))
     router.business_message.outer_middleware(
         BusinessMessageCaptureMiddleware(monitor)
     )
@@ -69,7 +78,9 @@ def create_router(
             "/status — показать модель и режим этого чата\n"
             "/mode mentions|all|off — режим группы (только администратор)\n"
             "/autoreply on|off — общие Business-автоответы (только владелец)\n"
-            "/chats — режимы отдельных Business-собеседников\n\n"
+            "/chats — режимы отдельных Business-собеседников\n"
+            "/users — последние пользователи самого бота (только владелец)\n"
+            "/stats — статистика использования (только владелец)\n\n"
             "Telegram Business: сохраняю исходный текст входящих сообщений на 30 "
             "дней, уведомляю об изменениях и удалениях и сразу отправляю вам копию "
             "входящих медиа. Секретные чаты обычным ботам недоступны.\n\n"
@@ -306,11 +317,63 @@ def create_router(
             )
         context = "есть" if has_context else "пуст"
         await message.reply(
+            f"Версия: {__version__}\n"
             f"Провайдер: {processor.settings.ai_provider}\n"
             f"Модель: {processor.settings.active_model}\n"
             f"Режим чата: {mode}\n"
             f"Контекст: {context}\n"
             f"Серверное хранение контекста: {context_storage}"
+        )
+
+    @router.message(Command("users"))
+    async def users_handler(message: Message, command: CommandObject) -> None:
+        user = message.from_user
+        if message.chat.type != "private" or user is None:
+            await message.reply("Отчёт доступен в личном чате с ботом.")
+            return
+        if not await _is_business_owner(processor, user.id):
+            await message.reply("Статистика доступна только владельцу бота.")
+            return
+        limit = _parse_users_limit(command.args)
+        records = await processor.storage.list_bot_users(limit)
+        stats = await processor.storage.get_bot_usage_stats()
+        if not records:
+            await message.reply(
+                "Другие пользователи пока не обращались к самому боту.\n"
+                "Business-собеседники доступны отдельно: /chats"
+            )
+            return
+        lines = [
+            f"Пользователи самого бота: {stats.total_users}",
+            f"Последние {len(records)} (Business-чаты не включены):",
+        ]
+        for index, record in enumerate(records, start=1):
+            lines.append(_format_bot_user(index, record))
+        await message.reply("\n\n".join(lines))
+
+    @router.message(Command("stats"))
+    async def stats_handler(message: Message) -> None:
+        user = message.from_user
+        if message.chat.type != "private" or user is None:
+            await message.reply("Отчёт доступен в личном чате с ботом.")
+            return
+        if not await _is_business_owner(processor, user.id):
+            await message.reply("Статистика доступна только владельцу бота.")
+            return
+        stats = await processor.storage.get_bot_usage_stats()
+        await message.reply(
+            f"Статистика бота — версия {__version__}\n\n"
+            f"Уникальных пользователей: {stats.total_users}\n"
+            f"Активны за 24 часа: {stats.active_24h}\n"
+            f"Активны за 7 дней: {stats.active_7d}\n"
+            f"Активны за 30 дней: {stats.active_30d}\n"
+            f"Последний источник — личный чат: {stats.private_users}\n"
+            f"Последний источник — группа: {stats.group_users}\n\n"
+            f"Учтённых обращений: {stats.interaction_count}\n"
+            f"AI-запросов: {stats.ai_request_count}\n"
+            f"Через OpenRouter: {stats.openrouter_request_count}\n"
+            f"Напрямую Google: {stats.google_request_count}\n\n"
+            "Business-собеседники считаются отдельно и доступны через /chats."
         )
 
     @router.message()
@@ -408,3 +471,41 @@ def _truncate_button_text(value: str, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 1] + "…"
+
+
+def _parse_users_limit(argument: str | None) -> int:
+    if not argument:
+        return 10
+    try:
+        return max(1, min(15, int(argument.strip())))
+    except ValueError:
+        return 10
+
+
+def _format_bot_user(index: int, record: BotUserRecord) -> str:
+    username = f"@{record.username}" if record.username else "без username"
+    if record.last_chat_type == "private":
+        source = "личный чат"
+    else:
+        title = _truncate_button_text(record.last_chat_title or "группа", 40)
+        source = f"группа «{title}»"
+    first_seen = datetime.fromtimestamp(
+        record.first_seen_at, timezone(timedelta(hours=3))
+    ).strftime("%d.%m.%Y %H:%M")
+    last_seen = datetime.fromtimestamp(
+        record.last_seen_at, timezone(timedelta(hours=3))
+    ).strftime("%d.%m.%Y %H:%M")
+    provider_parts: list[str] = []
+    if record.openrouter_request_count:
+        provider_parts.append(f"OpenRouter: {record.openrouter_request_count}")
+    if record.google_request_count:
+        provider_parts.append(f"Google: {record.google_request_count}")
+    providers = ", ".join(provider_parts) if provider_parts else "AI ещё не вызывался"
+    name = _truncate_button_text(record.display_name, 60)
+    return (
+        f"{index}. {name} ({username})\n"
+        f"ID: {record.user_id}; источник: {source}\n"
+        f"Первое обращение: {first_seen}; последнее: {last_seen} МСК\n"
+        f"Обращений: {record.interaction_count}; AI: {record.ai_request_count} "
+        f"({providers})"
+    )
