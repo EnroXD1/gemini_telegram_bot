@@ -25,9 +25,12 @@ class GeminiRequestError(RuntimeError):
 class GeminiService:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._client = genai.Client(api_key=settings.gemini_api_key)
+        client_kwargs: dict[str, Any] = {"api_key": settings.gemini_api_key}
+        if settings.gemini_vertex_ai:
+            client_kwargs["vertexai"] = True
+        self._client = genai.Client(**client_kwargs)
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
-        self._interactions_available = True
+        self._interactions_available = not settings.gemini_vertex_ai
 
     async def close(self) -> None:
         await self._client.aio.aclose()

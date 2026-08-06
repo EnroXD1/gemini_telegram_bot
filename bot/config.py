@@ -108,6 +108,7 @@ def _choice(name: str, default: str, allowed: set[str]) -> str:
 class Settings:
     telegram_bot_token: str
     gemini_api_key: str
+    gemini_vertex_ai: bool
     gemini_model: str
     gemini_system_prompt: str
     gemini_temperature: float
@@ -150,6 +151,7 @@ class Settings:
         return cls(
             telegram_bot_token=_telegram_bot_token(),
             gemini_api_key=_required("GEMINI_API_KEY"),
+            gemini_vertex_ai=_bool("GEMINI_VERTEX_AI", False),
             gemini_model=(
                 os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
                 or "gemini-3.6-flash"

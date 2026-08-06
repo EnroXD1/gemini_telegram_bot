@@ -2,6 +2,7 @@ import asyncio
 import base64
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from bot.gemini import GeminiService
 from bot.models import MediaPayload, PromptBundle
@@ -73,6 +74,21 @@ def make_service(
 
 
 class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
+    @patch("bot.gemini.genai.Client")
+    def test_vertex_express_client(self, client_factory) -> None:
+        settings = SimpleNamespace(
+            gemini_api_key="AQ.test-key",
+            gemini_vertex_ai=True,
+            max_concurrent_requests=1,
+        )
+
+        service = GeminiService(settings)
+
+        client_factory.assert_called_once_with(
+            api_key="AQ.test-key", vertexai=True
+        )
+        self.assertFalse(service._interactions_available)
+
     async def test_multimodal_request(self) -> None:
         service = make_service(
             [SimpleNamespace(id="new-id", output_text="ответ")]

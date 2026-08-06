@@ -35,3 +35,15 @@ def test_settings_ignore_non_telegram_host_token(monkeypatch, tmp_path) -> None:
     settings = Settings.from_env(tmp_path / "missing.env")
 
     assert settings.telegram_bot_token == "987654321:telegram-token"
+
+
+def test_settings_enable_vertex_ai(monkeypatch, tmp_path) -> None:
+    for name in TOKEN_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("GEMINI_VERTEX_AI", "true")
+
+    settings = Settings.from_env(tmp_path / "missing.env")
+
+    assert settings.gemini_vertex_ai is True

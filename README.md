@@ -129,7 +129,9 @@ docker compose logs -f bot
    URL репозитория, ветку `main`, платформу Telegram и главный файл `main.py`.
 2. Используйте стандартную Python-сборку Bothost (`requirements.txt` уже есть).
    Собственный `Dockerfile` также поддерживается, но для этого проекта не нужен.
-3. В переменных окружения Bothost добавьте `GEMINI_API_KEY`. Если токен из формы
+3. В переменных окружения Bothost добавьте `GEMINI_API_KEY`. Для ключа Vertex AI
+   Express Mode (например, с префиксом `AQ.`) также установите
+   `GEMINI_VERTEX_AI=true`. Если токен из формы
    создания не передаётся в контейнер, добавьте его как
    `APP_TELEGRAM_BOT_TOKEN`. Также поддерживаются `TELEGRAM_BOT_TOKEN` и
    системные алиасы `BOT_TOKEN`, `BOT_API_TOKEN`, `TOKEN`.
@@ -184,6 +186,7 @@ Telegram с включённой приватностью отдаёт боту 
 | Переменная | Значение по умолчанию | Назначение |
 | --- | ---: | --- |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | ID модели Gemini |
+| `GEMINI_VERTEX_AI` | `false` | Использовать Vertex AI Express Mode |
 | `GEMINI_SYSTEM_PROMPT` | встроенный русский prompt | Роль и стиль бота |
 | `GEMINI_TEMPERATURE` | `0.7` | Вариативность ответа, от 0 до 2 |
 | `GEMINI_MAX_OUTPUT_TOKENS` | `4096` | Максимум токенов ответа |
