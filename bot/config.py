@@ -137,6 +137,7 @@ class Settings:
     gemini_system_prompt: str
     gemini_temperature: float
     gemini_max_output_tokens: int
+    ai_max_continuations: int
     gemini_store_interactions: bool
     database_path: Path
     group_default_mode: str
@@ -205,6 +206,9 @@ class Settings:
         reply_chunk_size = _int("REPLY_CHUNK_SIZE", 4000, minimum=256)
         if reply_chunk_size > 4096:
             raise ConfigError("REPLY_CHUNK_SIZE не должен превышать лимит Telegram 4096")
+        ai_max_continuations = _int("AI_MAX_CONTINUATIONS", 2, minimum=0)
+        if ai_max_continuations > 5:
+            raise ConfigError("AI_MAX_CONTINUATIONS не должен превышать 5")
 
         return cls(
             telegram_bot_token=_telegram_bot_token(),
@@ -252,6 +256,7 @@ class Settings:
             gemini_max_output_tokens=_int(
                 "GEMINI_MAX_OUTPUT_TOKENS", 4096, minimum=1
             ),
+            ai_max_continuations=ai_max_continuations,
             gemini_store_interactions=_bool("GEMINI_STORE_INTERACTIONS", True),
             database_path=Path(os.getenv("DATABASE_PATH", "data/bot.sqlite3")),
             group_default_mode=_choice(

@@ -17,7 +17,7 @@ from .models import ConversationMessage, PromptBundle
 from .rate_limit import SlidingWindowRateLimiter
 from .scope import build_scope_key
 from .storage import Storage
-from .text_utils import remove_command, strip_bot_mention
+from .text_utils import remove_command, split_text, strip_bot_mention
 from .typing_action import show_progress
 from .usage import UsageTracker
 
@@ -150,7 +150,11 @@ class MessageProcessor:
                         "Could not persist conversation context chat_id=%s",
                         lead.chat.id,
                     )
-                await self.reply(lead, result.text)
+                await self.reply(
+                    lead,
+                    result.text,
+                    formatted=not result.truncated,
+                )
             except GeminiRequestError as exc:
                 await self.usage.record(
                     lead, ai_provider=self.gemini.current_provider
@@ -251,8 +255,16 @@ class MessageProcessor:
         task.cancel()
         return True
 
-    async def reply(self, message: Message, text: str) -> list[Message]:
-        chunks = render_markdown_chunks(text, self.settings.reply_chunk_size)
+    async def reply(
+        self, message: Message, text: str, *, formatted: bool = True
+    ) -> list[Message]:
+        if formatted:
+            chunks = render_markdown_chunks(text, self.settings.reply_chunk_size)
+        else:
+            chunks = [
+                FormattedChunk(chunk)
+                for chunk in split_text(text, self.settings.reply_chunk_size)
+            ]
         if not chunks:
             chunks = [FormattedChunk("Gemini не вернул текстовый ответ.")]
         sent_messages: list[Message] = []

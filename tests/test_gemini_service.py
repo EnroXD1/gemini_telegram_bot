@@ -96,6 +96,7 @@ def make_service(
         gemini_system_prompt="system",
         gemini_temperature=0.5,
         gemini_max_output_tokens=100,
+        ai_max_continuations=2,
         gemini_timeout_seconds=2.0,
         gemini_retry_attempts=1,
     )
@@ -167,6 +168,119 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(url, "chat/completions")
         self.assertEqual(payload["model"], "google/gemini-3.5-flash")
         self.assertEqual(payload["messages"][1]["content"], "вопрос")
+
+    async def test_openrouter_continues_response_stopped_by_token_limit(self) -> None:
+        service = make_openrouter_service("unused")
+        service._openrouter_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {
+                        "model": "free/model-a",
+                        "choices": [
+                            {
+                                "finish_reason": "length",
+                                "message": {"content": "Начало подробного ответа."},
+                            }
+                        ],
+                    }
+                ),
+                FakeOpenRouterResponse(
+                    {
+                        "model": "free/model-b",
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "message": {"content": "Окончание ответа."},
+                            }
+                        ],
+                    }
+                ),
+            ]
+        )
+
+        result = await service.generate(PromptBundle(prompt="реши всё"), None)
+
+        self.assertEqual(
+            result.text, "Начало подробного ответа.\n\nОкончание ответа."
+        )
+        self.assertFalse(result.truncated)
+        self.assertEqual(len(service._openrouter_client.calls), 2)
+        continuation_messages = service._openrouter_client.calls[1][1]["messages"]
+        self.assertEqual(continuation_messages[-2]["role"], "assistant")
+        self.assertEqual(
+            continuation_messages[-2]["content"], "Начало подробного ответа."
+        )
+        self.assertIn("Не повторяй", continuation_messages[-1]["content"])
+
+    async def test_openrouter_marks_response_after_continuations_are_exhausted(
+        self,
+    ) -> None:
+        service = make_openrouter_service("unused")
+        service._settings.ai_max_continuations = 1
+        service._openrouter_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "length",
+                                "message": {"content": "Первая часть"},
+                            }
+                        ]
+                    }
+                ),
+                FakeOpenRouterResponse(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "length",
+                                "message": {"content": "Вторая часть"},
+                            }
+                        ]
+                    }
+                ),
+            ]
+        )
+
+        result = await service.generate(PromptBundle(prompt="длинный ответ"), None)
+
+        self.assertTrue(result.truncated)
+        self.assertIn("Первая часть\n\nВторая часть", result.text)
+        self.assertIn("достиг лимита", result.text)
+        self.assertEqual(len(service._openrouter_client.calls), 2)
+
+    async def test_openrouter_continues_partial_provider_error(self) -> None:
+        service = make_openrouter_service("unused")
+        service._settings.ai_max_continuations = 1
+        service._openrouter_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "provider_error",
+                                "message": {"content": "Уцелевшая часть"},
+                            }
+                        ]
+                    }
+                ),
+                FakeOpenRouterResponse(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "message": {"content": "Продолжение"},
+                            }
+                        ]
+                    }
+                ),
+            ]
+        )
+
+        result = await service.generate(PromptBundle(prompt="вопрос"), None)
+
+        self.assertEqual(result.text, "Уцелевшая часть\n\nПродолжение")
+        self.assertFalse(result.truncated)
 
     async def test_openrouter_multimodal_request(self) -> None:
         service = make_openrouter_service("мультимодальный ответ")
@@ -269,6 +383,41 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.provider, "groq")
         _, payload = service._groq_client.calls[0]
         self.assertEqual(payload["model"], "llama-3.1-8b-instant")
+
+    async def test_groq_primary_continues_truncated_response(self) -> None:
+        service = make_openrouter_service("unused")
+        service._groq_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "length",
+                                "message": {"content": "Часть Groq"},
+                            }
+                        ]
+                    }
+                ),
+                FakeOpenRouterResponse(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "message": {"content": "Финал Groq"},
+                            }
+                        ]
+                    }
+                ),
+            ]
+        )
+        service._settings.groq_model = "llama-3.1-8b-instant"
+        service.select_model("groq")
+
+        result = await service.generate(PromptBundle(prompt="вопрос"), None)
+
+        self.assertEqual(result.text, "Часть Groq\n\nФинал Groq")
+        self.assertFalse(result.truncated)
+        self.assertEqual(len(service._groq_client.calls), 2)
 
     async def test_unconfigured_provider_cannot_be_selected(self) -> None:
         service = make_openrouter_service("unused")

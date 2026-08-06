@@ -105,6 +105,29 @@ def test_groq_can_be_the_primary_provider(monkeypatch, tmp_path) -> None:
     assert settings.active_model == "llama-3.1-8b-instant"
 
 
+def test_ai_continuations_default_to_two(monkeypatch, tmp_path) -> None:
+    for name in TOKEN_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.delenv("AI_MAX_CONTINUATIONS", raising=False)
+
+    settings = Settings.from_env(tmp_path / "missing.env")
+
+    assert settings.ai_max_continuations == 2
+
+
+def test_ai_continuations_are_capped_at_five(monkeypatch, tmp_path) -> None:
+    for name in TOKEN_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("AI_MAX_CONTINUATIONS", "6")
+
+    with pytest.raises(ConfigError, match="AI_MAX_CONTINUATIONS"):
+        Settings.from_env(tmp_path / "missing.env")
+
+
 def test_business_auto_reply_can_default_to_monitoring_only(
     monkeypatch, tmp_path
 ) -> None:

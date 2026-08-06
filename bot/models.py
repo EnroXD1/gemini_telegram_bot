@@ -29,3 +29,4 @@ class GeminiResult:
     interaction_id: str | None
     context_was_reset: bool = False
     provider: str | None = None
+    truncated: bool = False

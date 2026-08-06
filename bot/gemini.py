@@ -5,6 +5,7 @@ import base64
 import logging
 import random
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -22,6 +23,31 @@ OPENROUTER_APP_URL = "https://github.com/EnroXD1/gemini_telegram_bot"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1/"
 
 FallbackNotifier = Callable[[str], Awaitable[None]]
+
+_INCOMPLETE_FINISH_REASONS = {
+    "length",
+    "max_tokens",
+    "max_output_tokens",
+    "token_limit",
+    "error",
+    "provider_error",
+}
+_CONTINUATION_PROMPT = (
+    "Продолжи предыдущий ответ точно с места остановки. Не повторяй уже "
+    "написанное и не начинай решение заново. Верни только продолжение. "
+    "Заверши все начатые списки, формулы, блоки кода и Markdown-разметку."
+)
+_TRUNCATED_NOTICE = (
+    "⚠️ Ответ всё ещё достиг лимита выбранной модели после автоматических "
+    "продолжений. Отправьте «продолжи с места остановки», если требуется ещё."
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ChatCompletion:
+    text: str
+    finish_reason: str | None
+    model: str | None
 
 
 class GeminiRequestError(RuntimeError):
@@ -287,20 +313,22 @@ class GeminiService:
         if client is None:
             raise RuntimeError("OpenRouter client is not initialized")
 
-        messages = self._build_chat_messages(bundle, history)
-
-        payload = {
-            "model": self._model,
-            "messages": messages,
-            "temperature": self._settings.gemini_temperature,
-            "max_tokens": self._settings.gemini_max_output_tokens,
-            "stream": False,
-        }
+        base_messages = self._build_chat_messages(bundle, history)
+        request_messages = base_messages
+        combined_text = ""
+        continuation_count = 0
         attempt = 0
 
         async with self._semaphore:
             while True:
                 try:
+                    payload = {
+                        "model": self._model,
+                        "messages": request_messages,
+                        "temperature": self._settings.gemini_temperature,
+                        "max_tokens": self._settings.gemini_max_output_tokens,
+                        "stream": False,
+                    }
                     async with asyncio.timeout(
                         self._settings.gemini_timeout_seconds
                     ):
@@ -308,21 +336,65 @@ class GeminiService:
                             "chat/completions", json=payload
                         )
                         response.raise_for_status()
-                    text = _extract_openrouter_text(response.json())
-                    if not text:
+                    completion = _extract_chat_completion(response.json())
+                    if not completion.text:
                         raise GeminiRequestError(
                             "Модель обработала запрос через OpenRouter, но не вернула "
                             "текстовый ответ. Попробуйте переформулировать сообщение."
                         )
+                    combined_text = _merge_continuation(
+                        combined_text, completion.text
+                    )
+                    truncated = _needs_continuation(completion.finish_reason)
+                    logger.info(
+                        "OpenRouter completion model=%s finish_reason=%s "
+                        "continuation=%s",
+                        completion.model or self._model,
+                        completion.finish_reason,
+                        continuation_count,
+                    )
+                    if truncated and continuation_count < _max_continuations(
+                        self._settings
+                    ):
+                        continuation_count += 1
+                        request_messages = _continuation_messages(
+                            base_messages, combined_text
+                        )
+                        attempt = 0
+                        logger.info(
+                            "Continuing truncated OpenRouter response part=%s",
+                            continuation_count + 1,
+                        )
+                        continue
                     return GeminiResult(
-                        text=text,
+                        text=_finish_text(combined_text, truncated),
                         interaction_id=None,
                         context_was_reset=bool(previous_interaction_id),
                         provider="openrouter",
+                        truncated=truncated,
                     )
                 except GeminiRequestError:
+                    if combined_text:
+                        return GeminiResult(
+                            text=_finish_text(combined_text, True),
+                            interaction_id=None,
+                            context_was_reset=bool(previous_interaction_id),
+                            provider="openrouter",
+                            truncated=True,
+                        )
                     raise
                 except TimeoutError as exc:
+                    if combined_text:
+                        logger.warning(
+                            "OpenRouter continuation timed out after partial response"
+                        )
+                        return GeminiResult(
+                            text=_finish_text(combined_text, True),
+                            interaction_id=None,
+                            context_was_reset=bool(previous_interaction_id),
+                            provider="openrouter",
+                            truncated=True,
+                        )
                     raise GeminiRequestError(
                         "OpenRouter не успел получить ответ модели за отведённое "
                         "время. Попробуйте ещё раз или отправьте файл меньшего размера."
@@ -352,13 +424,36 @@ class GeminiService:
                     if self._can_fallback_to_groq(code, bundle):
                         await self._notify_fallback(on_fallback)
                         try:
-                            return await self._generate_groq(
-                                messages,
+                            fallback_result = await self._generate_groq(
+                                request_messages,
                                 previous_interaction_id,
                                 model=self._settings.groq_model,
                                 is_fallback=True,
                             )
+                            if not combined_text:
+                                return fallback_result
+                            return GeminiResult(
+                                text=_merge_continuation(
+                                    combined_text, fallback_result.text
+                                ),
+                                interaction_id=None,
+                                context_was_reset=bool(previous_interaction_id),
+                                provider="groq",
+                                truncated=fallback_result.truncated,
+                            )
                         except GeminiRequestError as fallback_exc:
+                            if combined_text:
+                                logger.warning(
+                                    "Groq fallback could not continue partial "
+                                    "OpenRouter response"
+                                )
+                                return GeminiResult(
+                                    text=_finish_text(combined_text, True),
+                                    interaction_id=None,
+                                    context_was_reset=bool(previous_interaction_id),
+                                    provider="openrouter",
+                                    truncated=True,
+                                )
                             raise GeminiRequestError(
                                 "Основная модель OpenRouter временно недоступна. "
                                 f"{fallback_exc.user_message}",
@@ -367,6 +462,14 @@ class GeminiService:
                                     or (20.0 if code == 429 else None)
                                 ),
                             ) from exc
+                    if combined_text:
+                        return GeminiResult(
+                            text=_finish_text(combined_text, True),
+                            interaction_id=None,
+                            context_was_reset=bool(previous_interaction_id),
+                            provider="openrouter",
+                            truncated=True,
+                        )
                     raise GeminiRequestError(
                         _friendly_openrouter_error(code),
                         delete_after_seconds=20.0 if code == 429 else None,
@@ -406,35 +509,82 @@ class GeminiService:
         client = self._groq_client
         if client is None:
             raise RuntimeError("Groq fallback client is not initialized")
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": self._settings.gemini_temperature,
-            "max_completion_tokens": self._settings.groq_max_output_tokens,
-            "stream": False,
-        }
+        base_messages = messages
+        request_messages = base_messages
+        combined_text = ""
+        continuation_count = 0
         attempt = 0
         while True:
             try:
+                payload = {
+                    "model": model,
+                    "messages": request_messages,
+                    "temperature": self._settings.gemini_temperature,
+                    "max_completion_tokens": self._settings.groq_max_output_tokens,
+                    "stream": False,
+                }
                 async with asyncio.timeout(self._settings.gemini_timeout_seconds):
                     response = await client.post("chat/completions", json=payload)
                     response.raise_for_status()
-                text = _extract_openrouter_text(response.json())
-                if not text:
+                completion = _extract_chat_completion(response.json())
+                if not completion.text:
                     label = "Резервная модель Groq" if is_fallback else "Модель Groq"
                     raise GeminiRequestError(
                         f"{label} не вернула текстовый ответ. "
                         "Попробуйте переформулировать сообщение."
                     )
+                combined_text = _merge_continuation(
+                    combined_text, completion.text
+                )
+                truncated = _needs_continuation(completion.finish_reason)
+                logger.info(
+                    "Groq completion model=%s finish_reason=%s continuation=%s",
+                    completion.model or model,
+                    completion.finish_reason,
+                    continuation_count,
+                )
+                if truncated and continuation_count < _max_continuations(
+                    self._settings
+                ):
+                    continuation_count += 1
+                    request_messages = _continuation_messages(
+                        base_messages, combined_text
+                    )
+                    attempt = 0
+                    logger.info(
+                        "Continuing truncated Groq response part=%s",
+                        continuation_count + 1,
+                    )
+                    continue
                 return GeminiResult(
-                    text=text,
+                    text=_finish_text(combined_text, truncated),
                     interaction_id=None,
                     context_was_reset=bool(previous_interaction_id),
                     provider="groq",
+                    truncated=truncated,
                 )
             except GeminiRequestError:
+                if combined_text:
+                    return GeminiResult(
+                        text=_finish_text(combined_text, True),
+                        interaction_id=None,
+                        context_was_reset=bool(previous_interaction_id),
+                        provider="groq",
+                        truncated=True,
+                    )
                 raise
             except TimeoutError as exc:
+                if combined_text:
+                    logger.warning(
+                        "Groq continuation timed out after partial response"
+                    )
+                    return GeminiResult(
+                        text=_finish_text(combined_text, True),
+                        interaction_id=None,
+                        context_was_reset=bool(previous_interaction_id),
+                        provider="groq",
+                        truncated=True,
+                    )
                 label = "Резервная модель Groq" if is_fallback else "Модель Groq"
                 raise GeminiRequestError(
                     f"{label} не успела ответить. "
@@ -462,6 +612,14 @@ class GeminiService:
                     code,
                     type(exc).__name__,
                 )
+                if combined_text:
+                    return GeminiResult(
+                        text=_finish_text(combined_text, True),
+                        interaction_id=None,
+                        context_was_reset=bool(previous_interaction_id),
+                        provider="groq",
+                        truncated=True,
+                    )
                 raise GeminiRequestError(
                     _friendly_groq_error(code, is_fallback=is_fallback),
                     delete_after_seconds=20.0 if code == 429 else None,
@@ -588,27 +746,95 @@ def _audio_format(mime_type: str) -> str:
     return formats.get(normalized, normalized.partition("/")[2] or "wav")
 
 
-def _extract_openrouter_text(payload: dict[str, Any]) -> str:
+def _extract_chat_completion(payload: dict[str, Any]) -> _ChatCompletion:
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
-        return ""
+        return _ChatCompletion("", None, _optional_string(payload.get("model")))
     first = choices[0]
     if not isinstance(first, dict):
-        return ""
+        return _ChatCompletion("", None, _optional_string(payload.get("model")))
+    finish_reason = _optional_string(
+        first.get("finish_reason") or first.get("native_finish_reason")
+    )
     message = first.get("message")
     if not isinstance(message, dict):
-        return ""
+        return _ChatCompletion(
+            "", finish_reason, _optional_string(payload.get("model"))
+        )
     content = message.get("content")
     if isinstance(content, str):
-        return content.strip()
-    if not isinstance(content, list):
-        return ""
-    parts = [
-        str(part.get("text", "")).strip()
-        for part in content
-        if isinstance(part, dict) and part.get("type") in {"text", "output_text"}
+        text = content.strip()
+    elif isinstance(content, list):
+        parts = [
+            str(part.get("text", "")).strip()
+            for part in content
+            if isinstance(part, dict)
+            and part.get("type") in {"text", "output_text"}
+        ]
+        text = "\n".join(part for part in parts if part).strip()
+    else:
+        text = ""
+    return _ChatCompletion(
+        text=text,
+        finish_reason=finish_reason,
+        model=_optional_string(payload.get("model")),
+    )
+
+
+def _optional_string(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _needs_continuation(finish_reason: str | None) -> bool:
+    if finish_reason is None:
+        return False
+    return finish_reason.strip().lower() in _INCOMPLETE_FINISH_REASONS
+
+
+def _max_continuations(settings: object) -> int:
+    try:
+        value = int(getattr(settings, "ai_max_continuations", 2))
+    except (TypeError, ValueError):
+        return 2
+    return max(0, min(5, value))
+
+
+def _continuation_messages(
+    base_messages: list[dict[str, Any]], combined_text: str
+) -> list[dict[str, Any]]:
+    return [
+        *base_messages,
+        {"role": "assistant", "content": combined_text},
+        {"role": "user", "content": _CONTINUATION_PROMPT},
     ]
-    return "\n".join(part for part in parts if part).strip()
+
+
+def _merge_continuation(current: str, continuation: str) -> str:
+    current = current.strip()
+    continuation = continuation.strip()
+    if not current:
+        return continuation
+    if not continuation:
+        return current
+
+    max_overlap = min(len(current), len(continuation), 2000)
+    for overlap in range(max_overlap, 19, -1):
+        if current[-overlap:] == continuation[:overlap]:
+            continuation = continuation[overlap:].lstrip()
+            break
+    if not continuation:
+        return current
+    return f"{current}\n\n{continuation}"
+
+
+def _finish_text(text: str, truncated: bool) -> str:
+    normalized = text.strip()
+    if not truncated:
+        return normalized
+    return f"{normalized}\n\n{_TRUNCATED_NOTICE}"
 
 
 def _error_code(exc: Exception) -> int | None:
