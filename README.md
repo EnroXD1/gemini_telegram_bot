@@ -128,7 +128,8 @@ docker compose logs -f bot
 2. Используйте стандартную Python-сборку Bothost (`requirements.txt` уже есть).
    Собственный `Dockerfile` также поддерживается, но для этого проекта не нужен.
 3. В переменных окружения Bothost добавьте `GEMINI_API_KEY`. Токен, введённый в
-   форме создания бота, платформа предоставляет как `TELEGRAM_BOT_TOKEN`.
+   форме создания бота. Помимо `TELEGRAM_BOT_TOKEN`, бот поддерживает системные
+   алиасы Bothost: `BOT_TOKEN`, `BOT_API_TOKEN` и `TOKEN`.
 4. Установите `DATABASE_PATH=/app/data/bot.sqlite3`, чтобы снимки сообщений и
    контекст сохранялись между обновлениями.
 5. После запуска проверьте runtime-логи, запустите бота в Telegram и подключите

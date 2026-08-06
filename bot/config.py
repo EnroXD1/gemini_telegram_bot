@@ -28,6 +28,19 @@ def _required(name: str) -> str:
     return value
 
 
+def _telegram_bot_token() -> str:
+    """Read the Telegram token, including aliases exposed by some bot hosts."""
+    for name in ("TELEGRAM_BOT_TOKEN", "BOT_TOKEN", "BOT_API_TOKEN", "TOKEN"):
+        value = os.getenv(name, "").strip()
+        token_id, separator, token_secret = value.partition(":")
+        if separator and token_id.isdigit() and token_secret:
+            return value
+    raise ConfigError(
+        "Не задан Telegram-токен: укажите TELEGRAM_BOT_TOKEN "
+        "(или поддерживаемый хостингом BOT_TOKEN)"
+    )
+
+
 def _bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -129,7 +142,7 @@ class Settings:
             raise ConfigError("REPLY_CHUNK_SIZE не должен превышать лимит Telegram 4096")
 
         return cls(
-            telegram_bot_token=_required("TELEGRAM_BOT_TOKEN"),
+            telegram_bot_token=_telegram_bot_token(),
             gemini_api_key=_required("GEMINI_API_KEY"),
             gemini_model=(
                 os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
