@@ -109,6 +109,12 @@ class BusinessMonitor:
         connection = await self._resolve_connection(connection_id)
         if connection is None or not connection.is_enabled:
             return False
+        auto_reply_enabled = await self.storage.get_business_auto_reply_enabled(
+            connection.owner_user_id,
+            self.settings.business_auto_reply_enabled,
+        )
+        if not auto_reply_enabled:
+            return False
         if not _record_from_message(message, connection).is_incoming:
             return False
 

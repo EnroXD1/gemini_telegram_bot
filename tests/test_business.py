@@ -11,7 +11,7 @@ from aiogram.types import BusinessMessagesDeleted, Chat, Message, PhotoSize, Use
 
 from bot.business import BusinessMonitor
 from bot.models import ConversationMessage
-from bot.processor import _is_outgoing_business_message
+from bot.processor import MessageProcessor, _is_outgoing_business_message
 from bot.storage import BusinessMessageRecord, Storage
 
 
@@ -35,6 +35,7 @@ class FakeBot:
 def make_settings() -> SimpleNamespace:
     return SimpleNamespace(
         business_monitor_enabled=True,
+        business_auto_reply_enabled=True,
         business_archive_media=True,
         business_archive_max_bytes=1024,
         media_download_timeout_seconds=1.0,
@@ -145,6 +146,34 @@ class BusinessStorageTests(unittest.IsolatedAsyncioTestCase):
             await _is_outgoing_business_message(self.storage, outgoing)
         )
 
+    async def test_business_auto_reply_setting_is_persisted_per_owner(self) -> None:
+        self.assertTrue(
+            await self.storage.get_business_auto_reply_enabled(100, True)
+        )
+
+        await self.storage.set_business_auto_reply_enabled(100, False)
+
+        self.assertFalse(
+            await self.storage.get_business_auto_reply_enabled(100, True)
+        )
+        self.assertTrue(
+            await self.storage.get_business_auto_reply_enabled(101, True)
+        )
+
+    async def test_processor_respects_monitoring_only_mode(self) -> None:
+        await self.storage.save_business_connection(
+            connection_id="connection-1",
+            owner_user_id=100,
+            owner_chat_id=100,
+            is_enabled=True,
+        )
+        await self.storage.set_business_auto_reply_enabled(100, False)
+        processor = object.__new__(MessageProcessor)
+        processor.storage = self.storage
+        processor.settings = SimpleNamespace(business_auto_reply_enabled=True)
+
+        self.assertFalse(await processor.can_respond(make_message(text="Вопрос")))
+
 
 class BusinessMonitorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -223,6 +252,23 @@ class BusinessMonitorTests(unittest.IsolatedAsyncioTestCase):
             self.bot.sent_messages[0]["business_connection_id"], "connection-1"
         )
         self.assertIn("Автоответчик", self.bot.sent_messages[0]["text"])
+
+    async def test_monitoring_only_disables_welcome_but_keeps_delete_alerts(self) -> None:
+        await self.storage.set_business_auto_reply_enabled(100, False)
+        message = make_message(text="Секрет")
+
+        await self.monitor.capture_message(message)
+        welcomed = await self.monitor.welcome_contact(message)
+        event = BusinessMessagesDeleted(
+            business_connection_id="connection-1",
+            chat=Chat(id=200, type=ChatType.PRIVATE, first_name="Собеседник"),
+            message_ids=[10],
+        )
+        await self.monitor.handle_deleted_messages(event)
+
+        self.assertFalse(welcomed)
+        self.assertEqual(len(self.bot.sent_messages), 1)
+        self.assertIn("удалил", self.bot.sent_messages[0]["text"])
 
 
 if __name__ == "__main__":

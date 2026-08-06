@@ -35,6 +35,8 @@ def create_router(
     @router.message(Command("start"))
     @router.business_message(Command("start"))
     async def start_handler(message: Message) -> None:
+        if not await processor.can_respond(message):
+            return
         await message.reply(
             "Привет! Я передаю сообщения Gemini и отвечаю с учётом контекста.\n\n"
             "Если подключить меня к Telegram Business с правом чтения сообщений, "
@@ -49,6 +51,8 @@ def create_router(
     @router.message(Command("help"))
     @router.business_message(Command("help"))
     async def help_handler(message: Message) -> None:
+        if not await processor.can_respond(message):
+            return
         await message.reply(
             "Команды:\n"
             "/ask запрос — явно обратиться к боту в группе; команду можно добавить "
@@ -71,6 +75,8 @@ def create_router(
     @router.message(Command("ask"))
     @router.business_message(Command("ask"))
     async def ask_handler(message: Message) -> None:
+        if not await processor.can_respond(message):
+            return
         if message.media_group_id:
             await albums.add(message, processor.process)
         else:
@@ -79,6 +85,8 @@ def create_router(
     @router.message(Command("reset"))
     @router.business_message(Command("reset"))
     async def reset_handler(message: Message) -> None:
+        if not await processor.can_respond(message):
+            return
         if not await _can_manage_shared_context(processor, message):
             await message.reply(
                 "В группе сбрасывать общий контекст может только администратор."
@@ -93,6 +101,8 @@ def create_router(
     @router.message(Command("cancel"))
     @router.business_message(Command("cancel"))
     async def cancel_handler(message: Message) -> None:
+        if not await processor.can_respond(message):
+            return
         if not await _can_manage_shared_context(processor, message):
             await message.reply(
                 "В группе останавливать общий запрос может только администратор."
@@ -148,9 +158,67 @@ def create_router(
         )
         await message.reply(f"Режим изменён: {mode} — {descriptions[mode]}.{extra}")
 
+    @router.message(Command("autoreply", "auto"))
+    async def autoreply_handler(message: Message, command: CommandObject) -> None:
+        if message.chat.type != "private":
+            await message.reply(
+                "Настройка Business-автоответов доступна в личном чате с ботом."
+            )
+            return
+        user = message.from_user
+        if user is None or not await _is_business_owner(processor, user.id):
+            await message.reply(
+                "Эта настройка доступна владельцу подключённого Telegram Business."
+            )
+            return
+
+        aliases = {
+            "on": True,
+            "вкл": True,
+            "enable": True,
+            "off": False,
+            "выкл": False,
+            "disable": False,
+        }
+        argument = (command.args or "status").strip().lower()
+        if argument in {"", "status", "статус"}:
+            enabled = await processor.storage.get_business_auto_reply_enabled(
+                user.id, processor.settings.business_auto_reply_enabled
+            )
+            state = "включены" if enabled else "выключены"
+            await message.reply(
+                f"Автоответы в ваших Business-чатах: {state}.\n"
+                "Мониторинг удалений, изменений и сохранение медиа управляются "
+                "отдельно и продолжают работать.\n\n"
+                "Использование: /autoreply on или /autoreply off"
+            )
+            return
+
+        enabled = aliases.get(argument)
+        if enabled is None:
+            await message.reply(
+                "Неизвестный режим. Используйте /autoreply on, "
+                "/autoreply off или /autoreply status."
+            )
+            return
+
+        await processor.storage.set_business_auto_reply_enabled(user.id, enabled)
+        if enabled:
+            await message.reply(
+                "Автоответы и приветствие в ваших Business-чатах включены."
+            )
+        else:
+            await message.reply(
+                "Включён режим «только мониторинг». Я не буду отвечать "
+                "собеседникам и отправлять приветствие, но продолжу сохранять "
+                "медиа и уведомлять вас об изменённых и удалённых сообщениях."
+            )
+
     @router.message(Command("status"))
     @router.business_message(Command("status"))
     async def status_handler(message: Message) -> None:
+        if not await processor.can_respond(message):
+            return
         mode = "private"
         if message.chat.type != "private":
             mode = await processor.storage.get_group_mode(
@@ -216,3 +284,9 @@ async def _is_admin(processor: MessageProcessor, message: Message) -> bool:
         return False
     status = getattr(member.status, "value", member.status)
     return status in {"creator", "administrator"}
+
+
+async def _is_business_owner(processor: MessageProcessor, user_id: int) -> bool:
+    if user_id in processor.settings.owner_ids:
+        return True
+    return await processor.storage.is_business_owner(user_id)

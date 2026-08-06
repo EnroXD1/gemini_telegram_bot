@@ -140,6 +140,7 @@ class Settings:
     owner_ids: frozenset[int]
     allowed_chat_ids: frozenset[int]
     business_monitor_enabled: bool
+    business_auto_reply_enabled: bool
     business_archive_media: bool
     business_archive_max_bytes: int
     business_message_retention_days: int
@@ -238,6 +239,9 @@ class Settings:
             owner_ids=_id_set("OWNER_IDS"),
             allowed_chat_ids=_id_set("ALLOWED_CHAT_IDS"),
             business_monitor_enabled=_bool("BUSINESS_MONITOR_ENABLED", True),
+            business_auto_reply_enabled=_bool(
+                "BUSINESS_AUTO_REPLY_ENABLED", True
+            ),
             business_archive_media=_bool("BUSINESS_ARCHIVE_MEDIA", True),
             business_archive_max_bytes=_int(
                 "BUSINESS_ARCHIVE_MAX_BYTES", 20 * 1024 * 1024, minimum=1

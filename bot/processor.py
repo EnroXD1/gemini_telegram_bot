@@ -55,7 +55,7 @@ class MessageProcessor:
 
         if sender is not None and sender.is_bot and lead.sender_chat is None:
             return
-        if await _is_outgoing_business_message(self.storage, lead):
+        if not await self.can_respond(lead):
             return
         if not self._is_chat_allowed(lead):
             return
@@ -187,6 +187,21 @@ class MessageProcessor:
             ):
                 return True
         return False
+
+    async def can_respond(self, message: Message) -> bool:
+        """Return whether this update may produce a reply to the interlocutor."""
+        if await _is_outgoing_business_message(self.storage, message):
+            return False
+        connection_id = message.business_connection_id
+        if not connection_id:
+            return True
+        connection = await self.storage.get_business_connection(connection_id)
+        if connection is None:
+            return True
+        return await self.storage.get_business_auto_reply_enabled(
+            connection.owner_user_id,
+            self.settings.business_auto_reply_enabled,
+        )
 
     def _is_chat_allowed(self, message: Message) -> bool:
         if not self.settings.allowed_chat_ids:

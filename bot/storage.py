@@ -101,6 +101,12 @@ class Storage:
                 greeted_at INTEGER NOT NULL,
                 PRIMARY KEY(connection_id, chat_id)
             );
+
+            CREATE TABLE IF NOT EXISTS business_owner_settings (
+                owner_user_id INTEGER PRIMARY KEY,
+                auto_reply_enabled INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             """
         )
         await self._db.commit()
@@ -314,6 +320,53 @@ class Storage:
                     int(is_enabled),
                     int(time.time()),
                 ),
+            )
+            await db.commit()
+
+    async def is_business_owner(self, user_id: int) -> bool:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                "SELECT 1 FROM business_connections WHERE owner_user_id = ? LIMIT 1",
+                (user_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return row is not None
+
+    async def get_business_auto_reply_enabled(
+        self, owner_user_id: int, default: bool
+    ) -> bool:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT auto_reply_enabled
+                FROM business_owner_settings
+                WHERE owner_user_id = ?
+                """,
+                (owner_user_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return default if row is None else bool(row["auto_reply_enabled"])
+
+    async def set_business_auto_reply_enabled(
+        self, owner_user_id: int, enabled: bool
+    ) -> None:
+        db = self._connection()
+        async with self._lock:
+            await db.execute(
+                """
+                INSERT INTO business_owner_settings(
+                    owner_user_id, auto_reply_enabled, updated_at
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(owner_user_id) DO UPDATE SET
+                    auto_reply_enabled = excluded.auto_reply_enabled,
+                    updated_at = excluded.updated_at
+                """,
+                (owner_user_id, int(enabled), int(time.time())),
             )
             await db.commit()
 

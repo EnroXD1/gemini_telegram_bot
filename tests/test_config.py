@@ -73,3 +73,17 @@ def test_openrouter_provider_requires_its_key(monkeypatch, tmp_path) -> None:
 
     with pytest.raises(ConfigError, match="OPENROUTER_API_KEY"):
         Settings.from_env(tmp_path / "missing.env")
+
+
+def test_business_auto_reply_can_default_to_monitoring_only(
+    monkeypatch, tmp_path
+) -> None:
+    for name in TOKEN_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("BUSINESS_AUTO_REPLY_ENABLED", "false")
+
+    settings = Settings.from_env(tmp_path / "missing.env")
+
+    assert settings.business_auto_reply_enabled is False
