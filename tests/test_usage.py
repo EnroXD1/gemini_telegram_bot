@@ -112,7 +112,7 @@ class UsageStorageTests(unittest.IsolatedAsyncioTestCase):
             connection_id="connection-1",
             owner_user_id=100,
             owner_chat_id=100,
-            is_enabled=True,
+            is_enabled=False,
         )
         bot = FakeBot()
         tracker = UsageTracker(

@@ -409,7 +409,6 @@ class Storage:
                 """
                 SELECT DISTINCT owner_chat_id
                 FROM business_connections
-                WHERE is_enabled = 1
                 """
             )
             rows = await cursor.fetchall()
