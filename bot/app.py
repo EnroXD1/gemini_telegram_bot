@@ -11,6 +11,7 @@ from aiogram.types import (
 )
 
 from .album import AlbumBuffer
+from .business import BusinessMonitor
 from .config import Settings
 from .gemini import GeminiService
 from .handlers import create_router
@@ -39,7 +40,13 @@ async def run_bot(settings: Settings) -> None:
             gemini=gemini,
             media=MediaExtractor(settings),
         )
-        dispatcher.include_router(create_router(processor, albums))
+        monitor = BusinessMonitor(bot=bot, settings=settings, storage=storage)
+        dispatcher.include_router(create_router(processor, albums, monitor))
+        removed = await storage.prune_business_messages(
+            settings.business_message_retention_days
+        )
+        if removed:
+            logger.info("Pruned %s expired business message snapshots", removed)
         await _set_commands(bot)
         await bot.delete_webhook(drop_pending_updates=settings.drop_pending_updates)
 

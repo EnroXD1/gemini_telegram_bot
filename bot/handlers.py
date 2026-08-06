@@ -3,20 +3,43 @@ from __future__ import annotations
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.filters.command import CommandObject
-from aiogram.types import Message
+from aiogram.types import BusinessConnection, BusinessMessagesDeleted, Message
 
 from .album import AlbumBuffer
+from .business import BusinessMessageCaptureMiddleware, BusinessMonitor
 from .processor import MessageProcessor
 
 
-def create_router(processor: MessageProcessor, albums: AlbumBuffer) -> Router:
+def create_router(
+    processor: MessageProcessor, albums: AlbumBuffer, monitor: BusinessMonitor
+) -> Router:
     router = Router(name="gemini-assistant")
+    router.business_message.outer_middleware(
+        BusinessMessageCaptureMiddleware(monitor)
+    )
+
+    @router.business_connection()
+    async def business_connection_handler(connection: BusinessConnection) -> None:
+        await monitor.handle_connection(connection)
+
+    @router.edited_business_message()
+    async def edited_business_message_handler(message: Message) -> None:
+        await monitor.handle_edited_message(message)
+
+    @router.deleted_business_messages()
+    async def deleted_business_messages_handler(
+        event: BusinessMessagesDeleted,
+    ) -> None:
+        await monitor.handle_deleted_messages(event)
 
     @router.message(Command("start"))
     @router.business_message(Command("start"))
     async def start_handler(message: Message) -> None:
         await message.reply(
             "Привет! Я передаю сообщения Gemini и отвечаю с учётом контекста.\n\n"
+            "Если подключить меня к Telegram Business с правом чтения сообщений, "
+            "я уведомлю вас об изменённых и удалённых сообщениях собеседников, а "
+            "также сохраню входящие фото, видео, голосовые и кружки.\n\n"
             "Мне можно отправлять текст, фото, PDF, текстовые документы, аудио, "
             "голосовые, видео, стикеры, геолокацию, контакты и опросы. Я также "
             "понимаю подписи, альбомы и сообщения, на которые вы отвечаете.\n\n"
@@ -34,6 +57,9 @@ def create_router(processor: MessageProcessor, albums: AlbumBuffer) -> Router:
             "/cancel — остановить текущий запрос\n"
             "/status — показать модель и режим этого чата\n"
             "/mode mentions|all|off — режим группы (только администратор)\n\n"
+            "Telegram Business: сохраняю исходный текст входящих сообщений на 30 "
+            "дней, уведомляю об изменениях и удалениях и сразу отправляю вам копию "
+            "входящих медиа. Секретные чаты обычным ботам недоступны.\n\n"
             "В личном чате я отвечаю на все поддерживаемые сообщения. В группе по "
             "умолчанию отвечаю на /ask, упоминание моего @username или ответ на моё "
             "сообщение."

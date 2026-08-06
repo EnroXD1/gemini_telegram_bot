@@ -99,6 +99,10 @@ class Settings:
     conversation_scope: str
     owner_ids: frozenset[int]
     allowed_chat_ids: frozenset[int]
+    business_monitor_enabled: bool
+    business_archive_media: bool
+    business_archive_max_bytes: int
+    business_message_retention_days: int
     max_media_bytes: int
     max_media_items: int
     max_text_file_chars: int
@@ -150,6 +154,14 @@ class Settings:
             ),
             owner_ids=_id_set("OWNER_IDS"),
             allowed_chat_ids=_id_set("ALLOWED_CHAT_IDS"),
+            business_monitor_enabled=_bool("BUSINESS_MONITOR_ENABLED", True),
+            business_archive_media=_bool("BUSINESS_ARCHIVE_MEDIA", True),
+            business_archive_max_bytes=_int(
+                "BUSINESS_ARCHIVE_MAX_BYTES", 20 * 1024 * 1024, minimum=1
+            ),
+            business_message_retention_days=_int(
+                "BUSINESS_MESSAGE_RETENTION_DAYS", 30, minimum=1
+            ),
             max_media_bytes=_int(
                 "MAX_MEDIA_BYTES", 20 * 1024 * 1024, minimum=1
             ),

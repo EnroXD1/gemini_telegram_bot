@@ -2,9 +2,31 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import aiosqlite
+
+
+@dataclass(frozen=True, slots=True)
+class BusinessConnectionRecord:
+    connection_id: str
+    owner_user_id: int
+    owner_chat_id: int
+    is_enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BusinessMessageRecord:
+    connection_id: str
+    chat_id: int
+    message_id: int
+    sender_user_id: int
+    sender_name: str
+    is_incoming: bool
+    content: str
+    media_kind: str | None = None
+    deleted_at: int | None = None
 
 
 class Storage:
@@ -33,6 +55,32 @@ class Storage:
                 group_mode TEXT NOT NULL CHECK(group_mode IN ('mentions', 'all', 'off')),
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS business_connections (
+                connection_id TEXT PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL,
+                owner_chat_id INTEGER NOT NULL,
+                is_enabled INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS business_messages (
+                connection_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                sender_user_id INTEGER NOT NULL,
+                sender_name TEXT NOT NULL,
+                is_incoming INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                media_kind TEXT,
+                deleted_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(connection_id, chat_id, message_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_business_messages_updated_at
+            ON business_messages(updated_at);
             """
         )
         await self._db.commit()
@@ -107,3 +155,184 @@ class Storage:
                 (chat_id, mode, int(time.time())),
             )
             await db.commit()
+
+    async def save_business_connection(
+        self,
+        *,
+        connection_id: str,
+        owner_user_id: int,
+        owner_chat_id: int,
+        is_enabled: bool,
+    ) -> None:
+        db = self._connection()
+        async with self._lock:
+            await db.execute(
+                """
+                INSERT INTO business_connections(
+                    connection_id, owner_user_id, owner_chat_id, is_enabled, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(connection_id) DO UPDATE SET
+                    owner_user_id = excluded.owner_user_id,
+                    owner_chat_id = excluded.owner_chat_id,
+                    is_enabled = excluded.is_enabled,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    connection_id,
+                    owner_user_id,
+                    owner_chat_id,
+                    int(is_enabled),
+                    int(time.time()),
+                ),
+            )
+            await db.commit()
+
+    async def get_business_connection(
+        self, connection_id: str
+    ) -> BusinessConnectionRecord | None:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT connection_id, owner_user_id, owner_chat_id, is_enabled
+                FROM business_connections
+                WHERE connection_id = ?
+                """,
+                (connection_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if row is None:
+            return None
+        return _business_connection_from_row(row)
+
+    async def upsert_business_message(
+        self, record: BusinessMessageRecord
+    ) -> BusinessMessageRecord | None:
+        """Store the newest version and return the version it replaced, if any."""
+        db = self._connection()
+        now = int(time.time())
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT connection_id, chat_id, message_id, sender_user_id,
+                       sender_name, is_incoming, content, media_kind, deleted_at
+                FROM business_messages
+                WHERE connection_id = ? AND chat_id = ? AND message_id = ?
+                """,
+                (record.connection_id, record.chat_id, record.message_id),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            previous = None if row is None else _business_message_from_row(row)
+            await db.execute(
+                """
+                INSERT INTO business_messages(
+                    connection_id, chat_id, message_id, sender_user_id, sender_name,
+                    is_incoming, content, media_kind, deleted_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(connection_id, chat_id, message_id) DO UPDATE SET
+                    sender_user_id = excluded.sender_user_id,
+                    sender_name = excluded.sender_name,
+                    is_incoming = excluded.is_incoming,
+                    content = excluded.content,
+                    media_kind = excluded.media_kind,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    record.connection_id,
+                    record.chat_id,
+                    record.message_id,
+                    record.sender_user_id,
+                    record.sender_name,
+                    int(record.is_incoming),
+                    record.content,
+                    record.media_kind,
+                    record.deleted_at,
+                    now,
+                    now,
+                ),
+            )
+            await db.commit()
+        return previous
+
+    async def get_business_messages(
+        self,
+        *,
+        connection_id: str,
+        chat_id: int,
+        message_ids: list[int],
+    ) -> list[BusinessMessageRecord]:
+        if not message_ids:
+            return []
+        db = self._connection()
+        placeholders = ", ".join("?" for _ in message_ids)
+        query = f"""
+            SELECT connection_id, chat_id, message_id, sender_user_id,
+                   sender_name, is_incoming, content, media_kind, deleted_at
+            FROM business_messages
+            WHERE connection_id = ? AND chat_id = ?
+              AND message_id IN ({placeholders})
+        """
+        parameters = (connection_id, chat_id, *message_ids)
+        async with self._lock:
+            cursor = await db.execute(query, parameters)
+            rows = await cursor.fetchall()
+            await cursor.close()
+        records = [_business_message_from_row(row) for row in rows]
+        order = {message_id: index for index, message_id in enumerate(message_ids)}
+        return sorted(records, key=lambda item: order.get(item.message_id, len(order)))
+
+    async def mark_business_message_deleted(
+        self, *, connection_id: str, chat_id: int, message_id: int
+    ) -> None:
+        db = self._connection()
+        now = int(time.time())
+        async with self._lock:
+            await db.execute(
+                """
+                UPDATE business_messages
+                SET deleted_at = ?, updated_at = ?
+                WHERE connection_id = ? AND chat_id = ? AND message_id = ?
+                """,
+                (now, now, connection_id, chat_id, message_id),
+            )
+            await db.commit()
+
+    async def prune_business_messages(self, retention_days: int) -> int:
+        db = self._connection()
+        cutoff = int(time.time()) - retention_days * 86_400
+        async with self._lock:
+            cursor = await db.execute(
+                "DELETE FROM business_messages WHERE updated_at < ?", (cutoff,)
+            )
+            removed = max(0, cursor.rowcount)
+            await cursor.close()
+            await db.commit()
+        return removed
+
+
+def _business_connection_from_row(row: aiosqlite.Row) -> BusinessConnectionRecord:
+    return BusinessConnectionRecord(
+        connection_id=str(row["connection_id"]),
+        owner_user_id=int(row["owner_user_id"]),
+        owner_chat_id=int(row["owner_chat_id"]),
+        is_enabled=bool(row["is_enabled"]),
+    )
+
+
+def _business_message_from_row(row: aiosqlite.Row) -> BusinessMessageRecord:
+    deleted_at = row["deleted_at"]
+    return BusinessMessageRecord(
+        connection_id=str(row["connection_id"]),
+        chat_id=int(row["chat_id"]),
+        message_id=int(row["message_id"]),
+        sender_user_id=int(row["sender_user_id"]),
+        sender_name=str(row["sender_name"]),
+        is_incoming=bool(row["is_incoming"]),
+        content=str(row["content"]),
+        media_kind=None if row["media_kind"] is None else str(row["media_kind"]),
+        deleted_at=None if deleted_at is None else int(deleted_at),
+    )
