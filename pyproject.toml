@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gemini-telegram-assistant"
-version = "1.4.0"
-description = "Telegram Business AI assistant with Gemini/OpenRouter and chat monitoring"
+version = "1.5.0"
+description = "Telegram Business AI assistant with Google, OpenRouter, Groq and chat monitoring"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

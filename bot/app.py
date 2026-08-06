@@ -14,7 +14,7 @@ from . import __version__
 from .album import AlbumBuffer
 from .business import BusinessMonitor
 from .config import Settings
-from .gemini import GeminiService
+from .gemini import GeminiService, ModelSelectionError
 from .handlers import create_router
 from .media import MediaExtractor
 from .processor import MessageProcessor
@@ -33,6 +33,12 @@ async def run_bot(settings: Settings) -> None:
 
     try:
         await storage.open()
+        saved_selection = await storage.get_ai_selection()
+        if saved_selection is not None:
+            try:
+                gemini.select_model(*saved_selection)
+            except ModelSelectionError as exc:
+                logger.warning("Ignoring unavailable saved AI selection: %s", exc)
         owners_removed = await storage.delete_bot_users(settings.owner_ids)
         if owners_removed:
             logger.info("Removed %s configured owners from usage audit", owners_removed)
@@ -68,8 +74,8 @@ async def run_bot(settings: Settings) -> None:
             "Starting @%s v%s with provider=%s model=%s fallback=%s",
             bot_user.username,
             __version__,
-            settings.ai_provider,
-            settings.active_model,
+            gemini.current_provider,
+            gemini.current_model,
             settings.groq_model if settings.groq_fallback_ready else "disabled",
         )
         await dispatcher.start_polling(
@@ -101,6 +107,7 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="chats", description="Настроить отдельные Business-чаты"),
         BotCommand(command="users", description="Кто пользуется ботом"),
         BotCommand(command="stats", description="Статистика использования"),
+        BotCommand(command="model", description="Выбрать AI-модель (владелец)"),
         BotCommand(command="status", description="Модель и состояние"),
     ]
     group_commands = private_commands + [

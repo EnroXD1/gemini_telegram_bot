@@ -100,7 +100,7 @@ class MessageProcessor:
             try:
                 previous_id = await self.storage.get_interaction_id(scope_key)
                 history: tuple[ConversationMessage, ...] = ()
-                if self.settings.ai_provider == "openrouter":
+                if self.gemini.uses_local_history:
                     try:
                         history = await self.storage.get_conversation_history(
                             scope_key=scope_key,
@@ -124,11 +124,11 @@ class MessageProcessor:
                     )
                     await self.usage.record(
                         lead,
-                        ai_provider=result.provider or self.settings.ai_provider,
+                        ai_provider=result.provider or self.gemini.current_provider,
                     )
 
                 try:
-                    if self.settings.ai_provider == "openrouter":
+                    if self.gemini.uses_local_history:
                         await self.storage.append_conversation_exchange(
                             scope_key=scope_key,
                             user_content=_history_user_content(
@@ -153,7 +153,7 @@ class MessageProcessor:
                 await self.reply(lead, result.text)
             except GeminiRequestError as exc:
                 await self.usage.record(
-                    lead, ai_provider=self.settings.ai_provider
+                    lead, ai_provider=self.gemini.current_provider
                 )
                 sent = await self.reply(lead, exc.user_message)
                 if exc.delete_after_seconds is not None:

@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from bot.gemini import GeminiRequestError, GeminiService
+from bot.gemini import GeminiRequestError, GeminiService, ModelSelectionError
 from bot.models import ConversationMessage, MediaPayload, PromptBundle
 
 
@@ -104,6 +104,8 @@ def make_service(
     service._groq_client = None
     service._semaphore = asyncio.Semaphore(1)
     service._interactions_available = True
+    service._provider = "google"
+    service._model = "gemini-test"
     return service
 
 
@@ -131,6 +133,8 @@ def make_openrouter_service(response_text: str) -> GeminiService:
     service._groq_client = None
     service._semaphore = asyncio.Semaphore(1)
     service._interactions_available = False
+    service._provider = "openrouter"
+    service._model = "google/gemini-3.5-flash"
     return service
 
 
@@ -245,6 +249,32 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         _, payload = service._groq_client.calls[0]
         self.assertEqual(payload["model"], "llama-3.1-8b-instant")
         self.assertEqual(payload["max_completion_tokens"], 256)
+
+    async def test_owner_selection_can_use_groq_as_primary(self) -> None:
+        service = make_openrouter_service("unused")
+        service._groq_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {"choices": [{"message": {"content": "прямой ответ Groq"}}]}
+                )
+            ]
+        )
+        service._settings.groq_model = "llama-3.1-8b-instant"
+
+        provider, model = service.select_model("groq")
+        result = await service.generate(PromptBundle(prompt="вопрос"), None)
+
+        self.assertEqual((provider, model), ("groq", "llama-3.1-8b-instant"))
+        self.assertEqual(result.text, "прямой ответ Groq")
+        self.assertEqual(result.provider, "groq")
+        _, payload = service._groq_client.calls[0]
+        self.assertEqual(payload["model"], "llama-3.1-8b-instant")
+
+    async def test_unconfigured_provider_cannot_be_selected(self) -> None:
+        service = make_openrouter_service("unused")
+
+        with self.assertRaises(ModelSelectionError):
+            service.select_model("groq")
 
     async def test_multimodal_limit_does_not_use_text_only_groq(self) -> None:
         service = make_openrouter_service("unused")

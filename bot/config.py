@@ -168,6 +168,8 @@ class Settings:
     def active_model(self) -> str:
         if self.ai_provider == "openrouter":
             return self.openrouter_model
+        if self.ai_provider == "groq":
+            return self.groq_model
         return self.gemini_model
 
     @property
@@ -179,7 +181,7 @@ class Settings:
         load_dotenv(dotenv_path=env_file, override=False)
 
         ai_provider = _choice(
-            "AI_PROVIDER", "google", {"google", "openrouter"}
+            "AI_PROVIDER", "google", {"google", "groq", "openrouter"}
         )
         gemini_api_key = (
             _required("GEMINI_API_KEY")
@@ -191,7 +193,11 @@ class Settings:
             if ai_provider == "openrouter"
             else os.getenv("OPENROUTER_API_KEY", "").strip()
         )
-        groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
+        groq_api_key = (
+            _required("GROQ_API_KEY")
+            if ai_provider == "groq"
+            else os.getenv("GROQ_API_KEY", "").strip()
+        )
 
         temperature = _float("GEMINI_TEMPERATURE", 0.7, 0.0)
         if temperature > 2.0:

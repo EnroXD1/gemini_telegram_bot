@@ -17,6 +17,7 @@ from aiogram.types import (
 from . import __version__
 from .album import AlbumBuffer
 from .business import BusinessMessageCaptureMiddleware, BusinessMonitor
+from .gemini import ModelSelectionError
 from .processor import MessageProcessor
 from .storage import BotUserRecord
 from .usage import BotUsageMiddleware, UsageTracker
@@ -81,6 +82,7 @@ def create_router(
             "/chats — режимы отдельных Business-собеседников\n"
             "/users — последние пользователи самого бота (только владелец)\n"
             "/stats — статистика использования (только владелец)\n\n"
+            "/model — выбрать провайдера и модель (только владелец)\n\n"
             "Telegram Business: сохраняю исходный текст входящих сообщений на 30 "
             "дней, уведомляю об изменениях и удалениях и сразу отправляю вам копию "
             "входящих медиа. Секретные чаты обычным ботам недоступны.\n\n"
@@ -290,6 +292,84 @@ def create_router(
         state = "автоответы включены" if enabled else "только мониторинг"
         await callback.answer(state)
 
+    @router.message(Command("model", "models"))
+    async def model_handler(message: Message, command: CommandObject) -> None:
+        user = message.from_user
+        if message.chat.type != "private" or user is None:
+            await message.reply("Выбор модели доступен в личном чате с ботом.")
+            return
+        if not _is_bot_owner(processor, user.id):
+            await message.reply("Выбирать общую AI-модель может только владелец бота.")
+            return
+
+        available = processor.gemini.configured_providers()
+        argument = (command.args or "").strip()
+        if not argument:
+            lines = [
+                "Текущая AI-конфигурация:",
+                f"{processor.gemini.current_provider} / "
+                f"{processor.gemini.current_model}",
+                "",
+                "Провайдеры с настроенными API-ключами:",
+            ]
+            lines.extend(
+                f"• {provider}: {default_model}"
+                for provider, default_model in available.items()
+            )
+            lines.extend(
+                [
+                    "",
+                    "Переключить на модель по умолчанию:",
+                    "/model groq",
+                    "/model openrouter",
+                    "/model google",
+                    "",
+                    "Указать точный ID модели:",
+                    "/model openrouter google/gemini-2.5-flash",
+                    "/model groq llama-3.1-8b-instant",
+                    "",
+                    "/model default — вернуть настройку из переменных окружения.",
+                ]
+            )
+            await message.reply("\n".join(lines))
+            return
+
+        provider, separator, model = argument.partition(" ")
+        if provider.lower() in {"default", "env", "поумолчанию"}:
+            provider = processor.settings.ai_provider
+            model = processor.settings.active_model
+        elif not separator:
+            model = ""
+
+        old_selection = (
+            processor.gemini.current_provider,
+            processor.gemini.current_model,
+        )
+        try:
+            selected_provider, selected_model = processor.gemini.select_model(
+                provider, model or None
+            )
+        except ModelSelectionError as exc:
+            await message.reply(str(exc))
+            return
+
+        await processor.storage.set_ai_selection(selected_provider, selected_model)
+        changed = old_selection != (selected_provider, selected_model)
+        if changed:
+            await processor.storage.clear_conversation_contexts()
+        context_note = (
+            "\nКонтексты диалогов сброшены, чтобы модели не смешивали цепочки."
+            if changed
+            else "\nЭта модель уже была выбрана."
+        )
+        await message.reply(
+            f"AI-модель переключена:\n"
+            f"Провайдер: {selected_provider}\n"
+            f"Модель: {selected_model}"
+            f"{context_note}\n\n"
+            "Выбор сохранён в SQLite и переживёт перезапуск бота."
+        )
+
     @router.message(Command("status"))
     @router.business_message(Command("status"))
     async def status_handler(message: Message) -> None:
@@ -301,17 +381,20 @@ def create_router(
                 message.chat.id, processor.settings.group_default_mode
             )
         scope_key = processor.scope_key(message)
-        if processor.settings.ai_provider == "openrouter":
+        if processor.gemini.uses_local_history:
             has_context = await processor.storage.has_conversation_history(scope_key)
             context_storage = (
                 "локально в SQLite, до "
                 f"{processor.settings.openrouter_history_turns} обменов"
             )
-            fallback = (
-                f"Groq / {processor.settings.groq_model} — готов"
-                if processor.settings.groq_fallback_ready
-                else "Groq — не настроен"
-            )
+            if processor.gemini.current_provider == "openrouter":
+                fallback = (
+                    f"Groq / {processor.settings.groq_model} — готов"
+                    if processor.settings.groq_fallback_ready
+                    else "Groq — не настроен"
+                )
+            else:
+                fallback = "не используется"
         else:
             interaction_id = await processor.storage.get_interaction_id(scope_key)
             has_context = bool(interaction_id)
@@ -324,8 +407,8 @@ def create_router(
         context = "есть" if has_context else "пуст"
         await message.reply(
             f"Версия: {__version__}\n"
-            f"Провайдер: {processor.settings.ai_provider}\n"
-            f"Модель: {processor.settings.active_model}\n"
+            f"Провайдер: {processor.gemini.current_provider}\n"
+            f"Модель: {processor.gemini.current_model}\n"
             f"Резерв: {fallback}\n"
             f"Режим чата: {mode}\n"
             f"Контекст: {context}\n"

@@ -174,6 +174,12 @@ class Storage:
 
             CREATE INDEX IF NOT EXISTS idx_bot_users_last_seen
             ON bot_users(last_seen_at DESC);
+
+            CREATE TABLE IF NOT EXISTS runtime_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             """
         )
         cursor = await self._db.execute("PRAGMA table_info(bot_users)")
@@ -195,6 +201,54 @@ class Storage:
         if self._db is not None:
             await self._db.close()
             self._db = None
+
+    async def get_ai_selection(self) -> tuple[str, str] | None:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT setting_key, setting_value
+                FROM runtime_settings
+                WHERE setting_key IN ('ai_provider', 'ai_model')
+                """
+            )
+            values = {
+                str(row["setting_key"]): str(row["setting_value"])
+                for row in await cursor.fetchall()
+            }
+            await cursor.close()
+        provider = values.get("ai_provider")
+        model = values.get("ai_model")
+        if not provider or not model:
+            return None
+        return provider, model
+
+    async def set_ai_selection(self, provider: str, model: str) -> None:
+        db = self._connection()
+        now = int(time.time())
+        async with self._lock:
+            await db.executemany(
+                """
+                INSERT INTO runtime_settings(setting_key, setting_value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    ("ai_provider", provider, now),
+                    ("ai_model", model, now),
+                ),
+            )
+            await db.commit()
+
+    async def clear_conversation_contexts(self) -> None:
+        """Reset provider-specific context after a global model switch."""
+        db = self._connection()
+        async with self._lock:
+            await db.execute("DELETE FROM conversations")
+            await db.execute("DELETE FROM conversation_exchanges")
+            await db.commit()
 
     async def get_interaction_id(self, scope_key: str) -> str | None:
         db = self._connection()
