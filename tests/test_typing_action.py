@@ -50,3 +50,13 @@ async def test_show_progress_animates_and_cleans_up() -> None:
     assert message.status.edits
     assert message.status.deleted is True
     assert message.bot.actions
+
+
+async def test_show_progress_displays_fallback_and_then_deletes_it() -> None:
+    message = FakeSourceMessage()
+
+    async with show_progress(message, interval=10.0) as progress:
+        await progress.show_fallback("llama-3.1-8b-instant")
+
+    assert "Переключаюсь на резервную модель Groq" in message.status.edits[-1]
+    assert message.status.deleted is True

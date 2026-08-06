@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from bot.gemini import GeminiService
+from bot.gemini import GeminiRequestError, GeminiService
 from bot.models import ConversationMessage, MediaPayload, PromptBundle
 
 
@@ -47,11 +47,15 @@ class FakeClient:
 
 
 class FakeOpenRouterResponse:
-    def __init__(self, payload: dict[str, object]) -> None:
+    def __init__(
+        self, payload: dict[str, object], *, error_code: int | None = None
+    ) -> None:
         self.payload = payload
+        self.error_code = error_code
 
     def raise_for_status(self) -> None:
-        return None
+        if self.error_code is not None:
+            raise FakeHttpError(self.error_code)
 
     def json(self) -> dict[str, object]:
         return self.payload
@@ -65,6 +69,12 @@ class FakeOpenRouterClient:
     async def post(self, url: str, *, json: dict[str, object]) -> FakeOpenRouterResponse:
         self.calls.append((url, json))
         return self.responses.pop(0)
+
+
+class FakeHttpError(RuntimeError):
+    def __init__(self, code: int) -> None:
+        super().__init__(f"HTTP {code}")
+        self.code = code
 
 
 class ContextError(RuntimeError):
@@ -91,6 +101,7 @@ def make_service(
     )
     service._client = FakeClient(responses, model_responses)
     service._openrouter_client = None
+    service._groq_client = None
     service._semaphore = asyncio.Semaphore(1)
     service._interactions_available = True
     return service
@@ -106,6 +117,8 @@ def make_openrouter_service(response_text: str) -> GeminiService:
         gemini_max_output_tokens=100,
         gemini_timeout_seconds=2.0,
         gemini_retry_attempts=1,
+        groq_model="llama-3.1-8b-instant",
+        groq_max_output_tokens=256,
     )
     service._client = None
     service._openrouter_client = FakeOpenRouterClient(
@@ -115,6 +128,7 @@ def make_openrouter_service(response_text: str) -> GeminiService:
             )
         ]
     )
+    service._groq_client = None
     service._semaphore = asyncio.Semaphore(1)
     service._interactions_available = False
     return service
@@ -144,6 +158,7 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.text, "ответ OpenRouter")
         self.assertIsNone(result.interaction_id)
+        self.assertEqual(result.provider, "openrouter")
         url, payload = service._openrouter_client.calls[0]
         self.assertEqual(url, "chat/completions")
         self.assertEqual(payload["model"], "google/gemini-3.5-flash")
@@ -203,6 +218,68 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[1]["content"], "старый вопрос")
         self.assertEqual(messages[2]["content"], "старый ответ")
 
+    async def test_openrouter_limit_switches_text_request_to_groq(self) -> None:
+        service = make_openrouter_service("unused")
+        service._openrouter_client = FakeOpenRouterClient(
+            [FakeOpenRouterResponse({}, error_code=429)]
+        )
+        service._groq_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {"choices": [{"message": {"content": "ответ Groq"}}]}
+                )
+            ]
+        )
+        switched_to: list[str] = []
+
+        async def on_fallback(model: str) -> None:
+            switched_to.append(model)
+
+        result = await service.generate(
+            PromptBundle(prompt="вопрос"), None, on_fallback=on_fallback
+        )
+
+        self.assertEqual(result.text, "ответ Groq")
+        self.assertEqual(result.provider, "groq")
+        self.assertEqual(switched_to, ["llama-3.1-8b-instant"])
+        _, payload = service._groq_client.calls[0]
+        self.assertEqual(payload["model"], "llama-3.1-8b-instant")
+        self.assertEqual(payload["max_completion_tokens"], 256)
+
+    async def test_multimodal_limit_does_not_use_text_only_groq(self) -> None:
+        service = make_openrouter_service("unused")
+        service._openrouter_client = FakeOpenRouterClient(
+            [FakeOpenRouterResponse({}, error_code=429)]
+        )
+        service._groq_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {"choices": [{"message": {"content": "не должен вызываться"}}]}
+                )
+            ]
+        )
+        bundle = PromptBundle(
+            prompt="опиши",
+            media=(MediaPayload("фото", "image", "image/jpeg", b"image"),),
+        )
+
+        with self.assertRaises(GeminiRequestError) as raised:
+            await service.generate(bundle, None)
+
+        self.assertEqual(service._groq_client.calls, [])
+        self.assertEqual(raised.exception.delete_after_seconds, 20.0)
+
+    async def test_openrouter_limit_error_is_marked_for_auto_deletion(self) -> None:
+        service = make_openrouter_service("unused")
+        service._openrouter_client = FakeOpenRouterClient(
+            [FakeOpenRouterResponse({}, error_code=429)]
+        )
+
+        with self.assertRaises(GeminiRequestError) as raised:
+            await service.generate(PromptBundle(prompt="вопрос"), None)
+
+        self.assertEqual(raised.exception.delete_after_seconds, 20.0)
+
     async def test_multimodal_request(self) -> None:
         service = make_service(
             [SimpleNamespace(id="new-id", output_text="ответ")]
@@ -222,6 +299,7 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         result = await service.generate(bundle, "old-id")
 
         self.assertEqual(result.text, "ответ")
+        self.assertEqual(result.provider, "google")
         self.assertEqual(result.interaction_id, "new-id")
         call = service._client.aio.interactions.calls[0]
         self.assertEqual(call["previous_interaction_id"], "old-id")

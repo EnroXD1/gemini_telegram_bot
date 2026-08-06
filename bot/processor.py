@@ -48,6 +48,7 @@ class MessageProcessor:
         )
         self._scope_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._active_tasks: dict[str, asyncio.Task[object]] = {}
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
     async def process(self, messages: list[Message], *, force: bool = False) -> None:
         if not messages:
@@ -111,15 +112,19 @@ class MessageProcessor:
                             "Could not load local conversation history scope=%s",
                             scope_key,
                         )
-                async with show_progress(lead):
+                async with show_progress(lead) as progress:
                     bundle = await self.media.prepare(
                         bot=self.bot, messages=ordered, user_text=clean_text
                     )
-                    await self.usage.record(
-                        lead, ai_provider=self.settings.ai_provider
-                    )
                     result = await self.gemini.generate(
-                        bundle, previous_id, history=history
+                        bundle,
+                        previous_id,
+                        history=history,
+                        on_fallback=progress.show_fallback,
+                    )
+                    await self.usage.record(
+                        lead,
+                        ai_provider=result.provider or self.settings.ai_provider,
                     )
 
                 try:
@@ -147,7 +152,12 @@ class MessageProcessor:
                     )
                 await self.reply(lead, result.text)
             except GeminiRequestError as exc:
-                await self.reply(lead, exc.user_message)
+                await self.usage.record(
+                    lead, ai_provider=self.settings.ai_provider
+                )
+                sent = await self.reply(lead, exc.user_message)
+                if exc.delete_after_seconds is not None:
+                    self._schedule_deletion(sent, exc.delete_after_seconds)
             except asyncio.CancelledError:
                 logger.info("Gemini request cancelled scope=%s", scope_key)
             except Exception:
@@ -241,22 +251,24 @@ class MessageProcessor:
         task.cancel()
         return True
 
-    async def reply(self, message: Message, text: str) -> None:
+    async def reply(self, message: Message, text: str) -> list[Message]:
         chunks = render_markdown_chunks(text, self.settings.reply_chunk_size)
         if not chunks:
             chunks = [FormattedChunk("Gemini не вернул текстовый ответ.")]
+        sent_messages: list[Message] = []
         for index, chunk in enumerate(chunks):
             entities = list(chunk.entities) or None
             while True:
                 try:
                     if index == 0:
-                        await message.reply(
+                        sent = await message.reply(
                             chunk.text,
                             entities=entities,
                             allow_sending_without_reply=True,
                         )
                     else:
-                        await message.answer(chunk.text, entities=entities)
+                        sent = await message.answer(chunk.text, entities=entities)
+                    sent_messages.append(sent)
                     break
                 except TelegramRetryAfter as exc:
                     await asyncio.sleep(max(0.1, float(exc.retry_after)))
@@ -270,6 +282,19 @@ class MessageProcessor:
                     entities = None
             if index + 1 < len(chunks):
                 await asyncio.sleep(0.05)
+        return sent_messages
+
+    def _schedule_deletion(
+        self, messages: list[Message], delay_seconds: float
+    ) -> None:
+        if not messages:
+            return
+        task = asyncio.create_task(
+            _delete_messages_later(messages, delay_seconds),
+            name="telegram-delete-transient-error",
+        )
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
 
 
 def _collect_text(messages: list[Message]) -> str:
@@ -365,3 +390,14 @@ def _trim_history_item(value: str, limit: int) -> str:
     head = max(1, (limit - len(marker)) // 3)
     tail = max(1, limit - len(marker) - head)
     return text[:head] + marker + text[-tail:]
+
+
+async def _delete_messages_later(
+    messages: list[Message], delay_seconds: float
+) -> None:
+    await asyncio.sleep(max(0.0, delay_seconds))
+    for message in messages:
+        try:
+            await message.delete()
+        except Exception as exc:
+            logger.debug("Could not delete transient error: %s", type(exc).__name__)

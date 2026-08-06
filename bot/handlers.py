@@ -307,6 +307,11 @@ def create_router(
                 "локально в SQLite, до "
                 f"{processor.settings.openrouter_history_turns} обменов"
             )
+            fallback = (
+                f"Groq / {processor.settings.groq_model} — готов"
+                if processor.settings.groq_fallback_ready
+                else "Groq — не настроен"
+            )
         else:
             interaction_id = await processor.storage.get_interaction_id(scope_key)
             has_context = bool(interaction_id)
@@ -315,11 +320,13 @@ def create_router(
                 if processor.settings.gemini_store_interactions
                 else "не используется"
             )
+            fallback = "не используется"
         context = "есть" if has_context else "пуст"
         await message.reply(
             f"Версия: {__version__}\n"
             f"Провайдер: {processor.settings.ai_provider}\n"
             f"Модель: {processor.settings.active_model}\n"
+            f"Резерв: {fallback}\n"
             f"Режим чата: {mode}\n"
             f"Контекст: {context}\n"
             f"Серверное хранение контекста: {context_storage}"
@@ -372,6 +379,7 @@ def create_router(
             f"Учтённых обращений: {stats.interaction_count}\n"
             f"AI-запросов: {stats.ai_request_count}\n"
             f"Через OpenRouter: {stats.openrouter_request_count}\n"
+            f"Через резерв Groq: {stats.groq_request_count}\n"
             f"Напрямую Google: {stats.google_request_count}\n\n"
             "Business-собеседники считаются отдельно и доступны через /chats."
         )
@@ -503,6 +511,8 @@ def _format_bot_user(index: int, record: BotUserRecord) -> str:
     provider_parts: list[str] = []
     if record.openrouter_request_count:
         provider_parts.append(f"OpenRouter: {record.openrouter_request_count}")
+    if record.groq_request_count:
+        provider_parts.append(f"Groq: {record.groq_request_count}")
     if record.google_request_count:
         provider_parts.append(f"Google: {record.google_request_count}")
     providers = ", ".join(provider_parts) if provider_parts else "AI ещё не вызывался"

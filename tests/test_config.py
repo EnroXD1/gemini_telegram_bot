@@ -75,6 +75,21 @@ def test_openrouter_provider_requires_its_key(monkeypatch, tmp_path) -> None:
         Settings.from_env(tmp_path / "missing.env")
 
 
+def test_groq_fallback_is_enabled_when_key_is_present(monkeypatch, tmp_path) -> None:
+    for name in TOKEN_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("AI_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
+
+    settings = Settings.from_env(tmp_path / "missing.env")
+
+    assert settings.groq_fallback_ready is True
+    assert settings.groq_model == "llama-3.1-8b-instant"
+    assert settings.groq_max_output_tokens == 1024
+
+
 def test_business_auto_reply_can_default_to_monitoring_only(
     monkeypatch, tmp_path
 ) -> None:

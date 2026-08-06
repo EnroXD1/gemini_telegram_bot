@@ -65,11 +65,12 @@ async def run_bot(settings: Settings) -> None:
         await bot.delete_webhook(drop_pending_updates=settings.drop_pending_updates)
 
         logger.info(
-            "Starting @%s v%s with provider=%s model=%s",
+            "Starting @%s v%s with provider=%s model=%s fallback=%s",
             bot_user.username,
             __version__,
             settings.ai_provider,
             settings.active_model,
+            settings.groq_model if settings.groq_fallback_ready else "disabled",
         )
         await dispatcher.start_polling(
             bot,

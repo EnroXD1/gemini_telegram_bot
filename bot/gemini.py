@@ -4,6 +4,7 @@ import asyncio
 import base64
 import logging
 import random
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -18,12 +19,18 @@ logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/"
 OPENROUTER_APP_URL = "https://github.com/EnroXD1/gemini_telegram_bot"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1/"
+
+FallbackNotifier = Callable[[str], Awaitable[None]]
 
 
 class GeminiRequestError(RuntimeError):
-    def __init__(self, user_message: str) -> None:
+    def __init__(
+        self, user_message: str, *, delete_after_seconds: float | None = None
+    ) -> None:
         super().__init__(user_message)
         self.user_message = user_message
+        self.delete_after_seconds = delete_after_seconds
 
 
 class GeminiService:
@@ -32,6 +39,7 @@ class GeminiService:
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
         self._client: Any | None = None
         self._openrouter_client: httpx.AsyncClient | None = None
+        self._groq_client: httpx.AsyncClient | None = None
 
         if settings.ai_provider == "openrouter":
             self._openrouter_client = httpx.AsyncClient(
@@ -44,6 +52,12 @@ class GeminiService:
                 timeout=settings.gemini_timeout_seconds,
             )
             self._interactions_available = False
+            if settings.groq_fallback_ready:
+                self._groq_client = httpx.AsyncClient(
+                    base_url=GROQ_BASE_URL,
+                    headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                    timeout=settings.gemini_timeout_seconds,
+                )
         else:
             client_kwargs: dict[str, Any] = {"api_key": settings.gemini_api_key}
             if settings.gemini_vertex_ai:
@@ -54,6 +68,8 @@ class GeminiService:
     async def close(self) -> None:
         if self._openrouter_client is not None:
             await self._openrouter_client.aclose()
+        if self._groq_client is not None:
+            await self._groq_client.aclose()
         if self._client is not None:
             await self._client.aio.aclose()
 
@@ -62,10 +78,11 @@ class GeminiService:
         bundle: PromptBundle,
         previous_interaction_id: str | None,
         history: tuple[ConversationMessage, ...] = (),
+        on_fallback: FallbackNotifier | None = None,
     ) -> GeminiResult:
         if self._settings.ai_provider == "openrouter":
             return await self._generate_openrouter(
-                bundle, previous_interaction_id, history
+                bundle, previous_interaction_id, history, on_fallback
             )
 
         request_input = _build_input(bundle)
@@ -134,6 +151,7 @@ class GeminiService:
                         text=text,
                         interaction_id=interaction_id,
                         context_was_reset=context_was_reset,
+                        provider="google",
                     )
                 except GeminiRequestError:
                     raise
@@ -189,6 +207,7 @@ class GeminiService:
         bundle: PromptBundle,
         previous_interaction_id: str | None,
         history: tuple[ConversationMessage, ...],
+        on_fallback: FallbackNotifier | None,
     ) -> GeminiResult:
         client = self._openrouter_client
         if client is None:
@@ -239,6 +258,7 @@ class GeminiService:
                         text=text,
                         interaction_id=None,
                         context_was_reset=bool(previous_interaction_id),
+                        provider="openrouter",
                     )
                 except GeminiRequestError:
                     raise
@@ -269,9 +289,108 @@ class GeminiService:
                         code,
                         type(exc).__name__,
                     )
+                    if self._can_fallback_to_groq(code, bundle):
+                        await self._notify_fallback(on_fallback)
+                        try:
+                            return await self._generate_groq(
+                                messages, previous_interaction_id
+                            )
+                        except GeminiRequestError as fallback_exc:
+                            raise GeminiRequestError(
+                                "Основная модель OpenRouter временно недоступна. "
+                                f"{fallback_exc.user_message}"
+                            ) from exc
                     raise GeminiRequestError(
-                        _friendly_openrouter_error(code)
+                        _friendly_openrouter_error(code),
+                        delete_after_seconds=20.0 if code == 429 else None,
                     ) from exc
+
+    def _can_fallback_to_groq(
+        self, code: int | None, bundle: PromptBundle
+    ) -> bool:
+        return (
+            self._groq_client is not None
+            and not bundle.media
+            and code in {402, 408, 429, 500, 502, 503, 504}
+        )
+
+    async def _notify_fallback(
+        self, notifier: FallbackNotifier | None
+    ) -> None:
+        logger.warning(
+            "Switching from OpenRouter to Groq model=%s",
+            self._settings.groq_model,
+        )
+        if notifier is None:
+            return
+        try:
+            await notifier(self._settings.groq_model)
+        except Exception:
+            logger.exception("Could not show Groq fallback status")
+
+    async def _generate_groq(
+        self,
+        messages: list[dict[str, Any]],
+        previous_interaction_id: str | None,
+    ) -> GeminiResult:
+        client = self._groq_client
+        if client is None:
+            raise RuntimeError("Groq fallback client is not initialized")
+        payload = {
+            "model": self._settings.groq_model,
+            "messages": messages,
+            "temperature": self._settings.gemini_temperature,
+            "max_completion_tokens": self._settings.groq_max_output_tokens,
+            "stream": False,
+        }
+        attempt = 0
+        while True:
+            try:
+                async with asyncio.timeout(self._settings.gemini_timeout_seconds):
+                    response = await client.post("chat/completions", json=payload)
+                    response.raise_for_status()
+                text = _extract_openrouter_text(response.json())
+                if not text:
+                    raise GeminiRequestError(
+                        "Резервная модель Groq не вернула текстовый ответ. "
+                        "Попробуйте переформулировать сообщение."
+                    )
+                return GeminiResult(
+                    text=text,
+                    interaction_id=None,
+                    context_was_reset=bool(previous_interaction_id),
+                    provider="groq",
+                )
+            except GeminiRequestError:
+                raise
+            except TimeoutError as exc:
+                raise GeminiRequestError(
+                    "Резервная модель Groq не успела ответить. "
+                    "Попробуйте немного позже."
+                ) from exc
+            except Exception as exc:
+                code = _error_code(exc)
+                attempt += 1
+                if (
+                    _is_retryable(exc, code)
+                    and code != 429
+                    and attempt < self._settings.gemini_retry_attempts
+                ):
+                    delay = min(4.0, (2 ** (attempt - 1)) + random.random())
+                    logger.warning(
+                        "Retryable Groq error code=%s attempt=%s type=%s",
+                        code,
+                        attempt,
+                        type(exc).__name__,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.exception(
+                    "Groq fallback failed code=%s type=%s",
+                    code,
+                    type(exc).__name__,
+                )
+                raise GeminiRequestError(_friendly_groq_error(code)) from exc
 
 
 def _build_input(bundle: PromptBundle) -> str | list[dict[str, str]]:
@@ -495,3 +614,24 @@ def _friendly_openrouter_error(code: int | None) -> str:
     if code in {500, 502, 503, 504}:
         return "OpenRouter или выбранный поставщик временно недоступен. Попробуйте позже."
     return "Не удалось получить ответ через OpenRouter. Попробуйте ещё раз позднее."
+
+
+def _friendly_groq_error(code: int | None) -> str:
+    if code in {401, 403}:
+        return (
+            "Резервная модель Groq отклонила ключ API. Владельцу бота нужно "
+            "проверить GROQ_API_KEY."
+        )
+    if code == 429:
+        return (
+            "Лимиты основной и резервной моделей временно исчерпаны. "
+            "Попробуйте немного позже."
+        )
+    if code == 400:
+        return (
+            "Резервная модель Groq не смогла обработать текст запроса. "
+            "Попробуйте переформулировать сообщение."
+        )
+    if code in {500, 502, 503, 504}:
+        return "Основная и резервная модели временно недоступны. Попробуйте позже."
+    return "Не удалось получить ответ от резервной модели Groq. Попробуйте позже."

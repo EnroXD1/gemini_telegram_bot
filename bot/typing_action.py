@@ -57,13 +57,56 @@ async def _progress_loop(status: Message, interval: float) -> None:
             logger.debug("Could not animate progress message: %s", type(exc).__name__)
 
 
+class ProgressReporter:
+    def __init__(self) -> None:
+        self._status: Message | None = None
+        self._animation: asyncio.Task[None] | None = None
+
+    def bind(
+        self, status: Message, animation: asyncio.Task[None]
+    ) -> None:
+        self._status = status
+        self._animation = animation
+
+    async def show_fallback(self, model: str) -> None:
+        """Replace animation with a stable provider-switch notification."""
+        if self._animation is not None:
+            self._animation.cancel()
+            await asyncio.gather(self._animation, return_exceptions=True)
+            self._animation = None
+        if self._status is None:
+            return
+        try:
+            await self._status.edit_text(
+                "⚡ Лимит OpenRouter исчерпан.\n"
+                f"🔄 Переключаюсь на резервную модель Groq ({model})…"
+            )
+        except Exception as exc:
+            logger.debug("Could not show fallback status: %s", type(exc).__name__)
+
+    async def close(self) -> None:
+        if self._animation is not None:
+            self._animation.cancel()
+            await asyncio.gather(self._animation, return_exceptions=True)
+            self._animation = None
+        if self._status is not None:
+            try:
+                await self._status.delete()
+            except Exception as exc:
+                logger.debug(
+                    "Could not delete progress message: %s", type(exc).__name__
+                )
+                with suppress(Exception):
+                    await self._status.edit_text("✅ Обработка завершена")
+            self._status = None
+
+
 @asynccontextmanager
 async def show_progress(
     message: Message, interval: float = 3.0
-) -> AsyncIterator[None]:
+) -> AsyncIterator[ProgressReporter]:
     """Show Telegram typing and a temporary, animated progress message."""
-    status: Message | None = None
-    progress_task: asyncio.Task[None] | None = None
+    reporter = ProgressReporter()
 
     async with keep_typing(message):
         try:
@@ -73,21 +116,11 @@ async def show_progress(
             progress_task = asyncio.create_task(
                 _progress_loop(status, interval), name="telegram-progress"
             )
+            reporter.bind(status, progress_task)
         except Exception as exc:
             logger.debug("Could not send progress message: %s", type(exc).__name__)
 
         try:
-            yield
+            yield reporter
         finally:
-            if progress_task is not None:
-                progress_task.cancel()
-                await asyncio.gather(progress_task, return_exceptions=True)
-            if status is not None:
-                try:
-                    await status.delete()
-                except Exception as exc:
-                    logger.debug(
-                        "Could not delete progress message: %s", type(exc).__name__
-                    )
-                    with suppress(Exception):
-                        await status.edit_text("✅ Обработка завершена")
+            await reporter.close()

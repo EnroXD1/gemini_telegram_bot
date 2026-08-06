@@ -52,6 +52,7 @@ class BotUserRecord:
     interaction_count: int
     ai_request_count: int
     openrouter_request_count: int
+    groq_request_count: int
     google_request_count: int
 
 
@@ -66,6 +67,7 @@ class BotUsageStats:
     interaction_count: int
     ai_request_count: int
     openrouter_request_count: int
+    groq_request_count: int
     google_request_count: int
 
 
@@ -166,6 +168,7 @@ class Storage:
                 interaction_count INTEGER NOT NULL,
                 ai_request_count INTEGER NOT NULL,
                 openrouter_request_count INTEGER NOT NULL,
+                groq_request_count INTEGER NOT NULL DEFAULT 0,
                 google_request_count INTEGER NOT NULL
             );
 
@@ -173,6 +176,14 @@ class Storage:
             ON bot_users(last_seen_at DESC);
             """
         )
+        cursor = await self._db.execute("PRAGMA table_info(bot_users)")
+        bot_user_columns = {str(row[1]) for row in await cursor.fetchall()}
+        await cursor.close()
+        if "groq_request_count" not in bot_user_columns:
+            await self._db.execute(
+                "ALTER TABLE bot_users ADD COLUMN "
+                "groq_request_count INTEGER NOT NULL DEFAULT 0"
+            )
         await self._db.commit()
 
     def _connection(self) -> aiosqlite.Connection:
@@ -443,6 +454,7 @@ class Storage:
         now = int(time.time())
         ai_increment = int(ai_provider is not None)
         openrouter_increment = int(ai_provider == "openrouter")
+        groq_increment = int(ai_provider == "groq")
         google_increment = int(ai_provider == "google")
         async with self._lock:
             cursor = await db.execute(
@@ -457,9 +469,10 @@ class Storage:
                     user_id, username, display_name, first_seen_at, last_seen_at,
                     last_chat_id, last_chat_type, last_chat_title,
                     interaction_count, ai_request_count,
-                    openrouter_request_count, google_request_count
+                    openrouter_request_count, groq_request_count,
+                    google_request_count
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     username = excluded.username,
                     display_name = excluded.display_name,
@@ -472,6 +485,10 @@ class Storage:
                     openrouter_request_count = (
                         bot_users.openrouter_request_count
                         + excluded.openrouter_request_count
+                    ),
+                    groq_request_count = (
+                        bot_users.groq_request_count
+                        + excluded.groq_request_count
                     ),
                     google_request_count = (
                         bot_users.google_request_count
@@ -489,6 +506,7 @@ class Storage:
                     chat_title,
                     ai_increment,
                     openrouter_increment,
+                    groq_increment,
                     google_increment,
                 ),
             )
@@ -506,7 +524,8 @@ class Storage:
                     user_id, username, display_name, first_seen_at, last_seen_at,
                     last_chat_id, last_chat_type, last_chat_title,
                     interaction_count, ai_request_count,
-                    openrouter_request_count, google_request_count
+                    openrouter_request_count, groq_request_count,
+                    google_request_count
                 FROM bot_users
                 ORDER BY last_seen_at DESC, user_id DESC
                 LIMIT ?
@@ -535,6 +554,7 @@ class Storage:
                     COALESCE(SUM(ai_request_count), 0) AS ai_request_count,
                     COALESCE(SUM(openrouter_request_count), 0)
                         AS openrouter_request_count,
+                    COALESCE(SUM(groq_request_count), 0) AS groq_request_count,
                     COALESCE(SUM(google_request_count), 0) AS google_request_count
                 FROM bot_users
                 """,
@@ -553,6 +573,7 @@ class Storage:
             interaction_count=int(row["interaction_count"]),
             ai_request_count=int(row["ai_request_count"]),
             openrouter_request_count=int(row["openrouter_request_count"]),
+            groq_request_count=int(row["groq_request_count"]),
             google_request_count=int(row["google_request_count"]),
         )
 
@@ -910,6 +931,7 @@ def _bot_user_from_row(row: aiosqlite.Row) -> BotUserRecord:
         interaction_count=int(row["interaction_count"]),
         ai_request_count=int(row["ai_request_count"]),
         openrouter_request_count=int(row["openrouter_request_count"]),
+        groq_request_count=int(row["groq_request_count"]),
         google_request_count=int(row["google_request_count"]),
     )
 

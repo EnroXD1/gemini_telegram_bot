@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from datetime import UTC, datetime
@@ -82,6 +83,15 @@ class UsageStorageTests(unittest.IsolatedAsyncioTestCase):
             ai_provider="openrouter",
         )
         await self.storage.record_bot_user_activity(
+            user_id=200,
+            username="ivan_new",
+            display_name="Иван Новый",
+            chat_id=200,
+            chat_type="private",
+            chat_title=None,
+            ai_provider="groq",
+        )
+        await self.storage.record_bot_user_activity(
             user_id=201,
             username=None,
             display_name="Анна",
@@ -97,15 +107,17 @@ class UsageStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first)
         self.assertFalse(second)
         self.assertEqual(records[200].username, "ivan_new")
-        self.assertEqual(records[200].interaction_count, 2)
-        self.assertEqual(records[200].ai_request_count, 1)
+        self.assertEqual(records[200].interaction_count, 3)
+        self.assertEqual(records[200].ai_request_count, 2)
         self.assertEqual(records[200].openrouter_request_count, 1)
+        self.assertEqual(records[200].groq_request_count, 1)
         self.assertEqual(stats.total_users, 2)
         self.assertEqual(stats.private_users, 1)
         self.assertEqual(stats.group_users, 1)
-        self.assertEqual(stats.interaction_count, 3)
-        self.assertEqual(stats.ai_request_count, 2)
+        self.assertEqual(stats.interaction_count, 4)
+        self.assertEqual(stats.ai_request_count, 3)
         self.assertEqual(stats.openrouter_request_count, 1)
+        self.assertEqual(stats.groq_request_count, 1)
         self.assertEqual(stats.google_request_count, 1)
 
     async def test_new_user_notification_is_sent_only_once(self) -> None:
@@ -210,6 +222,49 @@ class UsageStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(removed, 1)
         records = await self.storage.list_bot_users()
         self.assertEqual([record.user_id for record in records], [200])
+
+    async def test_existing_usage_database_is_migrated_for_groq_counter(self) -> None:
+        legacy_path = Path(self.temp_dir.name) / "legacy.sqlite3"
+        connection = sqlite3.connect(legacy_path)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE bot_users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    display_name TEXT NOT NULL,
+                    first_seen_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    last_chat_id INTEGER NOT NULL,
+                    last_chat_type TEXT NOT NULL,
+                    last_chat_title TEXT,
+                    interaction_count INTEGER NOT NULL,
+                    ai_request_count INTEGER NOT NULL,
+                    openrouter_request_count INTEGER NOT NULL,
+                    google_request_count INTEGER NOT NULL
+                )
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        legacy_storage = Storage(legacy_path)
+        await legacy_storage.open()
+        try:
+            await legacy_storage.record_bot_user_activity(
+                user_id=300,
+                username="fallback",
+                display_name="Fallback",
+                chat_id=300,
+                chat_type="private",
+                chat_title=None,
+                ai_provider="groq",
+            )
+            records = await legacy_storage.list_bot_users()
+            self.assertEqual(records[0].groq_request_count, 1)
+        finally:
+            await legacy_storage.close()
 
     def test_command_middleware_leaves_ask_for_processor(self) -> None:
         self.assertTrue(_is_non_ai_command(make_message(text="/start")))

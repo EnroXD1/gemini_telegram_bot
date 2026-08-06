@@ -130,6 +130,10 @@ class Settings:
     openrouter_history_item_chars: int
     openrouter_history_max_chars: int
     openrouter_history_retention_days: int
+    groq_api_key: str
+    groq_fallback_enabled: bool
+    groq_model: str
+    groq_max_output_tokens: int
     gemini_system_prompt: str
     gemini_temperature: float
     gemini_max_output_tokens: int
@@ -166,6 +170,10 @@ class Settings:
             return self.openrouter_model
         return self.gemini_model
 
+    @property
+    def groq_fallback_ready(self) -> bool:
+        return self.groq_fallback_enabled and bool(self.groq_api_key)
+
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> Settings:
         load_dotenv(dotenv_path=env_file, override=False)
@@ -183,6 +191,7 @@ class Settings:
             if ai_provider == "openrouter"
             else os.getenv("OPENROUTER_API_KEY", "").strip()
         )
+        groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
 
         temperature = _float("GEMINI_TEMPERATURE", 0.7, 0.0)
         if temperature > 2.0:
@@ -218,6 +227,17 @@ class Settings:
             ),
             openrouter_history_retention_days=_int(
                 "OPENROUTER_HISTORY_RETENTION_DAYS", 30, minimum=1
+            ),
+            groq_api_key=groq_api_key,
+            groq_fallback_enabled=_bool(
+                "GROQ_FALLBACK_ENABLED", bool(groq_api_key)
+            ),
+            groq_model=(
+                os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
+                or "llama-3.1-8b-instant"
+            ),
+            groq_max_output_tokens=_int(
+                "GROQ_MAX_OUTPUT_TOKENS", 1024, minimum=1
             ),
             gemini_system_prompt=os.getenv(
                 "GEMINI_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT
