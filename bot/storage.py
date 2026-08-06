@@ -7,6 +7,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from .models import ConversationMessage
+
 
 @dataclass(frozen=True, slots=True)
 class BusinessConnectionRecord:
@@ -56,6 +58,17 @@ class Storage:
                 updated_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS conversation_exchanges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope_key TEXT NOT NULL,
+                user_content TEXT NOT NULL,
+                assistant_content TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_conversation_exchanges_scope
+            ON conversation_exchanges(scope_key, id DESC);
+
             CREATE TABLE IF NOT EXISTS business_connections (
                 connection_id TEXT PRIMARY KEY,
                 owner_user_id INTEGER NOT NULL,
@@ -81,6 +94,13 @@ class Storage:
 
             CREATE INDEX IF NOT EXISTS idx_business_messages_updated_at
             ON business_messages(updated_at);
+
+            CREATE TABLE IF NOT EXISTS business_greetings (
+                connection_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                greeted_at INTEGER NOT NULL,
+                PRIMARY KEY(connection_id, chat_id)
+            );
             """
         )
         await self._db.commit()
@@ -127,7 +147,116 @@ class Storage:
         db = self._connection()
         async with self._lock:
             await db.execute("DELETE FROM conversations WHERE scope_key = ?", (scope_key,))
+            await db.execute(
+                "DELETE FROM conversation_exchanges WHERE scope_key = ?", (scope_key,)
+            )
             await db.commit()
+
+    async def get_conversation_history(
+        self, *, scope_key: str, max_exchanges: int, max_chars: int
+    ) -> tuple[ConversationMessage, ...]:
+        if max_exchanges <= 0 or max_chars <= 0:
+            return ()
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT user_content, assistant_content
+                FROM conversation_exchanges
+                WHERE scope_key = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (scope_key, max_exchanges),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+
+        selected: list[tuple[str, str]] = []
+        used_chars = 0
+        for row in rows:
+            user_content = str(row["user_content"])
+            assistant_content = str(row["assistant_content"])
+            pair_chars = len(user_content) + len(assistant_content)
+            if used_chars + pair_chars > max_chars:
+                if selected:
+                    break
+                half = max(1, max_chars // 2)
+                selected.append(
+                    (
+                        _trim_history_text(user_content, half),
+                        _trim_history_text(assistant_content, max_chars - half),
+                    )
+                )
+                break
+            selected.append((user_content, assistant_content))
+            used_chars += pair_chars
+
+        messages: list[ConversationMessage] = []
+        for user_content, assistant_content in reversed(selected):
+            messages.append(ConversationMessage(role="user", content=user_content))
+            messages.append(
+                ConversationMessage(role="assistant", content=assistant_content)
+            )
+        return tuple(messages)
+
+    async def append_conversation_exchange(
+        self,
+        *,
+        scope_key: str,
+        user_content: str,
+        assistant_content: str,
+        max_exchanges: int,
+    ) -> None:
+        if max_exchanges <= 0:
+            return
+        db = self._connection()
+        async with self._lock:
+            await db.execute(
+                """
+                INSERT INTO conversation_exchanges(
+                    scope_key, user_content, assistant_content, created_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (scope_key, user_content, assistant_content, int(time.time())),
+            )
+            await db.execute(
+                """
+                DELETE FROM conversation_exchanges
+                WHERE scope_key = ? AND id NOT IN (
+                    SELECT id FROM conversation_exchanges
+                    WHERE scope_key = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                """,
+                (scope_key, scope_key, max_exchanges),
+            )
+            await db.commit()
+
+    async def has_conversation_history(self, scope_key: str) -> bool:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                "SELECT 1 FROM conversation_exchanges WHERE scope_key = ? LIMIT 1",
+                (scope_key,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return row is not None
+
+    async def prune_conversation_history(self, retention_days: int) -> int:
+        db = self._connection()
+        cutoff = int(time.time()) - retention_days * 86_400
+        async with self._lock:
+            cursor = await db.execute(
+                "DELETE FROM conversation_exchanges WHERE created_at < ?", (cutoff,)
+            )
+            removed = max(0, cursor.rowcount)
+            await cursor.close()
+            await db.commit()
+        return removed
 
     async def get_group_mode(self, chat_id: int, default: str) -> str:
         db = self._connection()
@@ -185,6 +314,36 @@ class Storage:
                     int(is_enabled),
                     int(time.time()),
                 ),
+            )
+            await db.commit()
+
+    async def claim_business_greeting(
+        self, *, connection_id: str, chat_id: int
+    ) -> bool:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                INSERT OR IGNORE INTO business_greetings(
+                    connection_id, chat_id, greeted_at
+                )
+                VALUES (?, ?, ?)
+                """,
+                (connection_id, chat_id, int(time.time())),
+            )
+            claimed = cursor.rowcount == 1
+            await cursor.close()
+            await db.commit()
+        return claimed
+
+    async def release_business_greeting(
+        self, *, connection_id: str, chat_id: int
+    ) -> None:
+        db = self._connection()
+        async with self._lock:
+            await db.execute(
+                "DELETE FROM business_greetings WHERE connection_id = ? AND chat_id = ?",
+                (connection_id, chat_id),
             )
             await db.commit()
 
@@ -336,3 +495,14 @@ def _business_message_from_row(row: aiosqlite.Row) -> BusinessMessageRecord:
         media_kind=None if row["media_kind"] is None else str(row["media_kind"]),
         deleted_at=None if deleted_at is None else int(deleted_at),
     )
+
+
+def _trim_history_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    marker = "\n[…история сокращена…]\n"
+    if limit <= len(marker) + 2:
+        return value[-limit:]
+    head = max(1, (limit - len(marker)) // 3)
+    tail = limit - len(marker) - head
+    return value[:head] + marker + value[-tail:]

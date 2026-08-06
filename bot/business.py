@@ -49,6 +49,7 @@ class BusinessMessageCaptureMiddleware(BaseMiddleware):
         if isinstance(event, Message):
             try:
                 await self._monitor.capture_message(event)
+                await self._monitor.welcome_contact(event)
             except Exception:
                 logger.exception(
                     "Could not capture business message chat_id=%s message_id=%s",
@@ -97,6 +98,42 @@ class BusinessMonitor:
         attachment = archive_attachment_from_message(message)
         if attachment is not None:
             await self._archive_attachment(message, connection, attachment)
+
+    async def welcome_contact(self, message: Message) -> bool:
+        """Send the configured disclosure once to each Business interlocutor."""
+        if not self.settings.business_welcome_enabled:
+            return False
+        connection_id = message.business_connection_id
+        if not connection_id:
+            return False
+        connection = await self._resolve_connection(connection_id)
+        if connection is None or not connection.is_enabled:
+            return False
+        if not _record_from_message(message, connection).is_incoming:
+            return False
+
+        claimed = await self.storage.claim_business_greeting(
+            connection_id=connection_id, chat_id=message.chat.id
+        )
+        if not claimed:
+            return False
+        try:
+            await self.bot.send_message(
+                business_connection_id=connection_id,
+                chat_id=message.chat.id,
+                text=self.settings.business_welcome_text,
+            )
+            return True
+        except Exception as exc:
+            await self.storage.release_business_greeting(
+                connection_id=connection_id, chat_id=message.chat.id
+            )
+            logger.warning(
+                "Could not welcome business contact chat_id=%s: %s",
+                message.chat.id,
+                type(exc).__name__,
+            )
+            return False
 
     async def handle_edited_message(self, message: Message) -> None:
         if not self.settings.business_monitor_enabled:

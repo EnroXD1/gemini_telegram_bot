@@ -12,7 +12,7 @@ from google.genai import types
 
 from .config import Settings
 from .gemini_response import extract_interaction_id, extract_interaction_text
-from .models import GeminiResult, PromptBundle
+from .models import ConversationMessage, GeminiResult, PromptBundle
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +58,15 @@ class GeminiService:
             await self._client.aio.aclose()
 
     async def generate(
-        self, bundle: PromptBundle, previous_interaction_id: str | None
+        self,
+        bundle: PromptBundle,
+        previous_interaction_id: str | None,
+        history: tuple[ConversationMessage, ...] = (),
     ) -> GeminiResult:
         if self._settings.ai_provider == "openrouter":
-            return await self._generate_openrouter(bundle, previous_interaction_id)
+            return await self._generate_openrouter(
+                bundle, previous_interaction_id, history
+            )
 
         request_input = _build_input(bundle)
         current_previous_id = (
@@ -180,24 +185,34 @@ class GeminiService:
                     raise GeminiRequestError(_friendly_error(code)) from exc
 
     async def _generate_openrouter(
-        self, bundle: PromptBundle, previous_interaction_id: str | None
+        self,
+        bundle: PromptBundle,
+        previous_interaction_id: str | None,
+        history: tuple[ConversationMessage, ...],
     ) -> GeminiResult:
         client = self._openrouter_client
         if client is None:
             raise RuntimeError("OpenRouter client is not initialized")
 
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": self._settings.gemini_system_prompt,
+            }
+        ]
+        messages.extend(
+            {"role": item.role, "content": item.content} for item in history
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": _build_openrouter_content(bundle),
+            }
+        )
+
         payload = {
             "model": self._settings.openrouter_model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": self._settings.gemini_system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": _build_openrouter_content(bundle),
-                },
-            ],
+            "messages": messages,
             "temperature": self._settings.gemini_temperature,
             "max_tokens": self._settings.gemini_max_output_tokens,
             "stream": False,

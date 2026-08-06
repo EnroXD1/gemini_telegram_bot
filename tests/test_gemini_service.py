@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from bot.gemini import GeminiService
-from bot.models import MediaPayload, PromptBundle
+from bot.models import ConversationMessage, MediaPayload, PromptBundle
 
 
 class FakeInteractions:
@@ -183,6 +183,25 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
                 "data:application/pdf;base64,"
             )
         )
+
+    async def test_openrouter_includes_local_history(self) -> None:
+        service = make_openrouter_service("новый ответ")
+        history = (
+            ConversationMessage(role="user", content="старый вопрос"),
+            ConversationMessage(role="assistant", content="старый ответ"),
+        )
+
+        await service.generate(
+            PromptBundle(prompt="новый вопрос"), None, history=history
+        )
+
+        messages = service._openrouter_client.calls[0][1]["messages"]
+        self.assertEqual(
+            [item["role"] for item in messages],
+            ["system", "user", "assistant", "user"],
+        )
+        self.assertEqual(messages[1]["content"], "старый вопрос")
+        self.assertEqual(messages[2]["content"], "старый ответ")
 
     async def test_multimodal_request(self) -> None:
         service = make_service(

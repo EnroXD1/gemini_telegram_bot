@@ -156,16 +156,22 @@ def create_router(
             mode = await processor.storage.get_group_mode(
                 message.chat.id, processor.settings.group_default_mode
             )
-        interaction_id = await processor.storage.get_interaction_id(
-            processor.scope_key(message)
-        )
-        context = "есть" if interaction_id else "пуст"
-        context_storage = (
-            "на стороне Gemini"
-            if processor.settings.ai_provider == "google"
-            and processor.settings.gemini_store_interactions
-            else "не используется"
-        )
+        scope_key = processor.scope_key(message)
+        if processor.settings.ai_provider == "openrouter":
+            has_context = await processor.storage.has_conversation_history(scope_key)
+            context_storage = (
+                "локально в SQLite, до "
+                f"{processor.settings.openrouter_history_turns} обменов"
+            )
+        else:
+            interaction_id = await processor.storage.get_interaction_id(scope_key)
+            has_context = bool(interaction_id)
+            context_storage = (
+                "на стороне Gemini"
+                if processor.settings.gemini_store_interactions
+                else "не используется"
+            )
+        context = "есть" if has_context else "пуст"
         await message.reply(
             f"Провайдер: {processor.settings.ai_provider}\n"
             f"Модель: {processor.settings.active_model}\n"

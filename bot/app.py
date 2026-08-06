@@ -47,6 +47,13 @@ async def run_bot(settings: Settings) -> None:
         )
         if removed:
             logger.info("Pruned %s expired business message snapshots", removed)
+        history_removed = await storage.prune_conversation_history(
+            settings.openrouter_history_retention_days
+        )
+        if history_removed:
+            logger.info(
+                "Pruned %s expired local conversation exchanges", history_removed
+            )
         await _set_commands(bot)
         await bot.delete_webhook(drop_pending_updates=settings.drop_pending_updates)
 

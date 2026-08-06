@@ -10,6 +10,8 @@ from aiogram.enums import ChatType
 from aiogram.types import BusinessMessagesDeleted, Chat, Message, PhotoSize, User
 
 from bot.business import BusinessMonitor
+from bot.models import ConversationMessage
+from bot.processor import _is_outgoing_business_message
 from bot.storage import BusinessMessageRecord, Storage
 
 
@@ -36,6 +38,8 @@ def make_settings() -> SimpleNamespace:
         business_archive_media=True,
         business_archive_max_bytes=1024,
         media_download_timeout_seconds=1.0,
+        business_welcome_enabled=True,
+        business_welcome_text="Автоответчик подключён. /help — помощь",
     )
 
 
@@ -44,13 +48,14 @@ def make_message(
     message_id: int = 10,
     text: str | None = None,
     photo: list[PhotoSize] | None = None,
+    sender_id: int = 200,
 ) -> Message:
     return Message(
         message_id=message_id,
         date=datetime.now(UTC),
         chat=Chat(id=200, type=ChatType.PRIVATE, first_name="Собеседник"),
         from_user=User(
-            id=200,
+            id=sender_id,
             is_bot=False,
             first_name="Иван",
             username="ivan",
@@ -97,6 +102,48 @@ class BusinessStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(previous)
         assert previous is not None
         self.assertEqual(previous.content, "Старый текст")
+
+    async def test_local_history_is_bounded_and_reset(self) -> None:
+        for index in range(5):
+            await self.storage.append_conversation_exchange(
+                scope_key="chat:200",
+                user_content=f"вопрос {index}",
+                assistant_content=f"ответ {index}",
+                max_exchanges=3,
+            )
+
+        history = await self.storage.get_conversation_history(
+            scope_key="chat:200", max_exchanges=3, max_chars=10_000
+        )
+
+        self.assertEqual(len(history), 6)
+        self.assertEqual(
+            history[0], ConversationMessage(role="user", content="вопрос 2")
+        )
+        self.assertEqual(history[-1].content, "ответ 4")
+        self.assertTrue(await self.storage.has_conversation_history("chat:200"))
+
+        await self.storage.reset_conversation("chat:200")
+
+        self.assertFalse(await self.storage.has_conversation_history("chat:200"))
+
+    async def test_outgoing_business_message_is_not_treated_as_user_request(self) -> None:
+        await self.storage.save_business_connection(
+            connection_id="connection-1",
+            owner_user_id=100,
+            owner_chat_id=100,
+            is_enabled=True,
+        )
+
+        incoming = make_message(text="Вопрос", sender_id=200)
+        outgoing = make_message(text="Ответ владельца", sender_id=100)
+
+        self.assertFalse(
+            await _is_outgoing_business_message(self.storage, incoming)
+        )
+        self.assertTrue(
+            await _is_outgoing_business_message(self.storage, outgoing)
+        )
 
 
 class BusinessMonitorTests(unittest.IsolatedAsyncioTestCase):
@@ -158,6 +205,24 @@ class BusinessMonitorTests(unittest.IsolatedAsyncioTestCase):
         delete_text = self.bot.sent_messages[-1]["text"]
         self.assertIn("удалил", delete_text)
         self.assertIn("Новый текст", delete_text)
+
+    async def test_business_welcome_is_sent_once_to_incoming_contact(self) -> None:
+        message = make_message(text="Здравствуйте")
+
+        first = await self.monitor.welcome_contact(message)
+        second = await self.monitor.welcome_contact(message)
+        outgoing = await self.monitor.welcome_contact(
+            make_message(message_id=11, text="Ответ владельца", sender_id=100)
+        )
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertFalse(outgoing)
+        self.assertEqual(len(self.bot.sent_messages), 1)
+        self.assertEqual(
+            self.bot.sent_messages[0]["business_connection_id"], "connection-1"
+        )
+        self.assertIn("Автоответчик", self.bot.sent_messages[0]["text"])
 
 
 if __name__ == "__main__":

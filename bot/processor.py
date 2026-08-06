@@ -13,6 +13,7 @@ from .config import Settings
 from .gemini import GeminiRequestError, GeminiService
 from .markdown import FormattedChunk, render_markdown_chunks
 from .media import MediaExtractor
+from .models import ConversationMessage, PromptBundle
 from .rate_limit import SlidingWindowRateLimiter
 from .scope import build_scope_key
 from .storage import Storage
@@ -54,6 +55,8 @@ class MessageProcessor:
 
         if sender is not None and sender.is_bot and lead.sender_chat is None:
             return
+        if await _is_outgoing_business_message(self.storage, lead):
+            return
         if not self._is_chat_allowed(lead):
             return
         if not any(_has_processable_content(item) for item in ordered):
@@ -92,19 +95,49 @@ class MessageProcessor:
                 self._active_tasks[scope_key] = current_task
             try:
                 previous_id = await self.storage.get_interaction_id(scope_key)
+                history: tuple[ConversationMessage, ...] = ()
+                if self.settings.ai_provider == "openrouter":
+                    try:
+                        history = await self.storage.get_conversation_history(
+                            scope_key=scope_key,
+                            max_exchanges=self.settings.openrouter_history_turns,
+                            max_chars=self.settings.openrouter_history_max_chars,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not load local conversation history scope=%s",
+                            scope_key,
+                        )
                 async with show_progress(lead):
                     bundle = await self.media.prepare(
                         bot=self.bot, messages=ordered, user_text=clean_text
                     )
-                    result = await self.gemini.generate(bundle, previous_id)
+                    result = await self.gemini.generate(
+                        bundle, previous_id, history=history
+                    )
 
                 try:
-                    await self.storage.set_interaction_id(
-                        scope_key, result.interaction_id
-                    )
+                    if self.settings.ai_provider == "openrouter":
+                        await self.storage.append_conversation_exchange(
+                            scope_key=scope_key,
+                            user_content=_history_user_content(
+                                bundle,
+                                self.settings.openrouter_history_item_chars,
+                            ),
+                            assistant_content=_trim_history_item(
+                                result.text,
+                                self.settings.openrouter_history_item_chars,
+                            ),
+                            max_exchanges=self.settings.openrouter_history_turns,
+                        )
+                    else:
+                        await self.storage.set_interaction_id(
+                            scope_key, result.interaction_id
+                        )
                 except Exception:
                     logger.exception(
-                        "Could not persist Gemini context chat_id=%s", lead.chat.id
+                        "Could not persist conversation context chat_id=%s",
+                        lead.chat.id,
                     )
                 await self.reply(lead, result.text)
             except GeminiRequestError as exc:
@@ -271,3 +304,42 @@ def _effective_sender_id(message: Message) -> int:
     ):
         return message.sender_chat.id
     return message.from_user.id if message.from_user else 0
+
+
+async def _is_outgoing_business_message(
+    storage: Storage, message: Message
+) -> bool:
+    connection_id = message.business_connection_id
+    if not connection_id:
+        return False
+    if message.sender_business_bot is not None:
+        return True
+    sender = message.from_user
+    if sender is None:
+        return False
+    connection = await storage.get_business_connection(connection_id)
+    if connection is not None:
+        return sender.id == connection.owner_user_id
+    return str(message.chat.type) == "private" and sender.id != message.chat.id
+
+
+def _history_user_content(bundle: PromptBundle, limit: int) -> str:
+    parts: list[str] = []
+    if bundle.media:
+        labels = "; ".join(item.label for item in bundle.media)
+        parts.append(
+            "В этом предыдущем сообщении были вложения, которые повторно не "
+            f"передаются модели: {labels}."
+        )
+    parts.append(bundle.prompt)
+    return _trim_history_item("\n\n".join(parts), limit)
+
+
+def _trim_history_item(value: str, limit: int) -> str:
+    text = value.strip()
+    if len(text) <= limit:
+        return text
+    marker = "\n[…сокращено для локальной истории…]\n"
+    head = max(1, (limit - len(marker)) // 3)
+    tail = max(1, limit - len(marker) - head)
+    return text[:head] + marker + text[-tail:]

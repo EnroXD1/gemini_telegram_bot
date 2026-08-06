@@ -18,6 +18,12 @@ class PromptBundle:
 
 
 @dataclass(frozen=True, slots=True)
+class ConversationMessage:
+    role: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
 class GeminiResult:
     text: str
     interaction_id: str | None
