@@ -10,6 +10,7 @@ from typing import Any
 from aiogram.enums import ChatType
 from aiogram.types import Chat, Message, User
 
+from bot.handlers import _is_bot_owner
 from bot.storage import Storage
 from bot.usage import UsageTracker, _is_non_ai_command
 
@@ -117,7 +118,7 @@ class UsageStorageTests(unittest.IsolatedAsyncioTestCase):
         bot = FakeBot()
         tracker = UsageTracker(
             bot=bot,
-            settings=SimpleNamespace(owner_ids=frozenset()),
+            settings=SimpleNamespace(owner_ids=frozenset({100})),
             storage=self.storage,
         )
 
@@ -141,7 +142,7 @@ class UsageStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(records[0].interaction_count, 2)
         self.assertEqual(records[0].openrouter_request_count, 1)
 
-    async def test_business_owner_is_removed_from_external_user_list(self) -> None:
+    async def test_business_owner_is_not_implicitly_a_global_bot_owner(self) -> None:
         await self.storage.record_bot_user_activity(
             user_id=100,
             username="owner",
@@ -159,7 +160,56 @@ class UsageStorageTests(unittest.IsolatedAsyncioTestCase):
             is_enabled=True,
         )
 
-        self.assertEqual(await self.storage.list_bot_users(), [])
+        records = await self.storage.list_bot_users()
+        self.assertEqual([record.user_id for record in records], [100])
+
+        processor = SimpleNamespace(
+            settings=SimpleNamespace(owner_ids=frozenset({101}))
+        )
+        self.assertFalse(_is_bot_owner(processor, 100))
+        self.assertTrue(_is_bot_owner(processor, 101))
+
+    async def test_only_explicit_owner_receives_global_usage_notifications(self) -> None:
+        await self.storage.save_business_connection(
+            connection_id="connection-1",
+            owner_user_id=100,
+            owner_chat_id=100,
+            is_enabled=True,
+        )
+        bot = FakeBot()
+        tracker = UsageTracker(
+            bot=bot,
+            settings=SimpleNamespace(owner_ids=frozenset({101})),
+            storage=self.storage,
+        )
+
+        await tracker.record(make_message(user_id=200, text="/start"))
+        await tracker.record(make_message(user_id=100, text="/start"))
+
+        self.assertEqual(
+            [message["chat_id"] for message in bot.sent_messages],
+            [101, 101],
+        )
+        records = await self.storage.list_bot_users()
+        self.assertEqual({record.user_id for record in records}, {100, 200})
+
+    async def test_configured_owners_can_be_removed_from_usage_audit(self) -> None:
+        for user_id in (100, 200):
+            await self.storage.record_bot_user_activity(
+                user_id=user_id,
+                username=None,
+                display_name=str(user_id),
+                chat_id=user_id,
+                chat_type="private",
+                chat_title=None,
+                ai_provider=None,
+            )
+
+        removed = await self.storage.delete_bot_users(frozenset({100, 300}))
+
+        self.assertEqual(removed, 1)
+        records = await self.storage.list_bot_users()
+        self.assertEqual([record.user_id for record in records], [200])
 
     def test_command_middleware_leaves_ask_for_processor(self) -> None:
         self.assertTrue(_is_non_ai_command(make_message(text="/start")))

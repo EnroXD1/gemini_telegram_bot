@@ -385,11 +385,23 @@ class Storage:
                     int(time.time()),
                 ),
             )
-            await db.execute(
-                "DELETE FROM bot_users WHERE user_id = ?",
-                (owner_user_id,),
-            )
             await db.commit()
+
+    async def delete_bot_users(self, user_ids: frozenset[int]) -> int:
+        """Remove configured bot owners from the external-user audit."""
+        if not user_ids:
+            return 0
+        db = self._connection()
+        placeholders = ", ".join("?" for _ in user_ids)
+        async with self._lock:
+            cursor = await db.execute(
+                f"DELETE FROM bot_users WHERE user_id IN ({placeholders})",
+                tuple(user_ids),
+            )
+            removed = max(0, cursor.rowcount)
+            await cursor.close()
+            await db.commit()
+        return removed
 
     async def is_business_owner(self, user_id: int) -> bool:
         db = self._connection()

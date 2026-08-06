@@ -331,7 +331,7 @@ def create_router(
         if message.chat.type != "private" or user is None:
             await message.reply("Отчёт доступен в личном чате с ботом.")
             return
-        if not await _is_business_owner(processor, user.id):
+        if not _is_bot_owner(processor, user.id):
             await message.reply("Статистика доступна только владельцу бота.")
             return
         limit = _parse_users_limit(command.args)
@@ -357,7 +357,7 @@ def create_router(
         if message.chat.type != "private" or user is None:
             await message.reply("Отчёт доступен в личном чате с ботом.")
             return
-        if not await _is_business_owner(processor, user.id):
+        if not _is_bot_owner(processor, user.id):
             await message.reply("Статистика доступна только владельцу бота.")
             return
         stats = await processor.storage.get_bot_usage_stats()
@@ -418,6 +418,11 @@ async def _is_business_owner(processor: MessageProcessor, user_id: int) -> bool:
     if user_id in processor.settings.owner_ids:
         return True
     return await processor.storage.is_business_owner(user_id)
+
+
+def _is_bot_owner(processor: MessageProcessor, user_id: int) -> bool:
+    """Authorize global bot reports only through the explicit OWNER_IDS list."""
+    return user_id in processor.settings.owner_ids
 
 
 async def _business_chats_menu(

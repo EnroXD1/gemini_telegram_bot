@@ -48,8 +48,6 @@ class UsageTracker:
         if user.id in self.settings.owner_ids:
             return
         try:
-            if await self.storage.is_business_owner(user.id):
-                return
             chat_type = getattr(message.chat.type, "value", str(message.chat.type))
             is_new = await self.storage.record_bot_user_activity(
                 user_id=user.id,
@@ -70,7 +68,6 @@ class UsageTracker:
         if user is None:
             return
         recipients = set(self.settings.owner_ids)
-        recipients.update(await self.storage.list_business_owner_chat_ids())
         recipients.discard(user.id)
         if not recipients:
             return

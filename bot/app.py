@@ -33,6 +33,9 @@ async def run_bot(settings: Settings) -> None:
 
     try:
         await storage.open()
+        owners_removed = await storage.delete_bot_users(settings.owner_ids)
+        if owners_removed:
+            logger.info("Removed %s configured owners from usage audit", owners_removed)
         bot_user = await bot.get_me()
         usage = UsageTracker(bot=bot, settings=settings, storage=storage)
         processor = MessageProcessor(
