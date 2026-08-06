@@ -117,6 +117,24 @@ def test_ai_continuations_default_to_two(monkeypatch, tmp_path) -> None:
     assert settings.ai_max_continuations == 2
 
 
+def test_automatic_fallback_and_spam_protection_defaults(monkeypatch, tmp_path) -> None:
+    for name in TOKEN_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.delenv("AI_AUTO_FALLBACK_ENABLED", raising=False)
+    monkeypatch.delenv("AI_FALLBACK_COOLDOWN_SECONDS", raising=False)
+    monkeypatch.delenv("SPAM_VIOLATION_LIMIT", raising=False)
+    monkeypatch.delenv("SPAM_BLOCK_SECONDS", raising=False)
+
+    settings = Settings.from_env(tmp_path / "missing.env")
+
+    assert settings.ai_auto_fallback_enabled is True
+    assert settings.ai_fallback_cooldown_seconds == 600.0
+    assert settings.spam_violation_limit == 3
+    assert settings.spam_block_seconds == 300.0
+
+
 def test_ai_continuations_are_capped_at_five(monkeypatch, tmp_path) -> None:
     for name in TOKEN_NAMES:
         monkeypatch.delenv(name, raising=False)

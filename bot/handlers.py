@@ -88,7 +88,10 @@ def create_router(
             "удаления оригинала. Секретные чаты обычным ботам недоступны.\n\n"
             "Ответы оформляются с помощью Markdown: поддерживаются заголовки, "
             "списки, выделение, цитаты, ссылки и блоки кода. Пока модель думает, "
-            "показывается временный анимированный статус.\n\n"
+            "показывается временный анимированный статус. При исчерпании лимита "
+            "бот сообщит о переходе на другую настроенную модель.\n\n"
+            "Антиспам не позволяет одному пользователю запускать несколько "
+            "AI-запросов одновременно; частые нарушения дают временную блокировку.\n\n"
             "В личном чате я отвечаю на все поддерживаемые сообщения. В группе по "
             "умолчанию отвечаю на /ask, упоминание моего @username или ответ на моё "
             "сообщение."
@@ -381,29 +384,20 @@ def create_router(
                 message.chat.id, processor.settings.group_default_mode
             )
         scope_key = processor.scope_key(message)
-        if processor.gemini.uses_local_history:
-            has_context = await processor.storage.has_conversation_history(scope_key)
-            context_storage = (
-                "локально в SQLite, до "
-                f"{processor.settings.openrouter_history_turns} обменов"
+        has_local_context = await processor.storage.has_conversation_history(scope_key)
+        interaction_id = await processor.storage.get_interaction_id(scope_key)
+        has_context = has_local_context or bool(interaction_id)
+        context_storage = (
+            "локально в SQLite; для Google также используется серверная цепочка"
+        )
+        fallback_routes = processor.gemini.fallback_routes()
+        fallback = (
+            " → ".join(
+                f"{provider} / {model}" for provider, model in fallback_routes
             )
-            if processor.gemini.current_provider == "openrouter":
-                fallback = (
-                    f"Groq / {processor.settings.groq_model} — готов"
-                    if processor.settings.groq_fallback_ready
-                    else "Groq — не настроен"
-                )
-            else:
-                fallback = "не используется"
-        else:
-            interaction_id = await processor.storage.get_interaction_id(scope_key)
-            has_context = bool(interaction_id)
-            context_storage = (
-                "на стороне Gemini"
-                if processor.settings.gemini_store_interactions
-                else "не используется"
-            )
-            fallback = "не используется"
+            if fallback_routes
+            else "не настроен или отключён"
+        )
         context = "есть" if has_context else "пуст"
         await message.reply(
             f"Версия: {__version__}\n"

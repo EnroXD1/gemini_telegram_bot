@@ -4,7 +4,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from bot.gemini import GeminiRequestError, GeminiService, ModelSelectionError
+from bot.gemini import (
+    GeminiRequestError,
+    GeminiService,
+    ModelSelectionError,
+    ModelSwitchNotice,
+)
 from bot.models import ConversationMessage, MediaPayload, PromptBundle
 
 
@@ -348,10 +353,10 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             ]
         )
-        switched_to: list[str] = []
+        switches: list[ModelSwitchNotice] = []
 
-        async def on_fallback(model: str) -> None:
-            switched_to.append(model)
+        async def on_fallback(notice: ModelSwitchNotice) -> None:
+            switches.append(notice)
 
         result = await service.generate(
             PromptBundle(prompt="вопрос"), None, on_fallback=on_fallback
@@ -359,10 +364,55 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.text, "ответ Groq")
         self.assertEqual(result.provider, "groq")
-        self.assertEqual(switched_to, ["llama-3.1-8b-instant"])
+        self.assertEqual(len(switches), 1)
+        self.assertEqual(switches[0].source_provider, "openrouter")
+        self.assertEqual(switches[0].target_provider, "groq")
+        self.assertEqual(switches[0].target_model, "llama-3.1-8b-instant")
+        self.assertEqual(switches[0].reason, "limit")
         _, payload = service._groq_client.calls[0]
         self.assertEqual(payload["model"], "llama-3.1-8b-instant")
         self.assertEqual(payload["max_completion_tokens"], 256)
+
+    async def test_google_limit_switches_to_openrouter_and_starts_cooldown(self) -> None:
+        service = make_service([FakeHttpError(429)])
+        service._settings.openrouter_model = "openrouter/fallback-model"
+        service._settings.ai_fallback_cooldown_seconds = 600.0
+        service._openrouter_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {"choices": [{"message": {"content": "первый резерв"}}]}
+                ),
+                FakeOpenRouterResponse(
+                    {"choices": [{"message": {"content": "второй резерв"}}]}
+                ),
+            ]
+        )
+        switches: list[ModelSwitchNotice] = []
+
+        async def on_fallback(notice: ModelSwitchNotice) -> None:
+            switches.append(notice)
+
+        first = await service.generate(
+            PromptBundle(prompt="первый вопрос"),
+            None,
+            on_fallback=on_fallback,
+        )
+        second = await service.generate(
+            PromptBundle(prompt="второй вопрос"),
+            None,
+            on_fallback=on_fallback,
+        )
+
+        self.assertEqual(first.text, "первый резерв")
+        self.assertEqual(second.text, "второй резерв")
+        self.assertEqual(first.provider, "openrouter")
+        self.assertEqual(len(service._client.aio.interactions.calls), 1)
+        self.assertEqual(len(service._openrouter_client.calls), 2)
+        self.assertEqual(len(switches), 2)
+        self.assertTrue(all(item.reason == "limit" for item in switches))
+        self.assertTrue(
+            all(item.target_provider == "openrouter" for item in switches)
+        )
 
     async def test_owner_selection_can_use_groq_as_primary(self) -> None:
         service = make_openrouter_service("unused")
@@ -383,6 +433,34 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.provider, "groq")
         _, payload = service._groq_client.calls[0]
         self.assertEqual(payload["model"], "llama-3.1-8b-instant")
+
+    async def test_selected_groq_limit_switches_to_openrouter(self) -> None:
+        service = make_openrouter_service("unused")
+        service._groq_client = FakeOpenRouterClient(
+            [FakeOpenRouterResponse({}, error_code=429)]
+        )
+        service._openrouter_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {"choices": [{"message": {"content": "ответ OpenRouter"}}]}
+                )
+            ]
+        )
+        service.select_model("groq")
+        switches: list[ModelSwitchNotice] = []
+
+        async def on_fallback(notice: ModelSwitchNotice) -> None:
+            switches.append(notice)
+
+        result = await service.generate(
+            PromptBundle(prompt="вопрос"), None, on_fallback=on_fallback
+        )
+
+        self.assertEqual(result.text, "ответ OpenRouter")
+        self.assertEqual(result.provider, "openrouter")
+        self.assertEqual(len(switches), 1)
+        self.assertEqual(switches[0].source_provider, "groq")
+        self.assertEqual(switches[0].target_provider, "openrouter")
 
     async def test_groq_primary_continues_truncated_response(self) -> None:
         service = make_openrouter_service("unused")

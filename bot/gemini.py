@@ -4,6 +4,7 @@ import asyncio
 import base64
 import logging
 import random
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -26,7 +27,23 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/"
 OPENROUTER_APP_URL = "https://github.com/EnroXD1/gemini_telegram_bot"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1/"
 
-FallbackNotifier = Callable[[str], Awaitable[None]]
+
+@dataclass(frozen=True, slots=True)
+class ModelSwitchNotice:
+    source_provider: str
+    source_model: str
+    target_provider: str
+    target_model: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelRoute:
+    provider: str
+    model: str
+
+
+FallbackNotifier = Callable[[ModelSwitchNotice], Awaitable[None]]
 
 _INCOMPLETE_FINISH_REASONS = {
     "length",
@@ -57,11 +74,22 @@ class _ChatCompletion:
 
 class GeminiRequestError(RuntimeError):
     def __init__(
-        self, user_message: str, *, delete_after_seconds: float | None = None
+        self,
+        user_message: str,
+        *,
+        delete_after_seconds: float | None = None,
+        provider: str | None = None,
+        status_code: int | None = None,
+        fallback_allowed: bool = False,
+        quota_exhausted: bool = False,
     ) -> None:
         super().__init__(user_message)
         self.user_message = user_message
         self.delete_after_seconds = delete_after_seconds
+        self.provider = provider
+        self.status_code = status_code
+        self.fallback_allowed = fallback_allowed
+        self.quota_exhausted = quota_exhausted
 
 
 class ModelSelectionError(ValueError):
@@ -83,6 +111,7 @@ class GeminiService:
         else:
             self._model = getattr(settings, "gemini_model", "gemini-3.6-flash")
         self._interactions_available = False
+        self._route_cooldowns: dict[tuple[str, str], float] = {}
 
         if getattr(settings, "openrouter_api_key", ""):
             self._openrouter_client = httpx.AsyncClient(
@@ -154,6 +183,9 @@ class GeminiService:
             raise ModelSelectionError("ID модели содержит недопустимые символы.")
         self._provider = normalized
         self._model = selected_model
+        cooldowns = getattr(self, "_route_cooldowns", None)
+        if cooldowns is not None:
+            cooldowns.pop((normalized, selected_model), None)
         return normalized, selected_model
 
     async def close(self) -> None:
@@ -171,24 +203,209 @@ class GeminiService:
         history: tuple[ConversationMessage, ...] = (),
         on_fallback: FallbackNotifier | None = None,
     ) -> GeminiResult:
-        if self._provider == "openrouter":
+        routes = self._candidate_routes(bundle)
+        automatic_fallback = getattr(
+            self._settings, "ai_auto_fallback_enabled", True
+        )
+        last_error: GeminiRequestError | None = None
+        failed_route: _ModelRoute | None = None
+        attempted = 0
+
+        for route in routes:
+            if self._route_is_cooling_down(route):
+                if failed_route is None:
+                    failed_route = route
+                    last_error = GeminiRequestError(
+                        "Лимит модели недавно был исчерпан.",
+                        provider=route.provider,
+                        fallback_allowed=True,
+                        quota_exhausted=True,
+                    )
+                continue
+            if failed_route is not None and last_error is not None:
+                await self._notify_model_switch(
+                    on_fallback,
+                    failed_route,
+                    route,
+                    reason=(
+                        "limit" if last_error.quota_exhausted else "unavailable"
+                    ),
+                )
+            try:
+                attempted += 1
+                return await self._generate_route(
+                    route,
+                    bundle,
+                    previous_interaction_id,
+                    history,
+                    is_fallback=failed_route is not None,
+                )
+            except GeminiRequestError as exc:
+                last_error = exc
+                failed_route = route
+                if not automatic_fallback or not exc.fallback_allowed:
+                    raise
+                self._start_route_cooldown(route, exc)
+
+        if last_error is not None and attempted > 1:
+            raise GeminiRequestError(
+                "Все доступные модели временно недоступны или исчерпали лимит. "
+                "Попробуйте немного позже.",
+                delete_after_seconds=20.0,
+                fallback_allowed=False,
+                quota_exhausted=last_error.quota_exhausted,
+            ) from last_error
+        if last_error is not None:
+            raise last_error
+        raise GeminiRequestError(
+            "Для этого запроса нет доступной AI-модели. Владельцу бота нужно "
+            "проверить настроенные API-ключи."
+        )
+
+    def fallback_routes(self) -> tuple[tuple[str, str], ...]:
+        routes = self._candidate_routes(PromptBundle(prompt=""))
+        return tuple((route.provider, route.model) for route in routes[1:])
+
+    def _candidate_routes(self, bundle: PromptBundle) -> list[_ModelRoute]:
+        primary = _ModelRoute(self._provider, self._model)
+        routes = [primary]
+        if not getattr(self._settings, "ai_auto_fallback_enabled", True):
+            return routes
+
+        available = self.configured_providers()
+
+        def add(provider: str, model: str) -> None:
+            route = _ModelRoute(provider, model)
+            if route in routes:
+                return
+            if provider == "groq" and bundle.media:
+                return
+            if (
+                provider == "groq"
+                and primary.provider != "groq"
+                and not getattr(self._settings, "groq_fallback_enabled", True)
+            ):
+                return
+            routes.append(route)
+
+        default_model = available.get(primary.provider)
+        if default_model:
+            add(primary.provider, default_model)
+
+        provider_order = {
+            "google": ("openrouter", "groq"),
+            "openrouter": ("groq", "google"),
+            "groq": ("openrouter", "google"),
+        }.get(primary.provider, ("openrouter", "google", "groq"))
+        for provider in provider_order:
+            model = available.get(provider)
+            if model:
+                add(provider, model)
+        return routes
+
+    async def _generate_route(
+        self,
+        route: _ModelRoute,
+        bundle: PromptBundle,
+        previous_interaction_id: str | None,
+        history: tuple[ConversationMessage, ...],
+        *,
+        is_fallback: bool,
+    ) -> GeminiResult:
+        if route.provider == "openrouter":
             return await self._generate_openrouter(
-                bundle, previous_interaction_id, history, on_fallback
+                bundle,
+                previous_interaction_id,
+                history,
+                model=route.model,
             )
-        if self._provider == "groq":
+        if route.provider == "groq":
             if bundle.media:
                 raise GeminiRequestError(
-                    "Выбранная модель Groq работает только с текстом. "
-                    "Для фото, аудио, видео и документов переключитесь на "
-                    "OpenRouter или Google командой /model."
+                    "Модель Groq работает только с текстом.",
+                    provider="groq",
+                    fallback_allowed=True,
                 )
             messages = self._build_chat_messages(bundle, history)
-            return await self._generate_groq(
-                messages,
-                previous_interaction_id,
-                model=self._model,
-                is_fallback=False,
+            async with self._semaphore:
+                return await self._generate_groq(
+                    messages,
+                    previous_interaction_id,
+                    model=route.model,
+                    is_fallback=is_fallback,
+                )
+        return await self._generate_google(
+            bundle,
+            previous_interaction_id,
+            model=route.model,
+        )
+
+    def _route_is_cooling_down(self, route: _ModelRoute) -> bool:
+        cooldowns = getattr(self, "_route_cooldowns", None)
+        if cooldowns is None:
+            cooldowns = {}
+            self._route_cooldowns = cooldowns
+        now = time.monotonic()
+        for key in ((route.provider, route.model), (route.provider, "*")):
+            until = cooldowns.get(key, 0.0)
+            if until > now:
+                return True
+            cooldowns.pop(key, None)
+        return False
+
+    def _start_route_cooldown(
+        self, route: _ModelRoute, error: GeminiRequestError
+    ) -> None:
+        if not error.quota_exhausted:
+            return
+        seconds = float(
+            getattr(self._settings, "ai_fallback_cooldown_seconds", 600.0)
+        )
+        key = (
+            (route.provider, "*")
+            if error.status_code == 402
+            else (route.provider, route.model)
+        )
+        self._route_cooldowns[key] = time.monotonic() + max(1.0, seconds)
+
+    async def _notify_model_switch(
+        self,
+        notifier: FallbackNotifier | None,
+        source: _ModelRoute,
+        target: _ModelRoute,
+        *,
+        reason: str,
+    ) -> None:
+        logger.warning(
+            "Switching AI route %s/%s -> %s/%s reason=%s",
+            source.provider,
+            source.model,
+            target.provider,
+            target.model,
+            reason,
+        )
+        if notifier is None:
+            return
+        try:
+            await notifier(
+                ModelSwitchNotice(
+                    source_provider=source.provider,
+                    source_model=source.model,
+                    target_provider=target.provider,
+                    target_model=target.model,
+                    reason=reason,
+                )
             )
+        except Exception:
+            logger.exception("Could not show automatic model switch status")
+
+    async def _generate_google(
+        self,
+        bundle: PromptBundle,
+        previous_interaction_id: str | None,
+        *,
+        model: str,
+    ) -> GeminiResult:
 
         base_request_input = _build_input(bundle)
         request_input = base_request_input
@@ -210,7 +427,7 @@ class GeminiService:
             while True:
                 try:
                     kwargs: dict[str, Any] = {
-                        "model": self._model,
+                        "model": model,
                         "input": request_input,
                         "system_instruction": self._settings.gemini_system_prompt,
                         "generation_config": {
@@ -241,7 +458,7 @@ class GeminiService:
                             )
                         else:
                             response = await self._client.aio.models.generate_content(
-                                model=self._model,
+                                model=model,
                                 contents=generate_contents,
                                 config=types.GenerateContentConfig(
                                     system_instruction=(
@@ -267,7 +484,7 @@ class GeminiService:
                     logger.info(
                         "Gemini completion model=%s finish_reason=%s "
                         "continuation=%s",
-                        self._model,
+                        model,
                         finish_reason,
                         continuation_count,
                     )
@@ -325,7 +542,10 @@ class GeminiService:
                         )
                     raise GeminiRequestError(
                         "Gemini не успел ответить за отведённое время. "
-                        "Попробуйте ещё раз или отправьте файл меньшего размера."
+                        "Попробуйте ещё раз или отправьте файл меньшего размера.",
+                        provider="google",
+                        status_code=408,
+                        fallback_allowed=True,
                     ) from exc
                 except Exception as exc:
                     code = _error_code(exc)
@@ -384,14 +604,22 @@ class GeminiService:
                             provider="google",
                             truncated=True,
                         )
-                    raise GeminiRequestError(_friendly_error(code)) from exc
+                    raise GeminiRequestError(
+                        _friendly_error(code),
+                        delete_after_seconds=20.0 if code == 429 else None,
+                        provider="google",
+                        status_code=code,
+                        fallback_allowed=_allows_automatic_fallback(exc, code),
+                        quota_exhausted=_is_quota_error(exc, code),
+                    ) from exc
 
     async def _generate_openrouter(
         self,
         bundle: PromptBundle,
         previous_interaction_id: str | None,
         history: tuple[ConversationMessage, ...],
-        on_fallback: FallbackNotifier | None,
+        *,
+        model: str,
     ) -> GeminiResult:
         client = self._openrouter_client
         if client is None:
@@ -407,7 +635,7 @@ class GeminiService:
             while True:
                 try:
                     payload = {
-                        "model": self._model,
+                        "model": model,
                         "messages": request_messages,
                         "temperature": self._settings.gemini_temperature,
                         "max_tokens": self._settings.gemini_max_output_tokens,
@@ -433,7 +661,7 @@ class GeminiService:
                     logger.info(
                         "OpenRouter completion model=%s finish_reason=%s "
                         "continuation=%s",
-                        completion.model or self._model,
+                        completion.model or model,
                         completion.finish_reason,
                         continuation_count,
                     )
@@ -481,7 +709,10 @@ class GeminiService:
                         )
                     raise GeminiRequestError(
                         "OpenRouter не успел получить ответ модели за отведённое "
-                        "время. Попробуйте ещё раз или отправьте файл меньшего размера."
+                        "время. Попробуйте ещё раз или отправьте файл меньшего размера.",
+                        provider="openrouter",
+                        status_code=408,
+                        fallback_allowed=True,
                     ) from exc
                 except Exception as exc:
                     code = _error_code(exc)
@@ -505,47 +736,6 @@ class GeminiService:
                         code,
                         type(exc).__name__,
                     )
-                    if self._can_fallback_to_groq(code, bundle):
-                        await self._notify_fallback(on_fallback)
-                        try:
-                            fallback_result = await self._generate_groq(
-                                request_messages,
-                                previous_interaction_id,
-                                model=self._settings.groq_model,
-                                is_fallback=True,
-                            )
-                            if not combined_text:
-                                return fallback_result
-                            return GeminiResult(
-                                text=_merge_continuation(
-                                    combined_text, fallback_result.text
-                                ),
-                                interaction_id=None,
-                                context_was_reset=bool(previous_interaction_id),
-                                provider="groq",
-                                truncated=fallback_result.truncated,
-                            )
-                        except GeminiRequestError as fallback_exc:
-                            if combined_text:
-                                logger.warning(
-                                    "Groq fallback could not continue partial "
-                                    "OpenRouter response"
-                                )
-                                return GeminiResult(
-                                    text=_finish_text(combined_text, True),
-                                    interaction_id=None,
-                                    context_was_reset=bool(previous_interaction_id),
-                                    provider="openrouter",
-                                    truncated=True,
-                                )
-                            raise GeminiRequestError(
-                                "Основная модель OpenRouter временно недоступна. "
-                                f"{fallback_exc.user_message}",
-                                delete_after_seconds=(
-                                    fallback_exc.delete_after_seconds
-                                    or (20.0 if code == 429 else None)
-                                ),
-                            ) from exc
                     if combined_text:
                         return GeminiResult(
                             text=_finish_text(combined_text, True),
@@ -557,30 +747,11 @@ class GeminiService:
                     raise GeminiRequestError(
                         _friendly_openrouter_error(code),
                         delete_after_seconds=20.0 if code == 429 else None,
+                        provider="openrouter",
+                        status_code=code,
+                        fallback_allowed=_allows_automatic_fallback(exc, code),
+                        quota_exhausted=_is_quota_error(exc, code),
                     ) from exc
-
-    def _can_fallback_to_groq(
-        self, code: int | None, bundle: PromptBundle
-    ) -> bool:
-        return (
-            self._groq_client is not None
-            and not bundle.media
-            and code in {402, 408, 429, 500, 502, 503, 504}
-        )
-
-    async def _notify_fallback(
-        self, notifier: FallbackNotifier | None
-    ) -> None:
-        logger.warning(
-            "Switching from OpenRouter to Groq model=%s",
-            self._settings.groq_model,
-        )
-        if notifier is None:
-            return
-        try:
-            await notifier(self._settings.groq_model)
-        except Exception:
-            logger.exception("Could not show Groq fallback status")
 
     async def _generate_groq(
         self,
@@ -672,7 +843,10 @@ class GeminiService:
                 label = "Резервная модель Groq" if is_fallback else "Модель Groq"
                 raise GeminiRequestError(
                     f"{label} не успела ответить. "
-                    "Попробуйте немного позже."
+                    "Попробуйте немного позже.",
+                    provider="groq",
+                    status_code=408,
+                    fallback_allowed=True,
                 ) from exc
             except Exception as exc:
                 code = _error_code(exc)
@@ -707,6 +881,10 @@ class GeminiService:
                 raise GeminiRequestError(
                     _friendly_groq_error(code, is_fallback=is_fallback),
                     delete_after_seconds=20.0 if code == 429 else None,
+                    provider="groq",
+                    status_code=code,
+                    fallback_allowed=_allows_automatic_fallback(exc, code),
+                    quota_exhausted=_is_quota_error(exc, code),
                 ) from exc
 
     def _build_chat_messages(
@@ -1018,6 +1196,27 @@ def _is_retryable(exc: Exception, code: int | None) -> bool:
             "rate limit",
             "resource exhausted",
         )
+    )
+
+
+def _is_quota_error(exc: Exception, code: int | None) -> bool:
+    if code in {402, 429}:
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "rate limit",
+            "resource exhausted",
+            "quota exceeded",
+            "insufficient credits",
+        )
+    )
+
+
+def _allows_automatic_fallback(exc: Exception, code: int | None) -> bool:
+    return code in {402, 408, 429, 500, 502, 503, 504} or _is_retryable(
+        exc, code
     )
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+from bot.gemini import ModelSwitchNotice
 from bot.typing_action import PROGRESS_FRAMES, show_progress
 
 
@@ -70,9 +71,18 @@ async def test_show_progress_displays_fallback_and_then_deletes_it() -> None:
     message = FakeSourceMessage()
 
     async with show_progress(message, interval=10.0) as progress:
-        await progress.show_fallback("llama-3.1-8b-instant")
+        await progress.show_fallback(
+            ModelSwitchNotice(
+                source_provider="openrouter",
+                source_model="google/gemini-3.5-flash",
+                target_provider="groq",
+                target_model="llama-3.1-8b-instant",
+                reason="limit",
+            )
+        )
 
-    assert "Переключаюсь на резервную модель Groq" in message.status.edits[-1]
+    assert "Лимит модели OpenRouter" in message.status.edits[-1]
+    assert "Переключаюсь на Groq" in message.status.edits[-1]
     assert message.status.deleted is True
 
 

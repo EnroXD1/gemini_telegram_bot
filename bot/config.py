@@ -138,6 +138,8 @@ class Settings:
     gemini_temperature: float
     gemini_max_output_tokens: int
     ai_max_continuations: int
+    ai_auto_fallback_enabled: bool
+    ai_fallback_cooldown_seconds: float
     gemini_store_interactions: bool
     database_path: Path
     group_default_mode: str
@@ -160,6 +162,8 @@ class Settings:
     gemini_retry_attempts: int
     rate_limit_requests: int
     rate_limit_window_seconds: float
+    spam_violation_limit: int
+    spam_block_seconds: float
     album_debounce_seconds: float
     reply_chunk_size: int
     drop_pending_updates: bool
@@ -257,6 +261,10 @@ class Settings:
                 "GEMINI_MAX_OUTPUT_TOKENS", 4096, minimum=1
             ),
             ai_max_continuations=ai_max_continuations,
+            ai_auto_fallback_enabled=_bool("AI_AUTO_FALLBACK_ENABLED", True),
+            ai_fallback_cooldown_seconds=_float(
+                "AI_FALLBACK_COOLDOWN_SECONDS", 600.0, minimum=1.0
+            ),
             gemini_store_interactions=_bool("GEMINI_STORE_INTERACTIONS", True),
             database_path=Path(os.getenv("DATABASE_PATH", "data/bot.sqlite3")),
             group_default_mode=_choice(
@@ -305,6 +313,10 @@ class Settings:
             rate_limit_requests=_int("RATE_LIMIT_REQUESTS", 8, minimum=1),
             rate_limit_window_seconds=_float(
                 "RATE_LIMIT_WINDOW_SECONDS", 60.0, minimum=1.0
+            ),
+            spam_violation_limit=_int("SPAM_VIOLATION_LIMIT", 3, minimum=1),
+            spam_block_seconds=_float(
+                "SPAM_BLOCK_SECONDS", 300.0, minimum=1.0
             ),
             album_debounce_seconds=_float(
                 "ALBUM_DEBOUNCE_SECONDS", 0.8, minimum=0.1

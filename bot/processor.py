@@ -44,10 +44,14 @@ class MessageProcessor:
         self.media = media
         self.usage = usage
         self._rate_limiter = SlidingWindowRateLimiter(
-            settings.rate_limit_requests, settings.rate_limit_window_seconds
+            settings.rate_limit_requests,
+            settings.rate_limit_window_seconds,
+            violation_limit=settings.spam_violation_limit,
+            block_seconds=settings.spam_block_seconds,
         )
         self._scope_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._active_tasks: dict[str, asyncio.Task[object]] = {}
+        self._active_users: set[str] = set()
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
     async def process(self, messages: list[Message], *, force: bool = False) -> None:
@@ -75,15 +79,46 @@ class MessageProcessor:
             return
 
         user_id = _effective_sender_id(lead)
+        user_request_key: str | None = None
         if user_id not in self.settings.owner_ids:
-            retry_after = self._rate_limiter.check(f"{lead.chat.id}:{user_id}")
-            if retry_after is not None:
+            user_request_key = str(user_id)
+            if user_request_key in self._active_users:
+                penalty = self._rate_limiter.violate(user_request_key)
+                if penalty > self.settings.rate_limit_window_seconds:
+                    text = (
+                        "Из-за повторного спама во время обработки доступ к ИИ "
+                        "временно ограничен. Попробуйте примерно через "
+                        f"{max(1, math.ceil(penalty))} сек."
+                    )
+                else:
+                    text = (
+                        "Ваш предыдущий запрос ещё обрабатывается. Дождитесь ответа, "
+                        "прежде чем отправлять следующий."
+                    )
                 await self.reply(
                     lead,
-                    f"Слишком много запросов. Повторите примерно через "
-                    f"{max(1, math.ceil(retry_after))} сек.",
+                    text,
                 )
                 return
+            retry_after = self._rate_limiter.check(user_request_key)
+            if retry_after is not None:
+                if retry_after > self.settings.rate_limit_window_seconds:
+                    text = (
+                        "Из-за слишком частых запросов доступ к ИИ временно "
+                        "ограничен. Попробуйте примерно через "
+                        f"{max(1, math.ceil(retry_after))} сек."
+                    )
+                else:
+                    text = (
+                        "Слишком много запросов. Повторите примерно через "
+                        f"{max(1, math.ceil(retry_after))} сек."
+                    )
+                await self.reply(
+                    lead,
+                    text,
+                )
+                return
+            self._active_users.add(user_request_key)
 
         scope_key = self.scope_key(lead)
         clean_text = raw_text
@@ -100,18 +135,17 @@ class MessageProcessor:
             try:
                 previous_id = await self.storage.get_interaction_id(scope_key)
                 history: tuple[ConversationMessage, ...] = ()
-                if self.gemini.uses_local_history:
-                    try:
-                        history = await self.storage.get_conversation_history(
-                            scope_key=scope_key,
-                            max_exchanges=self.settings.openrouter_history_turns,
-                            max_chars=self.settings.openrouter_history_max_chars,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Could not load local conversation history scope=%s",
-                            scope_key,
-                        )
+                try:
+                    history = await self.storage.get_conversation_history(
+                        scope_key=scope_key,
+                        max_exchanges=self.settings.openrouter_history_turns,
+                        max_chars=self.settings.openrouter_history_max_chars,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not load local conversation history scope=%s",
+                        scope_key,
+                    )
                 async with show_progress(lead) as progress:
                     bundle = await self.media.prepare(
                         bot=self.bot, messages=ordered, user_text=clean_text
@@ -128,23 +162,22 @@ class MessageProcessor:
                     )
 
                 try:
-                    if self.gemini.uses_local_history:
-                        await self.storage.append_conversation_exchange(
-                            scope_key=scope_key,
-                            user_content=_history_user_content(
-                                bundle,
-                                self.settings.openrouter_history_item_chars,
-                            ),
-                            assistant_content=_trim_history_item(
-                                result.text,
-                                self.settings.openrouter_history_item_chars,
-                            ),
-                            max_exchanges=self.settings.openrouter_history_turns,
-                        )
-                    else:
-                        await self.storage.set_interaction_id(
-                            scope_key, result.interaction_id
-                        )
+                    await self.storage.append_conversation_exchange(
+                        scope_key=scope_key,
+                        user_content=_history_user_content(
+                            bundle,
+                            self.settings.openrouter_history_item_chars,
+                        ),
+                        assistant_content=_trim_history_item(
+                            result.text,
+                            self.settings.openrouter_history_item_chars,
+                        ),
+                        max_exchanges=self.settings.openrouter_history_turns,
+                    )
+                    await self.storage.set_interaction_id(
+                        scope_key,
+                        result.interaction_id if result.provider == "google" else None,
+                    )
                 except Exception:
                     logger.exception(
                         "Could not persist conversation context chat_id=%s",
@@ -178,6 +211,8 @@ class MessageProcessor:
             finally:
                 if self._active_tasks.get(scope_key) is current_task:
                     self._active_tasks.pop(scope_key, None)
+                if user_request_key is not None:
+                    self._active_users.discard(user_request_key)
 
     async def _should_answer(self, messages: list[Message], *, force: bool) -> bool:
         lead = messages[0]

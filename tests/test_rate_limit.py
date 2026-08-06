@@ -27,6 +27,40 @@ class RateLimiterTests(unittest.TestCase):
         self.assertIsNone(limiter.check("a"))
         self.assertIsNone(limiter.check("b"))
 
+    def test_repeated_violations_trigger_temporary_block(self) -> None:
+        clock = FakeClock()
+        limiter = SlidingWindowRateLimiter(
+            1,
+            10.0,
+            violation_limit=2,
+            block_seconds=30.0,
+            clock=clock,
+        )
+
+        self.assertIsNone(limiter.check("spammer"))
+        self.assertEqual(limiter.check("spammer"), 10.0)
+        self.assertEqual(limiter.check("spammer"), 30.0)
+
+        clock.now = 20.0
+        self.assertEqual(limiter.check("spammer"), 10.0)
+        clock.now = 30.1
+        self.assertIsNone(limiter.check("spammer"))
+
+    def test_busy_request_violations_also_trigger_block(self) -> None:
+        clock = FakeClock()
+        limiter = SlidingWindowRateLimiter(
+            10,
+            60.0,
+            violation_limit=3,
+            block_seconds=300.0,
+            clock=clock,
+        )
+
+        self.assertEqual(limiter.violate("busy-spammer"), 0.0)
+        self.assertEqual(limiter.violate("busy-spammer"), 0.0)
+        self.assertEqual(limiter.violate("busy-spammer"), 300.0)
+        self.assertEqual(limiter.check("busy-spammer"), 300.0)
+
 
 if __name__ == "__main__":
     unittest.main()

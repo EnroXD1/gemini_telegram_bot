@@ -8,6 +8,8 @@ from contextlib import asynccontextmanager, suppress
 from aiogram.enums import ChatAction
 from aiogram.types import Message
 
+from .gemini import ModelSwitchNotice
+
 logger = logging.getLogger(__name__)
 
 PROGRESS_FRAMES = (
@@ -78,7 +80,7 @@ class ProgressReporter:
         self._status = status
         self._animation = animation
 
-    async def show_fallback(self, model: str) -> None:
+    async def show_fallback(self, notice: ModelSwitchNotice) -> None:
         """Replace animation with a stable provider-switch notification."""
         if self._animation is not None:
             self._animation.cancel()
@@ -87,9 +89,19 @@ class ProgressReporter:
         if self._status is None:
             return
         try:
+            source = _provider_label(notice.source_provider)
+            target = _provider_label(notice.target_provider)
+            if notice.reason == "limit":
+                headline = (
+                    f"⚡ Лимит модели {source} ({notice.source_model}) исчерпан."
+                )
+            else:
+                headline = (
+                    f"⚠️ Модель {source} ({notice.source_model}) временно недоступна."
+                )
             await self._status.edit_text(
-                "⚡ Лимит OpenRouter исчерпан.\n"
-                f"🔄 Переключаюсь на резервную модель Groq ({model})…"
+                f"{headline}\n"
+                f"🔄 Переключаюсь на {target} ({notice.target_model})…"
             )
         except Exception as exc:
             logger.debug("Could not show fallback status: %s", type(exc).__name__)
@@ -147,11 +159,18 @@ async def _delete_progress_message(
                     type(direct_exc).__name__,
                     type(business_exc).__name__,
                 )
-                return False
         logger.debug(
             "Could not delete progress message: %s", type(direct_exc).__name__
         )
         return False
+
+
+def _provider_label(provider: str) -> str:
+    return {
+        "google": "Google/Gemini",
+        "openrouter": "OpenRouter",
+        "groq": "Groq",
+    }.get(provider, provider)
 
 
 async def _delete_progress_message_later(
