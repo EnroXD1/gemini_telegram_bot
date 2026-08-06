@@ -107,9 +107,12 @@ def _choice(name: str, default: str, allowed: set[str]) -> str:
 @dataclass(frozen=True, slots=True)
 class Settings:
     telegram_bot_token: str
+    ai_provider: str
     gemini_api_key: str
     gemini_vertex_ai: bool
     gemini_model: str
+    openrouter_api_key: str
+    openrouter_model: str
     gemini_system_prompt: str
     gemini_temperature: float
     gemini_max_output_tokens: int
@@ -137,9 +140,29 @@ class Settings:
     drop_pending_updates: bool
     log_level: str
 
+    @property
+    def active_model(self) -> str:
+        if self.ai_provider == "openrouter":
+            return self.openrouter_model
+        return self.gemini_model
+
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> Settings:
         load_dotenv(dotenv_path=env_file, override=False)
+
+        ai_provider = _choice(
+            "AI_PROVIDER", "google", {"google", "openrouter"}
+        )
+        gemini_api_key = (
+            _required("GEMINI_API_KEY")
+            if ai_provider == "google"
+            else os.getenv("GEMINI_API_KEY", "").strip()
+        )
+        openrouter_api_key = (
+            _required("OPENROUTER_API_KEY")
+            if ai_provider == "openrouter"
+            else os.getenv("OPENROUTER_API_KEY", "").strip()
+        )
 
         temperature = _float("GEMINI_TEMPERATURE", 0.7, 0.0)
         if temperature > 2.0:
@@ -150,11 +173,19 @@ class Settings:
 
         return cls(
             telegram_bot_token=_telegram_bot_token(),
-            gemini_api_key=_required("GEMINI_API_KEY"),
+            ai_provider=ai_provider,
+            gemini_api_key=gemini_api_key,
             gemini_vertex_ai=_bool("GEMINI_VERTEX_AI", False),
             gemini_model=(
                 os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
                 or "gemini-3.6-flash"
+            ),
+            openrouter_api_key=openrouter_api_key,
+            openrouter_model=(
+                os.getenv(
+                    "OPENROUTER_MODEL", "google/gemini-3.5-flash"
+                ).strip()
+                or "google/gemini-3.5-flash"
             ),
             gemini_system_prompt=os.getenv(
                 "GEMINI_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT

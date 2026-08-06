@@ -51,7 +51,10 @@ async def run_bot(settings: Settings) -> None:
         await bot.delete_webhook(drop_pending_updates=settings.drop_pending_updates)
 
         logger.info(
-            "Starting @%s with model=%s", bot_user.username, settings.gemini_model
+            "Starting @%s with provider=%s model=%s",
+            bot_user.username,
+            settings.ai_provider,
+            settings.active_model,
         )
         await dispatcher.start_polling(
             bot,

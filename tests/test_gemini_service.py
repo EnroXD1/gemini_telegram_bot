@@ -46,6 +46,27 @@ class FakeClient:
         )
 
 
+class FakeOpenRouterResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, object]:
+        return self.payload
+
+
+class FakeOpenRouterClient:
+    def __init__(self, responses: list[FakeOpenRouterResponse]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def post(self, url: str, *, json: dict[str, object]) -> FakeOpenRouterResponse:
+        self.calls.append((url, json))
+        return self.responses.pop(0)
+
+
 class ContextError(RuntimeError):
     code = 404
 
@@ -59,6 +80,7 @@ def make_service(
 ) -> GeminiService:
     service = GeminiService.__new__(GeminiService)
     service._settings = SimpleNamespace(
+        ai_provider="google",
         gemini_store_interactions=True,
         gemini_model="gemini-test",
         gemini_system_prompt="system",
@@ -68,8 +90,33 @@ def make_service(
         gemini_retry_attempts=1,
     )
     service._client = FakeClient(responses, model_responses)
+    service._openrouter_client = None
     service._semaphore = asyncio.Semaphore(1)
     service._interactions_available = True
+    return service
+
+
+def make_openrouter_service(response_text: str) -> GeminiService:
+    service = GeminiService.__new__(GeminiService)
+    service._settings = SimpleNamespace(
+        ai_provider="openrouter",
+        openrouter_model="google/gemini-3.5-flash",
+        gemini_system_prompt="system",
+        gemini_temperature=0.5,
+        gemini_max_output_tokens=100,
+        gemini_timeout_seconds=2.0,
+        gemini_retry_attempts=1,
+    )
+    service._client = None
+    service._openrouter_client = FakeOpenRouterClient(
+        [
+            FakeOpenRouterResponse(
+                {"choices": [{"message": {"content": response_text}}]}
+            )
+        ]
+    )
+    service._semaphore = asyncio.Semaphore(1)
+    service._interactions_available = False
     return service
 
 
@@ -77,6 +124,7 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
     @patch("bot.gemini.genai.Client")
     def test_vertex_express_client(self, client_factory) -> None:
         settings = SimpleNamespace(
+            ai_provider="google",
             gemini_api_key="AQ.test-key",
             gemini_vertex_ai=True,
             max_concurrent_requests=1,
@@ -88,6 +136,53 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
             api_key="AQ.test-key", vertexai=True
         )
         self.assertFalse(service._interactions_available)
+
+    async def test_openrouter_text_request(self) -> None:
+        service = make_openrouter_service("ответ OpenRouter")
+
+        result = await service.generate(PromptBundle(prompt="вопрос"), None)
+
+        self.assertEqual(result.text, "ответ OpenRouter")
+        self.assertIsNone(result.interaction_id)
+        url, payload = service._openrouter_client.calls[0]
+        self.assertEqual(url, "chat/completions")
+        self.assertEqual(payload["model"], "google/gemini-3.5-flash")
+        self.assertEqual(payload["messages"][1]["content"], "вопрос")
+
+    async def test_openrouter_multimodal_request(self) -> None:
+        service = make_openrouter_service("мультимодальный ответ")
+        bundle = PromptBundle(
+            prompt="проанализируй всё",
+            media=(
+                MediaPayload("фото", "image", "image/jpeg", b"image"),
+                MediaPayload("голос", "audio", "audio/ogg", b"audio"),
+                MediaPayload("кружок", "video", "video/mp4", b"video"),
+                MediaPayload("PDF", "document", "application/pdf", b"pdf"),
+            ),
+        )
+
+        result = await service.generate(bundle, "old-google-context")
+
+        self.assertEqual(result.text, "мультимодальный ответ")
+        self.assertTrue(result.context_was_reset)
+        content = service._openrouter_client.calls[0][1]["messages"][1]["content"]
+        typed_parts = {part["type"]: part for part in content if part["type"] != "text"}
+        self.assertTrue(
+            typed_parts["image_url"]["image_url"]["url"].startswith(
+                "data:image/jpeg;base64,"
+            )
+        )
+        self.assertEqual(typed_parts["input_audio"]["input_audio"]["format"], "ogg")
+        self.assertTrue(
+            typed_parts["video_url"]["video_url"]["url"].startswith(
+                "data:video/mp4;base64,"
+            )
+        )
+        self.assertTrue(
+            typed_parts["file"]["file"]["file_data"].startswith(
+                "data:application/pdf;base64,"
+            )
+        )
 
     async def test_multimodal_request(self) -> None:
         service = make_service(

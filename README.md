@@ -1,7 +1,7 @@
-# Telegram-бот с Gemini API
+# Telegram-бот с Gemini и OpenRouter
 
-Готовый асинхронный Telegram-бот, который использует Gemini Interactions API как
-диалоговый движок. Проект рассчитан на личные чаты, группы, темы форумов и
+Готовый асинхронный Telegram-бот, который умеет обращаться к Gemini напрямую
+или через OpenRouter. Проект рассчитан на личные чаты, группы, темы форумов и
 Telegram Business-сообщения. По умолчанию используется long polling, поэтому
 домен и HTTPS-сертификат для первого запуска не нужны.
 
@@ -10,7 +10,8 @@ Telegram Business-сообщения. По умолчанию используе
 - Python 3.11+;
 - aiogram 3.30+ с поддержкой Telegram Bot API 10.2;
 - официальный Google Gen AI SDK 2.11+;
-- модель `gemini-3.6-flash`, которую можно заменить через `.env`;
+- прямой Google API или OpenRouter, выбираемый через `.env`;
+- модели `gemini-3.6-flash` для Google и `google/gemini-3.5-flash` для OpenRouter;
 - SQLite для настроек чатов и идентификаторов контекста.
 
 ## Что уже реализовано
@@ -29,7 +30,7 @@ Telegram Business-сообщения. По умолчанию используе
 - Отдельный контекст для личного чата, группы/темы или каждого пользователя —
   настраивается переменной `CONVERSATION_SCOPE`.
 - Последовательная обработка одного диалога: два одновременных сообщения не
-  перепутают цепочку `previous_interaction_id`.
+  перепутают цепочку запросов.
 - Ограничение частоты запросов, общего размера файлов и числа одновременно
   выполняемых Gemini-запросов.
 - Повтор временных ошибок Gemini, понятные сообщения для 400/401/403/429/5xx и
@@ -80,7 +81,8 @@ Bot API не имеет доступа к секретным чатам; тай�
 ## Быстрый запуск без Docker
 
 1. Создайте бота через [@BotFather](https://t.me/BotFather), скопируйте токен.
-2. Создайте ключ в [Google AI Studio](https://aistudio.google.com/app/apikey).
+2. Создайте ключ в [Google AI Studio](https://aistudio.google.com/app/apikey)
+   либо в [OpenRouter](https://openrouter.ai/keys).
 3. Установите Python 3.11 или новее и выполните:
 
 ```bash
@@ -91,11 +93,20 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-4. Откройте `.env` и заполните минимум две строки:
+4. Откройте `.env` и выберите один из вариантов. Для прямого Google API:
 
 ```dotenv
 TELEGRAM_BOT_TOKEN=токен_от_BotFather
 GEMINI_API_KEY=ключ_из_Google_AI_Studio
+```
+
+Для OpenRouter:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=токен_от_BotFather
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=ключ_из_OpenRouter
+OPENROUTER_MODEL=google/gemini-3.5-flash
 ```
 
 5. Запустите:
@@ -114,7 +125,7 @@ gemini-telegram-bot
 
 ```bash
 cp .env.example .env
-# заполните TELEGRAM_BOT_TOKEN и GEMINI_API_KEY
+# заполните TELEGRAM_BOT_TOKEN и ключ выбранного AI-провайдера
 docker compose up -d --build
 docker compose logs -f bot
 ```
@@ -129,9 +140,10 @@ docker compose logs -f bot
    URL репозитория, ветку `main`, платформу Telegram и главный файл `main.py`.
 2. Используйте стандартную Python-сборку Bothost (`requirements.txt` уже есть).
    Собственный `Dockerfile` также поддерживается, но для этого проекта не нужен.
-3. В переменных окружения Bothost добавьте `GEMINI_API_KEY`. Для ключа Vertex AI
-   Express Mode (например, с префиксом `AQ.`) также установите
-   `GEMINI_VERTEX_AI=true`. Если токен из формы
+3. Для OpenRouter добавьте `AI_PROVIDER=openrouter`, `OPENROUTER_API_KEY` и
+   `OPENROUTER_MODEL=google/gemini-3.5-flash`. Для прямого Google API добавьте
+   `GEMINI_API_KEY`; для ключа Vertex AI Express Mode (например, с префиксом
+   `AQ.`) также установите `GEMINI_VERTEX_AI=true`. Если токен из формы
    создания не передаётся в контейнер, добавьте его как
    `APP_TELEGRAM_BOT_TOKEN`. Также поддерживаются `TELEGRAM_BOT_TOKEN` и
    системные алиасы `BOT_TOKEN`, `BOT_API_TOKEN`, `TOKEN`.
@@ -142,6 +154,27 @@ docker compose logs -f bot
 
 Не загружайте `.env` в репозиторий: токены и API-ключи задаются только через
 переменные окружения Bothost.
+
+## Как работает маршрут через OpenRouter
+
+Бот сначала получает Telegram update и скачивает поддерживаемое вложение в
+оперативную память процесса. Затем он собирает единый запрос: текст остаётся
+текстом, изображения и видео превращаются в Base64 data URL, аудио — в raw
+Base64 с указанием формата, PDF — в Base64-файл. Запрос отправляется по HTTPS на
+`https://openrouter.ai/api/v1/chat/completions` с ключом OpenRouter.
+
+OpenRouter проверяет ключ и баланс, находит доступного поставщика выбранной
+модели и передаёт ему запрос. Полученный текстовый ответ возвращается тем же
+маршрутом в бот, после чего бот делит длинный текст по лимиту Telegram. VPN
+пользователя в этой цепочке не участвует: сетевое соединение выполняет сервер
+Bothost.
+
+При `AI_PROVIDER=openrouter` ключ и оплата принадлежат OpenRouter, поэтому Google
+Cloud-проект и его выбор страны не нужны. Содержимое запроса при этом видят как
+OpenRouter, так и фактический поставщик модели. Текущая интеграция не сохраняет
+многоходовую цепочку на стороне OpenRouter: каждый новый запрос независим, но
+текст и вложение сообщения, на которое сделан Telegram reply, всё равно входят
+в текущий запрос.
 
 ## Поведение в группах
 
@@ -185,8 +218,10 @@ Telegram с включённой приватностью отдаёт боту 
 
 | Переменная | Значение по умолчанию | Назначение |
 | --- | ---: | --- |
+| `AI_PROVIDER` | `google` | `google` или `openrouter` |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | ID модели Gemini |
 | `GEMINI_VERTEX_AI` | `false` | Использовать Vertex AI Express Mode |
+| `OPENROUTER_MODEL` | `google/gemini-3.5-flash` | Модель через OpenRouter |
 | `GEMINI_SYSTEM_PROMPT` | встроенный русский prompt | Роль и стиль бота |
 | `GEMINI_TEMPERATURE` | `0.7` | Вариативность ответа, от 0 до 2 |
 | `GEMINI_MAX_OUTPUT_TOKENS` | `4096` | Максимум токенов ответа |
@@ -210,7 +245,7 @@ Telegram с включённой приватностью отдаёт боту 
 
 ## Контекст и приватность
 
-По умолчанию Interactions API хранит цепочку на стороне Gemini. Для работы
+В прямом Google-режиме Interactions API хранит цепочку на стороне Gemini. Для работы
 защиты Business-переписки локальная SQLite дополнительно хранит исходный текст,
 имя отправителя и тип вложения до 30 дней; сами файлы в SQLite не записываются,
 а отправляются владельцу в Telegram. Токены и ключи в базу не записываются.
@@ -227,8 +262,9 @@ GEMINI_STORE_INTERACTIONS=false
 ```
 
 В этом режиме каждое обращение независимо; reply-контекст текущего Telegram-
-сообщения всё равно передаётся. Любое содержимое, которое бот анализирует,
-отправляется API Google, поэтому перед добавлением бота в рабочий чат следует
+сообщения всё равно передаётся. Любое анализируемое содержимое отправляется
+выбранному AI-провайдеру. В режиме OpenRouter оно проходит через OpenRouter к
+фактическому поставщику модели. Перед добавлением бота в рабочий чат следует
 уведомить участников и проверить применимые правила обработки данных.
 
 Храните `.env` только на сервере. Если токен или ключ попал в публичный репозиторий,
@@ -246,8 +282,8 @@ GEMINI_STORE_INTERACTIONS=false
 - Максимальный размер намеренно установлен ниже лимитов Gemini и Telegram, чтобы
   base64-запросы не занимали слишком много памяти. Увеличивайте его только вместе
   с лимитами RAM и таймаутами.
-- Модели Gemini имеют жизненный цикл. При прекращении поддержки модели достаточно
-  заменить `GEMINI_MODEL`, не меняя обработчики Telegram.
+- Модели имеют жизненный цикл. При прекращении поддержки достаточно заменить
+  `GEMINI_MODEL` или `OPENROUTER_MODEL`, не меняя обработчики Telegram.
 
 ## Проверка проекта
 
@@ -278,3 +314,5 @@ pytest
 - [Gemini Interactions API](https://ai.google.dev/gemini-api/docs/interactions-overview)
 - [Gemini multimodal file inputs](https://ai.google.dev/gemini-api/docs/file-input-methods)
 - [Google Gen AI Python SDK](https://googleapis.github.io/python-genai/)
+- [OpenRouter Chat Completions](https://openrouter.ai/docs/api/api-reference/chat/send-chat-completion-request)
+- [OpenRouter multimodal inputs](https://openrouter.ai/docs/guides/overview/multimodal/overview)

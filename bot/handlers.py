@@ -157,12 +157,18 @@ def create_router(
             processor.scope_key(message)
         )
         context = "есть" if interaction_id else "пуст"
+        context_storage = (
+            "на стороне Gemini"
+            if processor.settings.ai_provider == "google"
+            and processor.settings.gemini_store_interactions
+            else "не используется"
+        )
         await message.reply(
-            f"Модель: {processor.settings.gemini_model}\n"
+            f"Провайдер: {processor.settings.ai_provider}\n"
+            f"Модель: {processor.settings.active_model}\n"
             f"Режим чата: {mode}\n"
             f"Контекст: {context}\n"
-            f"Хранение контекста Gemini: "
-            f"{'включено' if processor.settings.gemini_store_interactions else 'выключено'}"
+            f"Серверное хранение контекста: {context_storage}"
         )
 
     @router.message()
