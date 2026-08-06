@@ -20,16 +20,42 @@ class FakeInteractions:
         return response
 
 
+class FakeModels:
+    def __init__(self, responses: list[object] | None = None) -> None:
+        self.responses = responses or []
+        self.calls: list[dict[str, object]] = []
+
+    async def generate_content(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
 class FakeClient:
-    def __init__(self, responses: list[object]) -> None:
-        self.aio = SimpleNamespace(interactions=FakeInteractions(responses))
+    def __init__(
+        self,
+        interaction_responses: list[object],
+        model_responses: list[object] | None = None,
+    ) -> None:
+        self.aio = SimpleNamespace(
+            interactions=FakeInteractions(interaction_responses),
+            models=FakeModels(model_responses),
+        )
 
 
 class ContextError(RuntimeError):
     code = 404
 
 
-def make_service(responses: list[object]) -> GeminiService:
+class LocationError(RuntimeError):
+    code = 400
+
+
+def make_service(
+    responses: list[object], model_responses: list[object] | None = None
+) -> GeminiService:
     service = GeminiService.__new__(GeminiService)
     service._settings = SimpleNamespace(
         gemini_store_interactions=True,
@@ -40,8 +66,9 @@ def make_service(responses: list[object]) -> GeminiService:
         gemini_timeout_seconds=2.0,
         gemini_retry_attempts=1,
     )
-    service._client = FakeClient(responses)
+    service._client = FakeClient(responses, model_responses)
     service._semaphore = asyncio.Semaphore(1)
+    service._interactions_available = True
     return service
 
 
@@ -89,6 +116,48 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         calls = service._client.aio.interactions.calls
         self.assertEqual(calls[0]["previous_interaction_id"], "expired")
         self.assertNotIn("previous_interaction_id", calls[1])
+
+    async def test_location_error_falls_back_to_generate_content(self) -> None:
+        service = make_service(
+            [LocationError("This API is not available in your current location")],
+            [SimpleNamespace(text="резервный ответ")],
+        )
+        bundle = PromptBundle(
+            prompt="вопрос",
+            media=(
+                MediaPayload(
+                    label="фото",
+                    kind="image",
+                    mime_type="image/jpeg",
+                    data=b"image-bytes",
+                ),
+            ),
+        )
+
+        result = await service.generate(bundle, "old-id")
+
+        self.assertEqual(result.text, "резервный ответ")
+        self.assertIsNone(result.interaction_id)
+        self.assertTrue(result.context_was_reset)
+        self.assertFalse(service._interactions_available)
+        call = service._client.aio.models.calls[0]
+        parts = call["contents"]
+        self.assertEqual(parts[1].inline_data.data, b"image-bytes")
+        self.assertEqual(parts[1].inline_data.mime_type, "image/jpeg")
+
+    async def test_generate_content_stays_enabled_after_location_error(self) -> None:
+        service = make_service(
+            [LocationError("Interactions API is not available")],
+            [SimpleNamespace(text="первый"), SimpleNamespace(text="второй")],
+        )
+
+        first = await service.generate(PromptBundle(prompt="раз"), None)
+        second = await service.generate(PromptBundle(prompt="два"), None)
+
+        self.assertEqual(first.text, "первый")
+        self.assertEqual(second.text, "второй")
+        self.assertEqual(len(service._client.aio.interactions.calls), 1)
+        self.assertEqual(len(service._client.aio.models.calls), 2)
 
 
 if __name__ == "__main__":

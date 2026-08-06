@@ -7,6 +7,7 @@ import random
 from typing import Any
 
 from google import genai
+from google.genai import types
 
 from .config import Settings
 from .gemini_response import extract_interaction_id, extract_interaction_text
@@ -26,6 +27,7 @@ class GeminiService:
         self._settings = settings
         self._client = genai.Client(api_key=settings.gemini_api_key)
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
+        self._interactions_available = True
 
     async def close(self) -> None:
         await self._client.aio.aclose()
@@ -63,11 +65,33 @@ class GeminiService:
                     async with asyncio.timeout(
                         self._settings.gemini_timeout_seconds
                     ):
-                        interaction = await self._client.aio.interactions.create(
-                            **kwargs
-                        )
+                        if self._interactions_available:
+                            interaction = await self._client.aio.interactions.create(
+                                **kwargs
+                            )
+                            text = extract_interaction_text(interaction)
+                            interaction_id = (
+                                extract_interaction_id(interaction)
+                                if self._settings.gemini_store_interactions
+                                else None
+                            )
+                        else:
+                            response = await self._client.aio.models.generate_content(
+                                model=self._settings.gemini_model,
+                                contents=_build_generate_content(bundle),
+                                config=types.GenerateContentConfig(
+                                    system_instruction=(
+                                        self._settings.gemini_system_prompt
+                                    ),
+                                    temperature=self._settings.gemini_temperature,
+                                    max_output_tokens=(
+                                        self._settings.gemini_max_output_tokens
+                                    ),
+                                ),
+                            )
+                            text = str(getattr(response, "text", "") or "").strip()
+                            interaction_id = None
 
-                    text = extract_interaction_text(interaction)
                     if not text:
                         raise GeminiRequestError(
                             "Gemini обработал запрос, но не вернул текстовый ответ. "
@@ -75,11 +99,7 @@ class GeminiService:
                         )
                     return GeminiResult(
                         text=text,
-                        interaction_id=(
-                            extract_interaction_id(interaction)
-                            if self._settings.gemini_store_interactions
-                            else None
-                        ),
+                        interaction_id=interaction_id,
                         context_was_reset=context_was_reset,
                     )
                 except GeminiRequestError:
@@ -91,6 +111,18 @@ class GeminiService:
                     ) from exc
                 except Exception as exc:
                     code = _error_code(exc)
+                    if self._interactions_available and _is_location_error(exc):
+                        logger.warning(
+                            "Gemini Interactions API is unavailable in this region; "
+                            "switching to generateContent"
+                        )
+                        self._interactions_available = False
+                        current_previous_id = None
+                        context_was_reset = context_was_reset or bool(
+                            previous_interaction_id
+                        )
+                        attempt = 0
+                        continue
                     if current_previous_id and _is_expired_context_error(exc, code):
                         logger.info("Gemini conversation context expired; starting a new one")
                         current_previous_id = None
@@ -138,6 +170,18 @@ def _build_input(bundle: PromptBundle) -> str | list[dict[str, str]]:
     return content
 
 
+def _build_generate_content(bundle: PromptBundle) -> str | list[types.Part]:
+    if not bundle.media:
+        return bundle.prompt
+
+    parts: list[types.Part] = []
+    for item in bundle.media:
+        parts.append(types.Part.from_text(text=item.label))
+        parts.append(types.Part.from_bytes(data=item.data, mime_type=item.mime_type))
+    parts.append(types.Part.from_text(text=bundle.prompt))
+    return parts
+
+
 def _error_code(exc: Exception) -> int | None:
     for name in ("code", "status_code"):
         value = getattr(exc, name, None)
@@ -166,6 +210,14 @@ def _is_expired_context_error(exc: Exception, code: int | None) -> bool:
             "interaction expired",
             "not found",
         )
+    )
+
+
+def _is_location_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "api is not available in your current location" in text
+        or "interactions api is not available" in text
     )
 
 
