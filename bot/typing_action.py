@@ -15,6 +15,8 @@ PROGRESS_FRAMES = (
     "🔎 Анализирую данные",
     "✍️ Готовлю ответ",
 )
+COMPLETED_STATUS_TEXT = "✅ Обработка завершена"
+COMPLETED_STATUS_TTL_SECONDS = 3.0
 
 
 async def _typing_loop(message: Message, interval: float) -> None:
@@ -58,9 +60,17 @@ async def _progress_loop(status: Message, interval: float) -> None:
 
 
 class ProgressReporter:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        business_connection_id: str | None = None,
+        completed_status_ttl: float = COMPLETED_STATUS_TTL_SECONDS,
+    ) -> None:
         self._status: Message | None = None
         self._animation: asyncio.Task[None] | None = None
+        self._business_connection_id = business_connection_id
+        self._completed_status_ttl = max(0.0, completed_status_ttl)
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
     def bind(
         self, status: Message, animation: asyncio.Task[None]
@@ -90,23 +100,81 @@ class ProgressReporter:
             await asyncio.gather(self._animation, return_exceptions=True)
             self._animation = None
         if self._status is not None:
-            try:
-                await self._status.delete()
-            except Exception as exc:
-                logger.debug(
-                    "Could not delete progress message: %s", type(exc).__name__
-                )
+            deleted = await _delete_progress_message(
+                self._status,
+                business_connection_id=self._business_connection_id,
+            )
+            if not deleted:
                 with suppress(Exception):
-                    await self._status.edit_text("✅ Обработка завершена")
+                    await self._status.edit_text(COMPLETED_STATUS_TEXT)
+                cleanup_task = asyncio.create_task(
+                    _delete_progress_message_later(
+                        self._status,
+                        business_connection_id=self._business_connection_id,
+                        delay=self._completed_status_ttl,
+                    ),
+                    name="telegram-progress-cleanup",
+                )
+                self._cleanup_tasks.add(cleanup_task)
+                cleanup_task.add_done_callback(self._cleanup_tasks.discard)
             self._status = None
+
+
+async def _delete_progress_message(
+    status: Message, *, business_connection_id: str | None
+) -> bool:
+    try:
+        await status.delete()
+        return True
+    except Exception as direct_exc:
+        connection_id = (
+            getattr(status, "business_connection_id", None)
+            or business_connection_id
+        )
+        bot = getattr(status, "bot", None)
+        message_id = getattr(status, "message_id", None)
+        if connection_id and bot is not None and message_id is not None:
+            try:
+                await bot.delete_business_messages(
+                    business_connection_id=connection_id,
+                    message_ids=[message_id],
+                )
+                return True
+            except Exception as business_exc:
+                logger.debug(
+                    "Could not delete Business progress message: direct=%s "
+                    "business=%s",
+                    type(direct_exc).__name__,
+                    type(business_exc).__name__,
+                )
+                return False
+        logger.debug(
+            "Could not delete progress message: %s", type(direct_exc).__name__
+        )
+        return False
+
+
+async def _delete_progress_message_later(
+    status: Message, *, business_connection_id: str | None, delay: float
+) -> None:
+    await asyncio.sleep(max(0.0, delay))
+    await _delete_progress_message(
+        status,
+        business_connection_id=business_connection_id,
+    )
 
 
 @asynccontextmanager
 async def show_progress(
-    message: Message, interval: float = 3.0
+    message: Message,
+    interval: float = 3.0,
+    completed_status_ttl: float = COMPLETED_STATUS_TTL_SECONDS,
 ) -> AsyncIterator[ProgressReporter]:
     """Show Telegram typing and a temporary, animated progress message."""
-    reporter = ProgressReporter()
+    reporter = ProgressReporter(
+        business_connection_id=message.business_connection_id,
+        completed_status_ttl=completed_status_ttl,
+    )
 
     async with keep_typing(message):
         try:
