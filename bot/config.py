@@ -30,14 +30,20 @@ def _required(name: str) -> str:
 
 def _telegram_bot_token() -> str:
     """Read the Telegram token, including aliases exposed by some bot hosts."""
-    for name in ("TELEGRAM_BOT_TOKEN", "BOT_TOKEN", "BOT_API_TOKEN", "TOKEN"):
+    for name in (
+        "TELEGRAM_BOT_TOKEN",
+        "APP_TELEGRAM_BOT_TOKEN",
+        "BOT_TOKEN",
+        "BOT_API_TOKEN",
+        "TOKEN",
+    ):
         value = os.getenv(name, "").strip()
         token_id, separator, token_secret = value.partition(":")
         if separator and token_id.isdigit() and token_secret:
             return value
     raise ConfigError(
         "Не задан Telegram-токен: укажите TELEGRAM_BOT_TOKEN "
-        "(или поддерживаемый хостингом BOT_TOKEN)"
+        "(на Bothost можно использовать APP_TELEGRAM_BOT_TOKEN)"
     )
 
 

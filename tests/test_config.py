@@ -4,7 +4,13 @@ import pytest
 
 from bot.config import Settings
 
-TOKEN_NAMES = ("TELEGRAM_BOT_TOKEN", "BOT_TOKEN", "BOT_API_TOKEN", "TOKEN")
+TOKEN_NAMES = (
+    "TELEGRAM_BOT_TOKEN",
+    "APP_TELEGRAM_BOT_TOKEN",
+    "BOT_TOKEN",
+    "BOT_API_TOKEN",
+    "TOKEN",
+)
 
 
 @pytest.mark.parametrize("alias", TOKEN_NAMES)
