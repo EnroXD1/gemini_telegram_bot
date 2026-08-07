@@ -63,6 +63,8 @@ def make_message(
     photo: list[PhotoSize] | None = None,
     video_note: VideoNote | None = None,
     sender_id: int = 200,
+    reply_to_message: Message | None = None,
+    sender_business_bot: User | None = None,
 ) -> Message:
     return Message(
         message_id=message_id,
@@ -78,6 +80,8 @@ def make_message(
         text=text,
         photo=photo,
         video_note=video_note,
+        reply_to_message=reply_to_message,
+        sender_business_bot=sender_business_bot,
     )
 
 
@@ -388,6 +392,83 @@ class BusinessMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(archives), 10)
         self.assertEqual(self.bot.sent_messages, [])
         self.assertEqual(self.bot.sent_video_notes, [])
+
+    async def test_owner_reply_saves_hidden_photo_once(self) -> None:
+        hidden = make_message(
+            message_id=9,
+            photo=[
+                PhotoSize(
+                    file_id="hidden-photo-id",
+                    file_unique_id="hidden-photo-unique",
+                    width=100,
+                    height=100,
+                    file_size=100,
+                )
+            ],
+        )
+        reply = make_message(
+            message_id=11,
+            text="тест",
+            sender_id=100,
+            reply_to_message=hidden,
+        )
+
+        await self.monitor.capture_message(reply)
+        await self.monitor.capture_message(reply)
+
+        self.assertEqual(self.bot.downloaded_file_id, "hidden-photo-id")
+        self.assertEqual(len(self.bot.sent_photos), 1)
+        self.assertEqual(self.bot.sent_photos[0]["chat_id"], 100)
+        self.assertIn("сохранено по вашему ответу", self.bot.sent_photos[0]["caption"])
+        self.assertIsNone(
+            await self.storage.get_business_media_archive(
+                connection_id="connection-1", chat_id=200, message_id=9
+            )
+        )
+        stored = await self.storage.get_business_messages(
+            connection_id="connection-1", chat_id=200, message_ids=[9]
+        )
+        self.assertEqual(len(stored), 1)
+        self.assertIsNotNone(stored[0].deleted_at)
+
+    async def test_business_bot_reply_does_not_trigger_hidden_media_save(self) -> None:
+        hidden = make_message(
+            message_id=9,
+            photo=[
+                PhotoSize(
+                    file_id="hidden-photo-id",
+                    file_unique_id="hidden-photo-unique",
+                    width=100,
+                    height=100,
+                    file_size=100,
+                )
+            ],
+        )
+        bot_user = User(id=300, is_bot=True, first_name="Ку-ку")
+
+        await self.monitor.capture_message(
+            make_message(
+                message_id=11,
+                text="Ответ бота",
+                sender_id=100,
+                reply_to_message=hidden,
+                sender_business_bot=bot_user,
+            )
+        )
+
+        self.assertIsNone(self.bot.downloaded_file_id)
+        self.assertEqual(self.bot.sent_photos, [])
+
+    async def test_unknown_business_deletions_are_logged_without_notifications(self) -> None:
+        await self.monitor.handle_deleted_messages(
+            BusinessMessagesDeleted(
+                business_connection_id="connection-1",
+                chat=Chat(id=200, type=ChatType.PRIVATE, first_name="Собеседник"),
+                message_ids=[900, 901, 902],
+            )
+        )
+
+        self.assertEqual(self.bot.sent_messages, [])
 
     async def test_expired_silent_archive_is_removed_from_disk(self) -> None:
         await self.monitor.capture_message(

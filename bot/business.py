@@ -105,6 +105,8 @@ class BusinessMonitor:
                 and attachment is not None
             ):
                 await self._archive_attachment(message, connection, attachment)
+            elif self.settings.business_archive_media:
+                await self._save_media_from_owner_reply(message, connection)
 
     async def welcome_contact(self, message: Message) -> bool:
         """Send the configured disclosure once to each Business interlocutor."""
@@ -209,7 +211,6 @@ class BusinessMonitor:
                 message_ids=event.message_ids,
             )
             archive_by_message_id = {archive.message_id: archive for archive in archives}
-            delivered = 0
             for record in records:
                 if not record.is_incoming or record.deleted_at is not None:
                     continue
@@ -231,7 +232,6 @@ class BusinessMonitor:
                         _deleted_message_text(record),
                     )
                 if media_delivered or notification_delivered:
-                    delivered += 1
                     await self.storage.mark_business_message_deleted(
                         connection_id=record.connection_id,
                         chat_id=record.chat_id,
@@ -240,11 +240,12 @@ class BusinessMonitor:
 
             known_ids = {record.message_id for record in records}
             missing_ids = [item for item in event.message_ids if item not in known_ids]
-            if missing_ids and delivered == 0:
-                await self._send_notification(
-                    connection.owner_chat_id,
-                    "🗑 Telegram сообщил об удалении сообщения в Business-чате, но "
-                    "автор и исходная версия неизвестны (бот мог быть выключен).",
+            if missing_ids:
+                logger.info(
+                    "Ignoring %s unknown Business deletion(s) connection=%s chat_id=%s",
+                    len(missing_ids),
+                    event.business_connection_id,
+                    event.chat.id,
                 )
 
     async def prune_archived_media(self, retention_days: int) -> int:
@@ -361,6 +362,87 @@ class BusinessMonitor:
                 type(exc).__name__,
             )
 
+    async def _save_media_from_owner_reply(
+        self,
+        message: Message,
+        connection: BusinessConnectionRecord,
+    ) -> None:
+        """Save media explicitly requested by the owner through a reply.
+
+        Bot API doesn't expose the self-destruct timer. Replying before opening a
+        view-once item makes the original message available as ``reply_to_message``;
+        an owner reply is therefore treated as an explicit save request.
+        """
+        if message.sender_business_bot is not None:
+            return
+        if message.from_user is None or message.from_user.id != connection.owner_user_id:
+            return
+        replied = message.reply_to_message
+        if replied is None:
+            return
+        attachment = archive_attachment_from_message(replied)
+        if attachment is None:
+            return
+
+        original = _record_from_message(replied, connection)
+        if not original.is_incoming:
+            return
+        previous = await self.storage.upsert_business_message(original)
+        if previous is not None and previous.deleted_at is not None:
+            logger.info(
+                "Skipping already delivered replied media chat_id=%s message_id=%s",
+                original.chat_id,
+                original.message_id,
+            )
+            return
+
+        archive = await self.storage.get_business_media_archive(
+            connection_id=connection.connection_id,
+            chat_id=original.chat_id,
+            message_id=original.message_id,
+        )
+        if archive is None:
+            await self._archive_attachment(replied, connection, attachment)
+            archive = await self.storage.get_business_media_archive(
+                connection_id=connection.connection_id,
+                chat_id=original.chat_id,
+                message_id=original.message_id,
+            )
+        if archive is None:
+            await self._send_notification(
+                connection.owner_chat_id,
+                "⚠️ Не удалось сохранить медиа из сообщения, на которое вы ответили. "
+                "Возможно, Telegram уже закрыл доступ к файлу или превышен лимит размера.",
+            )
+            return
+
+        delivered = await self._send_archived_media(
+            chat_id=connection.owner_chat_id,
+            record=original,
+            archive=archive,
+            caption=_saved_reply_media_caption(original, archive.kind),
+        )
+        if not delivered:
+            await self._send_notification(
+                connection.owner_chat_id,
+                "⚠️ Медиа скачано, но Telegram не позволил отправить сохранённую копию. "
+                "Архив останется до следующей попытки или автоматической очистки.",
+            )
+            return
+
+        await self._remove_archived_media(archive)
+        await self.storage.mark_business_message_deleted(
+            connection_id=original.connection_id,
+            chat_id=original.chat_id,
+            message_id=original.message_id,
+        )
+        logger.info(
+            "Delivered media saved through owner reply chat_id=%s message_id=%s kind=%s",
+            original.chat_id,
+            original.message_id,
+            archive.kind,
+        )
+
     async def _send_deleted_media(
         self,
         *,
@@ -368,11 +450,25 @@ class BusinessMonitor:
         record: BusinessMessageRecord,
         archive: BusinessMediaArchiveRecord,
     ) -> bool:
+        return await self._send_archived_media(
+            chat_id=chat_id,
+            record=record,
+            archive=archive,
+            caption=_deleted_media_caption(record, archive.kind),
+        )
+
+    async def _send_archived_media(
+        self,
+        *,
+        chat_id: int,
+        record: BusinessMessageRecord,
+        archive: BusinessMediaArchiveRecord,
+        caption: str,
+    ) -> bool:
         try:
             archive_path = self._resolve_archive_path(archive.file_path)
             data = await asyncio.to_thread(archive_path.read_bytes)
             upload = BufferedInputFile(data, filename=archive.file_name)
-            caption = _deleted_media_caption(record, archive.kind)
             if archive.kind == "photo":
                 await self.bot.send_photo(chat_id=chat_id, photo=upload, caption=caption)
             elif archive.kind == "video":
@@ -546,6 +642,15 @@ def _deleted_media_caption(record: BusinessMessageRecord, kind: str) -> str:
         f"🗑 {record.sender_name} удалил(а) {_kind_label(kind)}.\n"
         f"Чат: {record.chat_id}\n\n"
         f"Удалённое содержимое:\n{record.content}",
+        1024,
+    )
+
+
+def _saved_reply_media_caption(record: BusinessMessageRecord, kind: str) -> str:
+    return _truncate(
+        f"⏳ {_kind_label(kind).capitalize()} сохранено по вашему ответу до открытия.\n"
+        f"Отправитель: {record.sender_name}\n"
+        f"Чат: {record.chat_id}",
         1024,
     )
 
