@@ -369,9 +369,11 @@ class BusinessMonitor:
     ) -> None:
         """Save media explicitly requested by the owner through a reply.
 
-        Bot API doesn't expose the self-destruct timer. Replying before opening a
-        view-once item makes the original message available as ``reply_to_message``;
-        an owner reply is therefore treated as an explicit save request.
+        Bot API doesn't expose the self-destruct timer itself. It does expose
+        ``has_protected_content`` for messages Telegram doesn't allow to be saved,
+        which is the only reliable Bot API signal available for view-once media.
+        Fail closed when the flag is absent so an ordinary photo, video or video
+        note never creates a duplicate just because the owner replied to it.
         """
         if message.sender_business_bot is not None:
             return
@@ -382,6 +384,16 @@ class BusinessMonitor:
             return
         attachment = archive_attachment_from_message(replied)
         if attachment is None:
+            return
+        if not _is_explicitly_protected_media(replied):
+            logger.info(
+                "Ignoring owner reply to ordinary Business media chat_id=%s "
+                "message_id=%s kind=%s media_spoiler=%s",
+                replied.chat.id,
+                replied.message_id,
+                attachment.kind,
+                bool(replied.has_media_spoiler),
+            )
             return
 
         original = _record_from_message(replied, connection)
@@ -594,6 +606,15 @@ def archive_attachment_from_message(message: Message) -> ArchiveAttachment | Non
             file_name=item.file_name or "document",
         )
     return None
+
+
+def _is_explicitly_protected_media(message: Message) -> bool:
+    """Return true only for media Telegram explicitly marks as non-saveable.
+
+    ``has_media_spoiler`` is intentionally not considered: a spoiler is ordinary
+    media hidden behind a visual cover, not a self-destruct/view-once attachment.
+    """
+    return message.has_protected_content is True
 
 
 def _record_from_message(

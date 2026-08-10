@@ -13,6 +13,7 @@ from aiogram.types import (
     Message,
     PhotoSize,
     User,
+    Video,
     VideoNote,
 )
 
@@ -26,6 +27,7 @@ class FakeBot:
     def __init__(self) -> None:
         self.sent_messages: list[dict[str, Any]] = []
         self.sent_photos: list[dict[str, Any]] = []
+        self.sent_videos: list[dict[str, Any]] = []
         self.sent_video_notes: list[dict[str, Any]] = []
         self.downloaded_file_id: str | None = None
 
@@ -38,6 +40,9 @@ class FakeBot:
 
     async def send_photo(self, **kwargs: Any) -> None:
         self.sent_photos.append(kwargs)
+
+    async def send_video(self, **kwargs: Any) -> None:
+        self.sent_videos.append(kwargs)
 
     async def send_video_note(self, **kwargs: Any) -> None:
         self.sent_video_notes.append(kwargs)
@@ -62,9 +67,12 @@ def make_message(
     text: str | None = None,
     photo: list[PhotoSize] | None = None,
     video_note: VideoNote | None = None,
+    video: Video | None = None,
     sender_id: int = 200,
     reply_to_message: Message | None = None,
     sender_business_bot: User | None = None,
+    has_protected_content: bool | None = None,
+    has_media_spoiler: bool | None = None,
 ) -> Message:
     return Message(
         message_id=message_id,
@@ -79,9 +87,12 @@ def make_message(
         business_connection_id="connection-1",
         text=text,
         photo=photo,
+        video=video,
         video_note=video_note,
         reply_to_message=reply_to_message,
         sender_business_bot=sender_business_bot,
+        has_protected_content=has_protected_content,
+        has_media_spoiler=has_media_spoiler,
     )
 
 
@@ -396,6 +407,7 @@ class BusinessMonitorTests(unittest.IsolatedAsyncioTestCase):
     async def test_owner_reply_saves_hidden_photo_once(self) -> None:
         hidden = make_message(
             message_id=9,
+            has_protected_content=True,
             photo=[
                 PhotoSize(
                     file_id="hidden-photo-id",
@@ -431,9 +443,112 @@ class BusinessMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(stored), 1)
         self.assertIsNotNone(stored[0].deleted_at)
 
+    async def test_owner_reply_ignores_ordinary_photo(self) -> None:
+        ordinary = make_message(
+            message_id=9,
+            photo=[
+                PhotoSize(
+                    file_id="ordinary-photo-id",
+                    file_unique_id="ordinary-photo-unique",
+                    width=100,
+                    height=100,
+                    file_size=100,
+                )
+            ],
+        )
+
+        await self.monitor.capture_message(
+            make_message(
+                message_id=11,
+                text="обычный ответ",
+                sender_id=100,
+                reply_to_message=ordinary,
+            )
+        )
+
+        self.assertIsNone(self.bot.downloaded_file_id)
+        self.assertEqual(self.bot.sent_photos, [])
+
+    async def test_owner_reply_ignores_ordinary_video(self) -> None:
+        ordinary = make_message(
+            message_id=9,
+            video=Video(
+                file_id="ordinary-video-id",
+                file_unique_id="ordinary-video-unique",
+                width=640,
+                height=360,
+                duration=5,
+                file_size=100,
+            ),
+        )
+
+        await self.monitor.capture_message(
+            make_message(
+                message_id=11,
+                text="обычный ответ",
+                sender_id=100,
+                reply_to_message=ordinary,
+            )
+        )
+
+        self.assertIsNone(self.bot.downloaded_file_id)
+        self.assertEqual(self.bot.sent_videos, [])
+
+    async def test_owner_reply_ignores_ordinary_video_note(self) -> None:
+        ordinary = make_message(
+            message_id=9,
+            video_note=VideoNote(
+                file_id="ordinary-video-note-id",
+                file_unique_id="ordinary-video-note-unique",
+                length=240,
+                duration=5,
+                file_size=100,
+            ),
+        )
+
+        await self.monitor.capture_message(
+            make_message(
+                message_id=11,
+                text="обычный ответ",
+                sender_id=100,
+                reply_to_message=ordinary,
+            )
+        )
+
+        self.assertIsNone(self.bot.downloaded_file_id)
+        self.assertEqual(self.bot.sent_video_notes, [])
+
+    async def test_media_spoiler_alone_is_not_treated_as_view_once(self) -> None:
+        spoiler = make_message(
+            message_id=9,
+            has_media_spoiler=True,
+            photo=[
+                PhotoSize(
+                    file_id="spoiler-photo-id",
+                    file_unique_id="spoiler-photo-unique",
+                    width=100,
+                    height=100,
+                    file_size=100,
+                )
+            ],
+        )
+
+        await self.monitor.capture_message(
+            make_message(
+                message_id=11,
+                text="ответ на спойлер",
+                sender_id=100,
+                reply_to_message=spoiler,
+            )
+        )
+
+        self.assertIsNone(self.bot.downloaded_file_id)
+        self.assertEqual(self.bot.sent_photos, [])
+
     async def test_business_bot_reply_does_not_trigger_hidden_media_save(self) -> None:
         hidden = make_message(
             message_id=9,
+            has_protected_content=True,
             photo=[
                 PhotoSize(
                     file_id="hidden-photo-id",
