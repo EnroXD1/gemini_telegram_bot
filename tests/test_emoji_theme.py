@@ -14,6 +14,7 @@ from bot.emoji_theme import (
     extract_custom_emojis,
     extract_emoji_pack_names,
     extract_sticker_set_emojis,
+    merge_service_custom_emojis,
 )
 from bot.storage import Storage
 
@@ -113,6 +114,28 @@ async def test_service_emoji_override_is_persisted_and_reset(tmp_path: Path) -> 
         await storage.close()
 
 
+@pytest.mark.asyncio
+async def test_any_emoji_mapping_can_be_persisted_removed_and_cleared(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    await storage.open()
+    try:
+        theme = EmojiTheme(storage)
+        await theme.set_service_emoji("✅", "5000000000000000100")
+
+        restored = EmojiTheme(storage)
+        assert (await restored.service_ids())["✅"] == "5000000000000000100"
+
+        await restored.remove_service_emoji("✅")
+        assert "✅" not in await restored.service_ids()
+
+        await restored.clear_service_emojis()
+        assert await EmojiTheme(storage).service_ids() == {}
+    finally:
+        await storage.close()
+
+
 def test_extract_emoji_pack_names_deduplicates_links() -> None:
     assert extract_emoji_pack_names(
         "https://t.me/addemoji/FirstPack и t.me/addemoji/Second_pack "
@@ -166,3 +189,38 @@ def test_service_custom_emoji_mapping_uses_configured_ids() -> None:
         SERVICE_CUSTOM_EMOJI_IDS["✍️"],
         SERVICE_CUSTOM_EMOJI_IDS["🔄"],
     ]
+
+
+def test_longest_custom_emoji_mapping_wins_without_overlapping_entities() -> None:
+    text = "❤️ и ❤"
+    themed = apply_service_custom_emojis(
+        text,
+        {"❤": "5000000000000000200", "❤️": "5000000000000000201"},
+    )
+
+    assert themed.entities is not None
+    assert [entity.extract_from(text) for entity in themed.entities] == ["❤️", "❤"]
+    assert [entity.custom_emoji_id for entity in themed.entities] == [
+        "5000000000000000201",
+        "5000000000000000200",
+    ]
+
+
+def test_custom_emoji_entities_merge_with_formatting_but_skip_code() -> None:
+    text = "✅ ✅"
+    existing = [
+        MessageEntity(type=MessageEntityType.BOLD, offset=0, length=1),
+        MessageEntity(type=MessageEntityType.CODE, offset=2, length=1),
+    ]
+    themed = merge_service_custom_emojis(
+        text, existing, {"✅": "5000000000000000300"}
+    )
+
+    assert themed.entities is not None
+    custom = [
+        entity
+        for entity in themed.entities
+        if entity.type == MessageEntityType.CUSTOM_EMOJI
+    ]
+    assert len(custom) == 1
+    assert custom[0].offset == 0

@@ -34,14 +34,50 @@ from .usage import BotUsageMiddleware, UsageTracker
 logger = logging.getLogger(__name__)
 
 SERVICE_EMOJI_GUIDE = (
+    "Можно настроить любой эмодзи, который встречается в сообщениях или кнопках бота.\n\n"
     "Как изменить оформление:\n"
     "1. Отправьте нужный кастомный эмодзи отдельным сообщением — бот покажет его ID.\n"
     "2. Скопируйте числовой ID.\n"
-    "3. Отправьте: /emoji set 🔄 123456789\n\n"
-    "Доступные служебные символы: 🔄 ⏳ 🔎 ✍️\n"
-    "/emoji reset 🔄 — вернуть стандартный ID одного символа\n"
-    "/emoji defaults — сбросить все четыре значения"
+    "3. Отправьте, например: /emoji set ✅ 123456789\n\n"
+    "/emoji list — показать все соответствия\n"
+    "/emoji remove ✅ — оставить для символа обычный эмодзи\n"
+    "/emoji reset 🔄 — вернуть встроенный вариант; добавленный символ удалить\n"
+    "/emoji defaults — восстановить четыре встроенных соответствия\n"
+    "/emoji clear — отключить все кастомные замены"
 )
+
+
+def _emoji_settings_pages(
+    response: str,
+    service_ids: dict[str, str],
+    *,
+    limit: int = 3800,
+) -> tuple[str, ...]:
+    lines = [response, ""]
+    if service_ids:
+        lines.extend(
+            f"{alternative} — {custom_emoji_id}"
+            for alternative, custom_emoji_id in service_ids.items()
+        )
+    else:
+        lines.append("Список пуст: бот использует обычные эмодзи.")
+    lines.extend(["", SERVICE_EMOJI_GUIDE])
+
+    pages: list[str] = []
+    current: list[str] = []
+    current_length = 0
+    for line in lines:
+        added_length = len(line) + (1 if current else 0)
+        if current and current_length + added_length > limit:
+            pages.append("\n".join(current))
+            current = ["Текущие соответствия (продолжение):", "", line]
+            current_length = sum(len(item) for item in current) + len(current) - 1
+        else:
+            current.append(line)
+            current_length += added_length
+    if current:
+        pages.append("\n".join(current))
+    return tuple(pages)
 
 
 def create_router(
@@ -147,11 +183,17 @@ def create_router(
             elif len(parts) == 2 and parts[0].lower() == "reset":
                 await emoji_theme.reset_service_emoji(parts[1])
                 response = f"Сброшено значение для {parts[1]}."
+            elif len(parts) == 2 and parts[0].lower() in {"remove", "delete"}:
+                await emoji_theme.remove_service_emoji(parts[1])
+                response = f"Удалено соответствие для {parts[1]}."
             elif len(parts) == 1 and parts[0].lower() in {"defaults", "reset-all"}:
                 await emoji_theme.reset_service_emoji()
-                response = "Восстановлены стандартные служебные эмодзи."
+                response = "Восстановлены четыре встроенных соответствия."
+            elif len(parts) == 1 and parts[0].lower() == "clear":
+                await emoji_theme.clear_service_emojis()
+                response = "Все кастомные замены отключены."
             elif not parts or parts == ["list"]:
-                response = "Текущие служебные эмодзи:"
+                response = "Текущие соответствия эмодзи:"
             else:
                 await message.reply(SERVICE_EMOJI_GUIDE)
                 return
@@ -160,17 +202,12 @@ def create_router(
             return
 
         service_ids = await emoji_theme.service_ids()
-        lines = [response, ""]
-        lines.extend(
-            f"{alternative} — {custom_emoji_id}"
-            for alternative, custom_emoji_id in service_ids.items()
-        )
-        lines.extend(["", SERVICE_EMOJI_GUIDE])
-        themed = await emoji_theme.service_text("\n".join(lines))
-        try:
-            await message.reply(themed.text, entities=themed.entities)
-        except TelegramBadRequest:
-            await message.reply(themed.text)
+        for page in _emoji_settings_pages(response, service_ids):
+            themed = await emoji_theme.service_text(page)
+            try:
+                await message.reply(themed.text, entities=themed.entities)
+            except TelegramBadRequest:
+                await message.reply(themed.text)
 
     @router.message(Command("start"))
     @router.business_message(Command("start"))
@@ -188,12 +225,11 @@ def create_router(
             "Команда /help покажет режимы работы."
         )
         themed = await emoji_theme.decorate(text, fallback="👋")
-        icon_id = await emoji_theme.first_id()
         try:
             await message.reply(
                 themed.text,
                 entities=themed.entities,
-                reply_markup=guide_keyboard(icon_id),
+                reply_markup=guide_keyboard(),
             )
         except TelegramBadRequest:
             await message.reply(text, reply_markup=guide_keyboard())
@@ -229,6 +265,7 @@ def create_router(
             "/users — последние пользователи самого бота (только владелец)\n"
             "/stats — статистика использования (только владелец)\n\n"
             "/model — выбрать провайдера и модель (только владелец)\n\n"
+            "/emoji — настроить любые эмодзи бота (только владелец)\n\n"
             "Секретные чаты обычным ботам недоступны.\n\n"
             "Ответы оформляются с помощью Markdown: поддерживаются заголовки, "
             "списки, выделение, цитаты, ссылки и блоки кода. Пока модель думает, "

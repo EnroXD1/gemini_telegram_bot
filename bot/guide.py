@@ -22,18 +22,13 @@ GUIDE_CAPTION = (
 )
 
 
-def guide_keyboard(icon_custom_emoji_id: str | None = None) -> InlineKeyboardMarkup:
+def guide_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=(
-                        "Гайд по скрытым медиа"
-                        if icon_custom_emoji_id
-                        else "🎬 Гайд по скрытым медиа"
-                    ),
+                    text="🎬 Гайд по скрытым медиа",
                     callback_data=GUIDE_CALLBACK_DATA,
-                    icon_custom_emoji_id=icon_custom_emoji_id,
                 )
             ]
         ]

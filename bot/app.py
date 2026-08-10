@@ -18,6 +18,7 @@ from .emoji_theme import EmojiTheme
 from .gemini import GeminiService, ModelSelectionError
 from .handlers import create_router
 from .media import MediaExtractor
+from .outgoing_emoji import OutgoingEmojiMiddleware
 from .processor import MessageProcessor
 from .storage import Storage
 from .usage import UsageTracker
@@ -43,9 +44,10 @@ async def run_bot(settings: Settings) -> None:
         owners_removed = await storage.delete_bot_users(settings.owner_ids)
         if owners_removed:
             logger.info("Removed %s configured owners from usage audit", owners_removed)
+        emoji_theme = EmojiTheme(storage)
+        bot.session.middleware(OutgoingEmojiMiddleware(emoji_theme))
         bot_user = await bot.get_me()
         usage = UsageTracker(bot=bot, settings=settings, storage=storage)
-        emoji_theme = EmojiTheme(storage)
         processor = MessageProcessor(
             bot=bot,
             bot_user=bot_user,
@@ -111,6 +113,7 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="start", description="Запустить бота"),
         BotCommand(command="help", description="Справка и возможности"),
         BotCommand(command="guide", description="Видеоинструкция"),
+        BotCommand(command="emoji", description="Настроить эмодзи (владелец)"),
         BotCommand(command="ask", description="Задать вопрос Gemini"),
         BotCommand(command="reset", description="Сбросить контекст"),
         BotCommand(command="cancel", description="Остановить запрос"),

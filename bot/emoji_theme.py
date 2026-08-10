@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -15,14 +16,14 @@ from .storage import Storage
 _SETTING_KEY = "custom_emoji_theme"
 _SERVICE_SETTING_KEY = "service_custom_emoji_ids"
 _MAX_THEME_ITEMS = 128
+_MAX_SERVICE_ITEMS = 128
 _PACK_LINK_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?t\.me/addemoji/([A-Za-z0-9_]+)",
     re.IGNORECASE,
 )
 
-# Edit this table to change custom emoji used in service messages.
-# The dictionary key stays as a readable fallback when Telegram cannot render
-# the custom emoji entity.
+# Defaults used until the owner saves a custom mapping. Any other emoji can be
+# added at runtime with /emoji set.
 SERVICE_CUSTOM_EMOJI_IDS: dict[str, str] = {
     "🔄": "5345778951031658558",
     "⏳": "5345988476716226868",
@@ -66,12 +67,18 @@ class EmojiTheme:
     async def set_service_emoji(
         self, alternative: str, custom_emoji_id: str
     ) -> None:
-        if alternative not in SERVICE_CUSTOM_EMOJI_IDS:
-            raise ValueError("Этот служебный символ не поддерживается")
+        _validate_service_alternative(alternative)
         if not custom_emoji_id.isdigit():
             raise ValueError("custom_emoji_id должен состоять только из цифр")
         async with self._lock:
             service_ids = dict(await self._load_service_ids_locked())
+            if (
+                alternative not in service_ids
+                and len(service_ids) >= _MAX_SERVICE_ITEMS
+            ):
+                raise ValueError(
+                    f"Можно сохранить не более {_MAX_SERVICE_ITEMS} соответствий"
+                )
             service_ids[alternative] = custom_emoji_id
             await self._save_service_ids_locked(service_ids)
 
@@ -83,8 +90,22 @@ class EmojiTheme:
             elif alternative in SERVICE_CUSTOM_EMOJI_IDS:
                 service_ids[alternative] = SERVICE_CUSTOM_EMOJI_IDS[alternative]
             else:
-                raise ValueError("Этот служебный символ не поддерживается")
+                _validate_service_alternative(alternative)
+                service_ids.pop(alternative, None)
             await self._save_service_ids_locked(service_ids)
+
+    async def remove_service_emoji(self, alternative: str) -> None:
+        _validate_service_alternative(alternative)
+        async with self._lock:
+            service_ids = dict(await self._load_service_ids_locked())
+            if alternative not in service_ids:
+                raise ValueError(f"Для {alternative} соответствие не настроено")
+            service_ids.pop(alternative)
+            await self._save_service_ids_locked(service_ids)
+
+    async def clear_service_emojis(self) -> None:
+        async with self._lock:
+            await self._save_service_ids_locked({})
 
     async def service_text(self, text: str) -> ThemedText:
         async with self._lock:
@@ -178,21 +199,25 @@ class EmojiTheme:
     async def _load_service_ids_locked(self) -> dict[str, str]:
         if self._service_ids is not None:
             return self._service_ids
-        service_ids = dict(SERVICE_CUSTOM_EMOJI_IDS)
         raw = await self._storage.get_runtime_setting(_SERVICE_SETTING_KEY)
-        if raw:
+        if raw is None:
+            service_ids = dict(SERVICE_CUSTOM_EMOJI_IDS)
+        else:
+            service_ids = {}
             try:
                 payload = json.loads(raw)
                 if isinstance(payload, dict):
-                    for alternative in SERVICE_CUSTOM_EMOJI_IDS:
-                        custom_emoji_id = payload.get(alternative)
+                    for alternative, custom_emoji_id in payload.items():
                         if (
-                            isinstance(custom_emoji_id, str)
+                            len(service_ids) < _MAX_SERVICE_ITEMS
+                            and isinstance(alternative, str)
+                            and isinstance(custom_emoji_id, str)
                             and custom_emoji_id.isdigit()
+                            and _is_service_alternative(alternative)
                         ):
                             service_ids[alternative] = custom_emoji_id
             except (TypeError, ValueError):
-                pass
+                service_ids = dict(SERVICE_CUSTOM_EMOJI_IDS)
         self._service_ids = service_ids
         return self._service_ids
 
@@ -230,23 +255,68 @@ def apply_service_custom_emojis(
     text: str,
     service_ids: Mapping[str, str] = SERVICE_CUSTOM_EMOJI_IDS,
 ) -> ThemedText:
-    entities: list[MessageEntity] = []
-    for alternative, custom_emoji_id in service_ids.items():
+    return merge_service_custom_emojis(text, None, service_ids)
+
+
+def merge_service_custom_emojis(
+    text: str,
+    existing_entities: list[MessageEntity] | None,
+    service_ids: Mapping[str, str] = SERVICE_CUSTOM_EMOJI_IDS,
+) -> ThemedText:
+    entities = list(existing_entities or [])
+    occupied: list[tuple[int, int]] = [
+        (entity.offset, entity.offset + entity.length)
+        for entity in entities
+        if entity.type == MessageEntityType.CUSTOM_EMOJI
+    ]
+    blocked = [
+        (entity.offset, entity.offset + entity.length)
+        for entity in entities
+        if entity.type
+        not in {
+            MessageEntityType.BOLD,
+            MessageEntityType.ITALIC,
+            MessageEntityType.UNDERLINE,
+            MessageEntityType.STRIKETHROUGH,
+            MessageEntityType.SPOILER,
+            MessageEntityType.BLOCKQUOTE,
+            MessageEntityType.EXPANDABLE_BLOCKQUOTE,
+            MessageEntityType.CUSTOM_EMOJI,
+        }
+    ]
+    mappings = sorted(
+        service_ids.items(),
+        key=lambda item: (_utf16_length(item[0]), len(item[0])),
+        reverse=True,
+    )
+    for alternative, custom_emoji_id in mappings:
+        if not alternative or not custom_emoji_id.isdigit():
+            continue
         start = 0
         while True:
             index = text.find(alternative, start)
             if index < 0:
                 break
+            offset = _utf16_length(text[:index])
+            end = offset + _utf16_length(alternative)
+            overlaps = any(
+                offset < existing_end and end > existing_start
+                for existing_start, existing_end in (*occupied, *blocked)
+            )
+            if overlaps:
+                start = index + len(alternative)
+                continue
             entities.append(
                 MessageEntity(
                     type=MessageEntityType.CUSTOM_EMOJI,
-                    offset=_utf16_length(text[:index]),
-                    length=_utf16_length(alternative),
+                    offset=offset,
+                    length=end - offset,
                     custom_emoji_id=custom_emoji_id,
                 )
             )
+            occupied.append((offset, end))
             start = index + len(alternative)
-    entities.sort(key=lambda entity: entity.offset)
+    entities.sort(key=lambda entity: (entity.offset, -entity.length))
     return ThemedText(text=text, entities=entities or None)
 
 
@@ -330,6 +400,28 @@ def _validated_custom_emoji(
     if _utf16_length(alternative) > 32:
         return None
     return CustomEmoji(custom_emoji_id=custom_emoji_id, alternative=alternative)
+
+
+def _validate_service_alternative(alternative: str) -> None:
+    if not _is_service_alternative(alternative):
+        raise ValueError(
+            "Укажите один эмодзи без пробелов (составные эмодзи тоже поддерживаются)"
+        )
+
+
+def _is_service_alternative(alternative: str) -> bool:
+    if (
+        not alternative
+        or alternative != alternative.strip()
+        or any(character.isspace() for character in alternative)
+        or _utf16_length(alternative) > 32
+    ):
+        return False
+    return any(
+        unicodedata.category(character).startswith("S")
+        or character == "\N{COMBINING ENCLOSING KEYCAP}"
+        for character in alternative
+    )
 
 
 def _utf16_length(value: str) -> int:
