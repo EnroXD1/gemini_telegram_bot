@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gemini-telegram-assistant"
-version = "1.8.2"
+version = "1.8.3"
 description = "Telegram Business AI assistant with Google, OpenRouter, Groq and chat monitoring"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,6 +29,9 @@ gemini-telegram-bot = "bot.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["bot*"]
+
+[tool.setuptools.package-data]
+bot = ["assets/*.mp4"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

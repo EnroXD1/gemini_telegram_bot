@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 from aiogram import F, Router
@@ -18,9 +19,12 @@ from . import __version__
 from .album import AlbumBuffer
 from .business import BusinessMessageCaptureMiddleware, BusinessMonitor
 from .gemini import ModelSelectionError
+from .guide import GUIDE_CALLBACK_DATA, GuideVideoSender, guide_keyboard
 from .processor import MessageProcessor
 from .storage import BotUserRecord
 from .usage import BotUsageMiddleware, UsageTracker
+
+logger = logging.getLogger(__name__)
 
 
 def create_router(
@@ -34,6 +38,14 @@ def create_router(
     router.business_message.outer_middleware(
         BusinessMessageCaptureMiddleware(monitor)
     )
+    guide = GuideVideoSender()
+
+    async def send_guide(message: Message) -> None:
+        try:
+            await guide.send(message)
+        except Exception:
+            logger.exception("Could not send bundled hidden-media guide")
+            await message.reply("Гайд временно недоступен. Попробуйте немного позже.")
 
     @router.business_connection()
     async def business_connection_handler(connection: BusinessConnection) -> None:
@@ -62,8 +74,22 @@ def create_router(
             "Мне можно отправлять текст, фото, PDF, текстовые документы, аудио, "
             "голосовые, видео, стикеры, геолокацию, контакты и опросы. Я также "
             "понимаю подписи, альбомы и сообщения, на которые вы отвечаете.\n\n"
-            "Команда /help покажет режимы работы."
+            "Команда /help покажет режимы работы.",
+            reply_markup=guide_keyboard(),
         )
+
+    @router.message(Command("guide"))
+    @router.business_message(Command("guide"))
+    async def guide_handler(message: Message) -> None:
+        await send_guide(message)
+
+    @router.callback_query(F.data == GUIDE_CALLBACK_DATA)
+    async def guide_callback_handler(callback: CallbackQuery) -> None:
+        if not isinstance(callback.message, Message):
+            await callback.answer("Сообщение с кнопкой больше недоступно.", show_alert=True)
+            return
+        await callback.answer()
+        await send_guide(callback.message)
 
     @router.message(Command("help"))
     @router.business_message(Command("help"))

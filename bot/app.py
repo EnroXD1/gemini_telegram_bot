@@ -105,6 +105,7 @@ async def _set_commands(bot: Bot) -> None:
     private_commands = [
         BotCommand(command="start", description="Запустить бота"),
         BotCommand(command="help", description="Справка и возможности"),
+        BotCommand(command="guide", description="Видеоинструкция"),
         BotCommand(command="ask", description="Задать вопрос Gemini"),
         BotCommand(command="reset", description="Сбросить контекст"),
         BotCommand(command="cancel", description="Остановить запрос"),
