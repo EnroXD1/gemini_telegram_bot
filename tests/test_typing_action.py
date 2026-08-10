@@ -63,16 +63,13 @@ class FakeSourceMessage:
 
 class FakeEmojiTheme:
     async def service_text(self, text: str) -> ThemedText:
-        return ThemedText(text=text, entities=None)
-
-    async def decorate(self, text: str, *, fallback: str) -> ThemedText:
         return ThemedText(
-            text=f"😀 {text}",
+            text=text,
             entities=[
                 MessageEntity(
                     type=MessageEntityType.CUSTOM_EMOJI,
                     offset=0,
-                    length=2,
+                    length=1,
                     custom_emoji_id="5000000000000000001",
                 )
             ],
@@ -134,7 +131,7 @@ async def test_fallback_status_uses_saved_custom_emoji() -> None:
             )
         )
 
-    assert message.status.edits[-1].startswith("😀 ")
+    assert message.status.edits[-1].startswith("⚡ ")
     assert message.status.edit_kwargs[-1]["entities"][0].custom_emoji_id == (
         "5000000000000000001"
     )

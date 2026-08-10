@@ -129,7 +129,7 @@ class ProgressReporter:
                 except TelegramBadRequest:
                     await self._status.edit_text(text)
             else:
-                themed = await self._emoji_theme.decorate(text, fallback="⚡")
+                themed = await self._emoji_theme.service_text(text)
                 try:
                     await self._status.edit_text(
                         themed.text, entities=themed.entities

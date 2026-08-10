@@ -137,26 +137,32 @@ def create_router(
                 continue
             collected.extend(pack_emojis)
 
-        added, total = await emoji_theme.add(tuple(collected))
-        if not total:
+        unique = tuple(
+            {
+                item.custom_emoji_id: item
+                for item in collected
+            }.values()
+        )
+        if not unique:
             await message.reply(
                 "Не удалось получить кастомные эмодзи из сообщения. "
                 "Пришлите эмодзи или ссылку вида t.me/addemoji/название."
             )
             return
-        text = (
-            f"Сохранил новых эмодзи: {added}. В оформлении доступно: {total}."
+        shown = unique[:12]
+        text = f"Распознано кастомных эмодзи: {len(unique)}.\n\nID:\n" + "\n".join(
+            f"{item.alternative} — {item.custom_emoji_id}" for item in shown
         )
-        if custom_emojis:
-            shown = custom_emojis[:8]
-            text += "\n\nID из сообщения:\n" + "\n".join(
-                f"{item.alternative} — {item.custom_emoji_id}" for item in shown
-            )
-            if len(custom_emojis) > len(shown):
-                text += f"\n…и ещё {len(custom_emojis) - len(shown)}."
+        if len(unique) > len(shown):
+            text += f"\n…и ещё {len(unique) - len(shown)}."
+        first = shown[0]
+        text += (
+            "\n\nЧтобы назначить эмодзи, используйте:\n"
+            f"/emoji set {first.alternative} {first.custom_emoji_id}"
+        )
         if unavailable_packs:
-            text += f" Не удалось открыть наборов: {unavailable_packs}."
-        themed = await emoji_theme.decorate(text, fallback="✨")
+            text += f"\nНе удалось открыть наборов: {unavailable_packs}."
+        themed = await emoji_theme.service_text(f"✨ {text}")
         try:
             await message.reply(themed.text, entities=themed.entities)
         except TelegramBadRequest:
@@ -224,7 +230,7 @@ def create_router(
             "понимаю подписи, альбомы и сообщения, на которые вы отвечаете.\n\n"
             "Команда /help покажет режимы работы."
         )
-        themed = await emoji_theme.decorate(text, fallback="👋")
+        themed = await emoji_theme.service_text(f"👋 {text}")
         try:
             await message.reply(
                 themed.text,

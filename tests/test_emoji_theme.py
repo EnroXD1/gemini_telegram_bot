@@ -67,27 +67,19 @@ async def test_only_owner_emoji_palette_messages_are_captured() -> None:
 
 
 @pytest.mark.asyncio
-async def test_emoji_theme_is_persisted_and_decorates_service_text(
+async def test_emoji_theme_uses_stable_service_emoji_instead_of_random_palette(
     tmp_path: Path,
 ) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     await storage.open()
     try:
         theme = EmojiTheme(storage)
-        added, total = await theme.add(extract_custom_emojis(make_message()))
+        themed = await theme.service_text("⏳ Готовлю ответ")
 
-        assert (added, total) == (2, 2)
-        themed = await theme.decorate("Готовлю ответ", fallback="⏳")
-        assert themed.text == "😀 Готовлю ответ"
+        assert themed.text == "⏳ Готовлю ответ"
         assert themed.entities is not None
-        assert themed.entities[0].custom_emoji_id == "5000000000000000001"
-        assert themed.entities[0].length == 2
-
-        restored = EmojiTheme(storage)
-        assert await restored.items() == (
-            CustomEmoji("5000000000000000001", "😀"),
-            CustomEmoji("5000000000000000002", "😎"),
-        )
+        assert themed.entities[0].custom_emoji_id == SERVICE_CUSTOM_EMOJI_IDS["⏳"]
+        assert themed.entities[0].length == 1
     finally:
         await storage.close()
 

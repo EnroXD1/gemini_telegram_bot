@@ -13,9 +13,7 @@ from aiogram.types import Message, MessageEntity, StickerSet
 
 from .storage import Storage
 
-_SETTING_KEY = "custom_emoji_theme"
 _SERVICE_SETTING_KEY = "service_custom_emoji_ids"
-_MAX_THEME_ITEMS = 128
 _MAX_SERVICE_ITEMS = 128
 _PACK_LINK_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?t\.me/addemoji/([A-Za-z0-9_]+)",
@@ -47,18 +45,8 @@ class ThemedText:
 class EmojiTheme:
     def __init__(self, storage: Storage) -> None:
         self._storage = storage
-        self._items: tuple[CustomEmoji, ...] | None = None
         self._service_ids: dict[str, str] | None = None
-        self._cursor = 0
         self._lock = asyncio.Lock()
-
-    async def items(self) -> tuple[CustomEmoji, ...]:
-        async with self._lock:
-            return await self._load_locked()
-
-    async def first_id(self) -> str | None:
-        items = await self.items()
-        return items[0].custom_emoji_id if items else None
 
     async def service_ids(self) -> dict[str, str]:
         async with self._lock:
@@ -111,90 +99,6 @@ class EmojiTheme:
         async with self._lock:
             service_ids = await self._load_service_ids_locked()
             return apply_service_custom_emojis(text, service_ids)
-
-    async def add(
-        self, incoming: tuple[CustomEmoji, ...]
-    ) -> tuple[int, int]:
-        async with self._lock:
-            current = list(await self._load_locked())
-            known_ids = {item.custom_emoji_id for item in current}
-            added = 0
-            for item in incoming:
-                if item.custom_emoji_id in known_ids:
-                    continue
-                current.append(item)
-                known_ids.add(item.custom_emoji_id)
-                added += 1
-            current = current[-_MAX_THEME_ITEMS:]
-            self._items = tuple(current)
-            await self._storage.set_runtime_setting(
-                _SETTING_KEY,
-                json.dumps(
-                    [
-                        {
-                            "id": item.custom_emoji_id,
-                            "alternative": item.alternative,
-                        }
-                        for item in current
-                    ],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
-            )
-            return added, len(current)
-
-    async def decorate(self, text: str, *, fallback: str) -> ThemedText:
-        async with self._lock:
-            items = await self._load_locked()
-            service_ids = await self._load_service_ids_locked()
-            if not items:
-                return apply_service_custom_emojis(
-                    f"{fallback} {text}", service_ids
-                )
-            item = items[self._cursor % len(items)]
-            self._cursor += 1
-        decorated = f"{item.alternative} {text}"
-        themed = apply_service_custom_emojis(text, service_ids)
-        prefix_length = _utf16_length(f"{item.alternative} ")
-        entities = [
-            entity.model_copy(update={"offset": entity.offset + prefix_length})
-            for entity in themed.entities or []
-        ]
-        entities.append(
-            MessageEntity(
-                type=MessageEntityType.CUSTOM_EMOJI,
-                offset=0,
-                length=_utf16_length(item.alternative),
-                custom_emoji_id=item.custom_emoji_id,
-            )
-        )
-        entities.sort(key=lambda entity: entity.offset)
-        return ThemedText(
-            text=decorated,
-            entities=entities,
-        )
-
-    async def _load_locked(self) -> tuple[CustomEmoji, ...]:
-        if self._items is not None:
-            return self._items
-        raw = await self._storage.get_runtime_setting(_SETTING_KEY)
-        parsed: list[CustomEmoji] = []
-        if raw:
-            try:
-                payload = json.loads(raw)
-                if isinstance(payload, list):
-                    for value in payload:
-                        if not isinstance(value, dict):
-                            continue
-                        item = _validated_custom_emoji(
-                            value.get("id"), value.get("alternative")
-                        )
-                        if item is not None:
-                            parsed.append(item)
-            except (TypeError, ValueError):
-                parsed = []
-        self._items = tuple(parsed[-_MAX_THEME_ITEMS:])
-        return self._items
 
     async def _load_service_ids_locked(self) -> dict[str, str]:
         if self._service_ids is not None:

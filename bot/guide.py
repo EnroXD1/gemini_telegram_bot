@@ -59,8 +59,8 @@ class GuideVideoSender:
                 video = FSInputFile(self.path, filename="Guide.mp4")
             themed = None
             if self.emoji_theme is not None:
-                themed = await self.emoji_theme.decorate(
-                    GUIDE_CAPTION, fallback="🎬"
+                themed = await self.emoji_theme.service_text(
+                    f"🎬 {GUIDE_CAPTION}"
                 )
             try:
                 sent = await message.answer_video(
