@@ -581,9 +581,9 @@ def create_router(
         )
         context = "есть" if has_context else "пуст"
         await message.reply(
-            f"Версия: {__version__}\n"
-            f"Провайдер: {processor.gemini.current_provider}\n"
-            f"Модель: {processor.gemini.current_model}\n"
+            f"⬆️Версия: {__version__}\n"
+            f"🌐Провайдер: {processor.gemini.current_provider}\n"
+            f"🤖Модель: {processor.gemini.current_model}\n"
             f"Резерв: {fallback}\n"
             f"Режим чата: {mode}\n"
             f"Контекст: {context}\n"
