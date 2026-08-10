@@ -33,6 +33,16 @@ from .usage import BotUsageMiddleware, UsageTracker
 
 logger = logging.getLogger(__name__)
 
+SERVICE_EMOJI_GUIDE = (
+    "Как изменить оформление:\n"
+    "1. Отправьте нужный кастомный эмодзи отдельным сообщением — бот покажет его ID.\n"
+    "2. Скопируйте числовой ID.\n"
+    "3. Отправьте: /emoji set 🔄 123456789\n\n"
+    "Доступные служебные символы: 🔄 ⏳ 🔎 ✍️\n"
+    "/emoji reset 🔄 — вернуть стандартный ID одного символа\n"
+    "/emoji defaults — сбросить все четыре значения"
+)
+
 
 def create_router(
     processor: MessageProcessor,
@@ -101,6 +111,13 @@ def create_router(
         text = (
             f"Сохранил новых эмодзи: {added}. В оформлении доступно: {total}."
         )
+        if custom_emojis:
+            shown = custom_emojis[:8]
+            text += "\n\nID из сообщения:\n" + "\n".join(
+                f"{item.alternative} — {item.custom_emoji_id}" for item in shown
+            )
+            if len(custom_emojis) > len(shown):
+                text += f"\n…и ещё {len(custom_emojis) - len(shown)}."
         if unavailable_packs:
             text += f" Не удалось открыть наборов: {unavailable_packs}."
         themed = await emoji_theme.decorate(text, fallback="✨")
@@ -136,13 +153,7 @@ def create_router(
             elif not parts or parts == ["list"]:
                 response = "Текущие служебные эмодзи:"
             else:
-                await message.reply(
-                    "Формат:\n"
-                    "/emoji — показать значения\n"
-                    "/emoji set 🔄 123456789 — заменить ID\n"
-                    "/emoji reset 🔄 — вернуть стандартный ID\n"
-                    "/emoji defaults — сбросить все четыре значения"
-                )
+                await message.reply(SERVICE_EMOJI_GUIDE)
                 return
         except ValueError as exc:
             await message.reply(str(exc))
@@ -154,6 +165,7 @@ def create_router(
             f"{alternative} — {custom_emoji_id}"
             for alternative, custom_emoji_id in service_ids.items()
         )
+        lines.extend(["", SERVICE_EMOJI_GUIDE])
         themed = await emoji_theme.service_text("\n".join(lines))
         try:
             await message.reply(themed.text, entities=themed.entities)
