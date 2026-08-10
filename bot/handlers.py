@@ -109,6 +109,57 @@ def create_router(
         except TelegramBadRequest:
             await message.reply(f"✨ {text}")
 
+    @router.message(Command("emoji"))
+    async def service_emoji_handler(
+        message: Message, command: CommandObject
+    ) -> None:
+        user = message.from_user
+        if message.chat.type != "private" or user is None:
+            await message.reply("Настройка эмодзи доступна в личном чате с ботом.")
+            return
+        if not _is_bot_owner(processor, user.id):
+            await message.reply("Менять служебные эмодзи может только владелец бота.")
+            return
+
+        argument = (command.args or "").strip()
+        parts = argument.split()
+        try:
+            if len(parts) == 3 and parts[0].lower() == "set":
+                await emoji_theme.set_service_emoji(parts[1], parts[2])
+                response = f"Сохранено: {parts[1]} → {parts[2]}"
+            elif len(parts) == 2 and parts[0].lower() == "reset":
+                await emoji_theme.reset_service_emoji(parts[1])
+                response = f"Сброшено значение для {parts[1]}."
+            elif len(parts) == 1 and parts[0].lower() in {"defaults", "reset-all"}:
+                await emoji_theme.reset_service_emoji()
+                response = "Восстановлены стандартные служебные эмодзи."
+            elif not parts or parts == ["list"]:
+                response = "Текущие служебные эмодзи:"
+            else:
+                await message.reply(
+                    "Формат:\n"
+                    "/emoji — показать значения\n"
+                    "/emoji set 🔄 123456789 — заменить ID\n"
+                    "/emoji reset 🔄 — вернуть стандартный ID\n"
+                    "/emoji defaults — сбросить все четыре значения"
+                )
+                return
+        except ValueError as exc:
+            await message.reply(str(exc))
+            return
+
+        service_ids = await emoji_theme.service_ids()
+        lines = [response, ""]
+        lines.extend(
+            f"{alternative} — {custom_emoji_id}"
+            for alternative, custom_emoji_id in service_ids.items()
+        )
+        themed = await emoji_theme.service_text("\n".join(lines))
+        try:
+            await message.reply(themed.text, entities=themed.entities)
+        except TelegramBadRequest:
+            await message.reply(themed.text)
+
     @router.message(Command("start"))
     @router.business_message(Command("start"))
     async def start_handler(message: Message) -> None:

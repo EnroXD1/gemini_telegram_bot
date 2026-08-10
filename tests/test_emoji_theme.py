@@ -6,9 +6,11 @@ from aiogram.enums import ChatType, MessageEntityType, StickerType
 from aiogram.types import Chat, Message, MessageEntity, Sticker, StickerSet, User
 
 from bot.emoji_theme import (
+    SERVICE_CUSTOM_EMOJI_IDS,
     CustomEmoji,
     EmojiTheme,
     OwnerEmojiPaletteFilter,
+    apply_service_custom_emojis,
     extract_custom_emojis,
     extract_emoji_pack_names,
     extract_sticker_set_emojis,
@@ -89,6 +91,28 @@ async def test_emoji_theme_is_persisted_and_decorates_service_text(
         await storage.close()
 
 
+@pytest.mark.asyncio
+async def test_service_emoji_override_is_persisted_and_reset(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    await storage.open()
+    try:
+        theme = EmojiTheme(storage)
+        await theme.set_service_emoji("🔄", "5000000000000000099")
+
+        themed = await EmojiTheme(storage).service_text("🔄 Переключаюсь")
+        assert themed.entities is not None
+        assert themed.entities[0].custom_emoji_id == "5000000000000000099"
+
+        await theme.reset_service_emoji("🔄")
+        reset = await theme.service_text("🔄 Переключаюсь")
+        assert reset.entities is not None
+        assert reset.entities[0].custom_emoji_id == (
+            SERVICE_CUSTOM_EMOJI_IDS["🔄"]
+        )
+    finally:
+        await storage.close()
+
+
 def test_extract_emoji_pack_names_deduplicates_links() -> None:
     assert extract_emoji_pack_names(
         "https://t.me/addemoji/FirstPack и t.me/addemoji/Second_pack "
@@ -122,3 +146,23 @@ def test_extract_sticker_set_emojis_ignores_regular_sticker_sets() -> None:
         "5368324170671202286"
     )
     assert extract_sticker_set_emojis(regular_set) == ()
+
+
+def test_service_custom_emoji_mapping_uses_configured_ids() -> None:
+    text = "⏳ затем 🔎 затем ✍️ и 🔄"
+    themed = apply_service_custom_emojis(text)
+
+    assert themed.text == text
+    assert themed.entities is not None
+    assert [entity.extract_from(text) for entity in themed.entities] == [
+        "⏳",
+        "🔎",
+        "✍️",
+        "🔄",
+    ]
+    assert [entity.custom_emoji_id for entity in themed.entities] == [
+        SERVICE_CUSTOM_EMOJI_IDS["⏳"],
+        SERVICE_CUSTOM_EMOJI_IDS["🔎"],
+        SERVICE_CUSTOM_EMOJI_IDS["✍️"],
+        SERVICE_CUSTOM_EMOJI_IDS["🔄"],
+    ]

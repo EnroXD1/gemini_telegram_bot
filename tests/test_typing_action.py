@@ -62,6 +62,9 @@ class FakeSourceMessage:
 
 
 class FakeEmojiTheme:
+    async def service_text(self, text: str) -> ThemedText:
+        return ThemedText(text=text, entities=None)
+
     async def decorate(self, text: str, *, fallback: str) -> ThemedText:
         return ThemedText(
             text=f"😀 {text}",
@@ -83,7 +86,13 @@ async def test_show_progress_animates_and_cleans_up() -> None:
         await asyncio.sleep(0.025)
 
     assert message.replies[0][0] == PROGRESS_FRAMES[0]
+    assert message.replies[0][1]["entities"][0].custom_emoji_id == (
+        "5345988476716226868"
+    )
     assert message.status.edits
+    assert message.status.edit_kwargs[0]["entities"][0].custom_emoji_id == (
+        "5231012545799666522"
+    )
     assert message.status.deleted is True
     assert message.bot.actions
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from aiogram.enums import MessageEntityType, StickerType
@@ -12,11 +13,22 @@ from aiogram.types import Message, MessageEntity, StickerSet
 from .storage import Storage
 
 _SETTING_KEY = "custom_emoji_theme"
+_SERVICE_SETTING_KEY = "service_custom_emoji_ids"
 _MAX_THEME_ITEMS = 128
 _PACK_LINK_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?t\.me/addemoji/([A-Za-z0-9_]+)",
     re.IGNORECASE,
 )
+
+# Edit this table to change custom emoji used in service messages.
+# The dictionary key stays as a readable fallback when Telegram cannot render
+# the custom emoji entity.
+SERVICE_CUSTOM_EMOJI_IDS: dict[str, str] = {
+    "🔄": "5345778951031658558",
+    "⏳": "5345988476716226868",
+    "🔎": "5231012545799666522",
+    "✍️": "5213277341639254218",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +47,7 @@ class EmojiTheme:
     def __init__(self, storage: Storage) -> None:
         self._storage = storage
         self._items: tuple[CustomEmoji, ...] | None = None
+        self._service_ids: dict[str, str] | None = None
         self._cursor = 0
         self._lock = asyncio.Lock()
 
@@ -45,6 +58,38 @@ class EmojiTheme:
     async def first_id(self) -> str | None:
         items = await self.items()
         return items[0].custom_emoji_id if items else None
+
+    async def service_ids(self) -> dict[str, str]:
+        async with self._lock:
+            return dict(await self._load_service_ids_locked())
+
+    async def set_service_emoji(
+        self, alternative: str, custom_emoji_id: str
+    ) -> None:
+        if alternative not in SERVICE_CUSTOM_EMOJI_IDS:
+            raise ValueError("Этот служебный символ не поддерживается")
+        if not custom_emoji_id.isdigit():
+            raise ValueError("custom_emoji_id должен состоять только из цифр")
+        async with self._lock:
+            service_ids = dict(await self._load_service_ids_locked())
+            service_ids[alternative] = custom_emoji_id
+            await self._save_service_ids_locked(service_ids)
+
+    async def reset_service_emoji(self, alternative: str | None = None) -> None:
+        async with self._lock:
+            service_ids = dict(await self._load_service_ids_locked())
+            if alternative is None:
+                service_ids = dict(SERVICE_CUSTOM_EMOJI_IDS)
+            elif alternative in SERVICE_CUSTOM_EMOJI_IDS:
+                service_ids[alternative] = SERVICE_CUSTOM_EMOJI_IDS[alternative]
+            else:
+                raise ValueError("Этот служебный символ не поддерживается")
+            await self._save_service_ids_locked(service_ids)
+
+    async def service_text(self, text: str) -> ThemedText:
+        async with self._lock:
+            service_ids = await self._load_service_ids_locked()
+            return apply_service_custom_emojis(text, service_ids)
 
     async def add(
         self, incoming: tuple[CustomEmoji, ...]
@@ -80,21 +125,32 @@ class EmojiTheme:
     async def decorate(self, text: str, *, fallback: str) -> ThemedText:
         async with self._lock:
             items = await self._load_locked()
+            service_ids = await self._load_service_ids_locked()
             if not items:
-                return ThemedText(text=f"{fallback} {text}", entities=None)
+                return apply_service_custom_emojis(
+                    f"{fallback} {text}", service_ids
+                )
             item = items[self._cursor % len(items)]
             self._cursor += 1
         decorated = f"{item.alternative} {text}"
+        themed = apply_service_custom_emojis(text, service_ids)
+        prefix_length = _utf16_length(f"{item.alternative} ")
+        entities = [
+            entity.model_copy(update={"offset": entity.offset + prefix_length})
+            for entity in themed.entities or []
+        ]
+        entities.append(
+            MessageEntity(
+                type=MessageEntityType.CUSTOM_EMOJI,
+                offset=0,
+                length=_utf16_length(item.alternative),
+                custom_emoji_id=item.custom_emoji_id,
+            )
+        )
+        entities.sort(key=lambda entity: entity.offset)
         return ThemedText(
             text=decorated,
-            entities=[
-                MessageEntity(
-                    type=MessageEntityType.CUSTOM_EMOJI,
-                    offset=0,
-                    length=_utf16_length(item.alternative),
-                    custom_emoji_id=item.custom_emoji_id,
-                )
-            ],
+            entities=entities,
         )
 
     async def _load_locked(self) -> tuple[CustomEmoji, ...]:
@@ -119,6 +175,34 @@ class EmojiTheme:
         self._items = tuple(parsed[-_MAX_THEME_ITEMS:])
         return self._items
 
+    async def _load_service_ids_locked(self) -> dict[str, str]:
+        if self._service_ids is not None:
+            return self._service_ids
+        service_ids = dict(SERVICE_CUSTOM_EMOJI_IDS)
+        raw = await self._storage.get_runtime_setting(_SERVICE_SETTING_KEY)
+        if raw:
+            try:
+                payload = json.loads(raw)
+                if isinstance(payload, dict):
+                    for alternative in SERVICE_CUSTOM_EMOJI_IDS:
+                        custom_emoji_id = payload.get(alternative)
+                        if (
+                            isinstance(custom_emoji_id, str)
+                            and custom_emoji_id.isdigit()
+                        ):
+                            service_ids[alternative] = custom_emoji_id
+            except (TypeError, ValueError):
+                pass
+        self._service_ids = service_ids
+        return self._service_ids
+
+    async def _save_service_ids_locked(self, service_ids: dict[str, str]) -> None:
+        self._service_ids = service_ids
+        await self._storage.set_runtime_setting(
+            _SERVICE_SETTING_KEY,
+            json.dumps(service_ids, ensure_ascii=False, separators=(",", ":")),
+        )
+
 
 class OwnerEmojiPaletteFilter(BaseFilter):
     def __init__(self, owner_ids: frozenset[int]) -> None:
@@ -140,6 +224,30 @@ class OwnerEmojiPaletteFilter(BaseFilter):
 
 def extract_emoji_pack_names(text: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(_PACK_LINK_PATTERN.findall(text)))
+
+
+def apply_service_custom_emojis(
+    text: str,
+    service_ids: Mapping[str, str] = SERVICE_CUSTOM_EMOJI_IDS,
+) -> ThemedText:
+    entities: list[MessageEntity] = []
+    for alternative, custom_emoji_id in service_ids.items():
+        start = 0
+        while True:
+            index = text.find(alternative, start)
+            if index < 0:
+                break
+            entities.append(
+                MessageEntity(
+                    type=MessageEntityType.CUSTOM_EMOJI,
+                    offset=_utf16_length(text[:index]),
+                    length=_utf16_length(alternative),
+                    custom_emoji_id=custom_emoji_id,
+                )
+            )
+            start = index + len(alternative)
+    entities.sort(key=lambda entity: entity.offset)
+    return ThemedText(text=text, entities=entities or None)
 
 
 def extract_sticker_set_emojis(sticker_set: StickerSet) -> tuple[CustomEmoji, ...]:

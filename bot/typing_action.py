@@ -9,7 +9,7 @@ from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
 
-from .emoji_theme import EmojiTheme
+from .emoji_theme import EmojiTheme, apply_service_custom_emojis
 from .gemini import ModelSwitchNotice
 
 logger = logging.getLogger(__name__)
@@ -50,12 +50,30 @@ async def keep_typing(message: Message, interval: float = 4.5) -> AsyncIterator[
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def _progress_loop(status: Message, interval: float) -> None:
+async def _progress_loop(
+    status: Message,
+    interval: float,
+    emoji_theme: EmojiTheme | None = None,
+) -> None:
     frame_index = 1
+    custom_emoji_allowed = True
     while True:
         await asyncio.sleep(interval)
         try:
-            await status.edit_text(PROGRESS_FRAMES[frame_index])
+            frame = PROGRESS_FRAMES[frame_index]
+            themed = (
+                await emoji_theme.service_text(frame)
+                if emoji_theme is not None
+                else apply_service_custom_emojis(frame)
+            )
+            if custom_emoji_allowed:
+                try:
+                    await status.edit_text(frame, entities=themed.entities)
+                except TelegramBadRequest:
+                    custom_emoji_allowed = False
+                    await status.edit_text(frame)
+            else:
+                await status.edit_text(frame)
             frame_index = (frame_index + 1) % len(PROGRESS_FRAMES)
         except asyncio.CancelledError:
             raise
@@ -105,7 +123,11 @@ class ProgressReporter:
                 )
             text = f"{headline}\n🔄 Переключаюсь на {target} ({notice.target_model})…"
             if self._emoji_theme is None:
-                await self._status.edit_text(text)
+                themed = apply_service_custom_emojis(text)
+                try:
+                    await self._status.edit_text(text, entities=themed.entities)
+                except TelegramBadRequest:
+                    await self._status.edit_text(text)
             else:
                 themed = await self._emoji_theme.decorate(text, fallback="⚡")
                 try:
@@ -210,11 +232,25 @@ async def show_progress(
 
     async with keep_typing(message):
         try:
-            status = await message.reply(
-                PROGRESS_FRAMES[0], allow_sending_without_reply=True
+            first_frame = PROGRESS_FRAMES[0]
+            themed = (
+                await emoji_theme.service_text(first_frame)
+                if emoji_theme is not None
+                else apply_service_custom_emojis(first_frame)
             )
+            try:
+                status = await message.reply(
+                    first_frame,
+                    entities=themed.entities,
+                    allow_sending_without_reply=True,
+                )
+            except TelegramBadRequest:
+                status = await message.reply(
+                    first_frame, allow_sending_without_reply=True
+                )
             progress_task = asyncio.create_task(
-                _progress_loop(status, interval), name="telegram-progress"
+                _progress_loop(status, interval, emoji_theme),
+                name="telegram-progress",
             )
             reporter.bind(status, progress_task)
         except Exception as exc:
