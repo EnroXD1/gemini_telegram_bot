@@ -10,6 +10,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import Message, User
 
 from .config import Settings
+from .emoji_theme import EmojiTheme
 from .gemini import GeminiRequestError, GeminiService
 from .markdown import FormattedChunk, render_markdown_chunks
 from .media import MediaExtractor
@@ -35,6 +36,7 @@ class MessageProcessor:
         gemini: GeminiService,
         media: MediaExtractor,
         usage: UsageTracker,
+        emoji_theme: EmojiTheme | None = None,
     ) -> None:
         self.bot = bot
         self.bot_user = bot_user
@@ -43,6 +45,7 @@ class MessageProcessor:
         self.gemini = gemini
         self.media = media
         self.usage = usage
+        self.emoji_theme = emoji_theme
         self._rate_limiter = SlidingWindowRateLimiter(
             settings.rate_limit_requests,
             settings.rate_limit_window_seconds,
@@ -146,7 +149,9 @@ class MessageProcessor:
                         "Could not load local conversation history scope=%s",
                         scope_key,
                     )
-                async with show_progress(lead) as progress:
+                async with show_progress(
+                    lead, emoji_theme=self.emoji_theme
+                ) as progress:
                     bundle = await self.media.prepare(
                         bot=self.bot, messages=ordered, user_text=clean_text
                     )

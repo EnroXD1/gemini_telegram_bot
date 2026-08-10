@@ -209,6 +209,7 @@ class GeminiService:
         )
         last_error: GeminiRequestError | None = None
         failed_route: _ModelRoute | None = None
+        notify_switch = False
         attempted = 0
 
         for route in routes:
@@ -223,14 +224,26 @@ class GeminiService:
                     )
                 continue
             if failed_route is not None and last_error is not None:
-                await self._notify_model_switch(
-                    on_fallback,
-                    failed_route,
-                    route,
-                    reason=(
-                        "limit" if last_error.quota_exhausted else "unavailable"
-                    ),
-                )
+                if notify_switch:
+                    await self._notify_model_switch(
+                        on_fallback,
+                        failed_route,
+                        route,
+                        reason=(
+                            "limit"
+                            if last_error.quota_exhausted
+                            else "unavailable"
+                        ),
+                    )
+                else:
+                    logger.info(
+                        "Using AI fallback silently while route cools down "
+                        "%s/%s -> %s/%s",
+                        failed_route.provider,
+                        failed_route.model,
+                        route.provider,
+                        route.model,
+                    )
             try:
                 attempted += 1
                 return await self._generate_route(
@@ -243,6 +256,7 @@ class GeminiService:
             except GeminiRequestError as exc:
                 last_error = exc
                 failed_route = route
+                notify_switch = True
                 if not automatic_fallback or not exc.fallback_allowed:
                     raise
                 self._start_route_cooldown(route, exc)

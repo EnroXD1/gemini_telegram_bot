@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+from aiogram.enums import MessageEntityType
+from aiogram.types import MessageEntity
+
+from bot.emoji_theme import ThemedText
 from bot.gemini import ModelSwitchNotice
 from bot.typing_action import PROGRESS_FRAMES, show_progress
 
@@ -28,11 +32,13 @@ class FakeStatusMessage:
         self.message_id = 456
         self.business_connection_id: str | None = None
         self.edits: list[str] = []
+        self.edit_kwargs: list[dict[str, object]] = []
         self.deleted = False
         self.delete_failures = 0
 
-    async def edit_text(self, text: str) -> None:
+    async def edit_text(self, text: str, **kwargs: object) -> None:
         self.edits.append(text)
+        self.edit_kwargs.append(kwargs)
 
     async def delete(self) -> None:
         if self.delete_failures > 0:
@@ -53,6 +59,21 @@ class FakeSourceMessage:
     async def reply(self, text: str, **kwargs: object) -> FakeStatusMessage:
         self.replies.append((text, kwargs))
         return self.status
+
+
+class FakeEmojiTheme:
+    async def decorate(self, text: str, *, fallback: str) -> ThemedText:
+        return ThemedText(
+            text=f"😀 {text}",
+            entities=[
+                MessageEntity(
+                    type=MessageEntityType.CUSTOM_EMOJI,
+                    offset=0,
+                    length=2,
+                    custom_emoji_id="5000000000000000001",
+                )
+            ],
+        )
 
 
 async def test_show_progress_animates_and_cleans_up() -> None:
@@ -84,6 +105,30 @@ async def test_show_progress_displays_fallback_and_then_deletes_it() -> None:
     assert "Лимит модели OpenRouter" in message.status.edits[-1]
     assert "Переключаюсь на Groq" in message.status.edits[-1]
     assert message.status.deleted is True
+
+
+async def test_fallback_status_uses_saved_custom_emoji() -> None:
+    message = FakeSourceMessage()
+
+    async with show_progress(
+        message,
+        interval=10.0,
+        emoji_theme=FakeEmojiTheme(),  # type: ignore[arg-type]
+    ) as progress:
+        await progress.show_fallback(
+            ModelSwitchNotice(
+                source_provider="google",
+                source_model="gemini-test",
+                target_provider="openrouter",
+                target_model="openrouter/free",
+                reason="limit",
+            )
+        )
+
+    assert message.status.edits[-1].startswith("😀 ")
+    assert message.status.edit_kwargs[-1]["entities"][0].custom_emoji_id == (
+        "5000000000000000001"
+    )
 
 
 async def test_show_progress_uses_business_delete_method() -> None:

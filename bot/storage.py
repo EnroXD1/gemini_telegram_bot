@@ -230,6 +230,33 @@ class Storage:
             await self._db.close()
             self._db = None
 
+    async def get_runtime_setting(self, key: str) -> str | None:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                "SELECT setting_value FROM runtime_settings WHERE setting_key = ?",
+                (key,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return None if row is None else str(row["setting_value"])
+
+    async def set_runtime_setting(self, key: str, value: str) -> None:
+        db = self._connection()
+        now = int(time.time())
+        async with self._lock:
+            await db.execute(
+                """
+                INSERT INTO runtime_settings(setting_key, setting_value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, now),
+            )
+            await db.commit()
+
     async def get_ai_selection(self) -> tuple[str, str] | None:
         db = self._connection()
         async with self._lock:

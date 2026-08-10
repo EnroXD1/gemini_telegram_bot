@@ -6,8 +6,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 
 from aiogram.enums import ChatAction
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
 
+from .emoji_theme import EmojiTheme
 from .gemini import ModelSwitchNotice
 
 logger = logging.getLogger(__name__)
@@ -67,12 +69,14 @@ class ProgressReporter:
         *,
         business_connection_id: str | None = None,
         completed_status_ttl: float = COMPLETED_STATUS_TTL_SECONDS,
+        emoji_theme: EmojiTheme | None = None,
     ) -> None:
         self._status: Message | None = None
         self._animation: asyncio.Task[None] | None = None
         self._business_connection_id = business_connection_id
         self._completed_status_ttl = max(0.0, completed_status_ttl)
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._emoji_theme = emoji_theme
 
     def bind(
         self, status: Message, animation: asyncio.Task[None]
@@ -99,10 +103,17 @@ class ProgressReporter:
                 headline = (
                     f"⚠️ Модель {source} ({notice.source_model}) временно недоступна."
                 )
-            await self._status.edit_text(
-                f"{headline}\n"
-                f"🔄 Переключаюсь на {target} ({notice.target_model})…"
-            )
+            text = f"{headline}\n🔄 Переключаюсь на {target} ({notice.target_model})…"
+            if self._emoji_theme is None:
+                await self._status.edit_text(text)
+            else:
+                themed = await self._emoji_theme.decorate(text, fallback="⚡")
+                try:
+                    await self._status.edit_text(
+                        themed.text, entities=themed.entities
+                    )
+                except TelegramBadRequest:
+                    await self._status.edit_text(text)
         except Exception as exc:
             logger.debug("Could not show fallback status: %s", type(exc).__name__)
 
@@ -188,11 +199,13 @@ async def show_progress(
     message: Message,
     interval: float = 3.0,
     completed_status_ttl: float = COMPLETED_STATUS_TTL_SECONDS,
+    emoji_theme: EmojiTheme | None = None,
 ) -> AsyncIterator[ProgressReporter]:
     """Show Telegram typing and a temporary, animated progress message."""
     reporter = ProgressReporter(
         business_connection_id=message.business_connection_id,
         completed_status_ttl=completed_status_ttl,
+        emoji_theme=emoji_theme,
     )
 
     async with keep_typing(message):

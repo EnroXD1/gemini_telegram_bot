@@ -14,6 +14,7 @@ from . import __version__
 from .album import AlbumBuffer
 from .business import BusinessMonitor
 from .config import Settings
+from .emoji_theme import EmojiTheme
 from .gemini import GeminiService, ModelSelectionError
 from .handlers import create_router
 from .media import MediaExtractor
@@ -44,6 +45,7 @@ async def run_bot(settings: Settings) -> None:
             logger.info("Removed %s configured owners from usage audit", owners_removed)
         bot_user = await bot.get_me()
         usage = UsageTracker(bot=bot, settings=settings, storage=storage)
+        emoji_theme = EmojiTheme(storage)
         processor = MessageProcessor(
             bot=bot,
             bot_user=bot_user,
@@ -52,9 +54,12 @@ async def run_bot(settings: Settings) -> None:
             gemini=gemini,
             media=MediaExtractor(settings),
             usage=usage,
+            emoji_theme=emoji_theme,
         )
         monitor = BusinessMonitor(bot=bot, settings=settings, storage=storage)
-        dispatcher.include_router(create_router(processor, albums, monitor, usage))
+        dispatcher.include_router(
+            create_router(processor, albums, monitor, usage, emoji_theme)
+        )
         media_removed = await monitor.prune_archived_media(
             settings.business_message_retention_days
         )

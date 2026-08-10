@@ -408,7 +408,7 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.provider, "openrouter")
         self.assertEqual(len(service._client.aio.interactions.calls), 1)
         self.assertEqual(len(service._openrouter_client.calls), 2)
-        self.assertEqual(len(switches), 2)
+        self.assertEqual(len(switches), 1)
         self.assertTrue(all(item.reason == "limit" for item in switches))
         self.assertTrue(
             all(item.target_provider == "openrouter" for item in switches)

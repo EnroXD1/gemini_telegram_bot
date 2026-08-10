@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.filters.command import CommandObject
 from aiogram.types import (
@@ -18,6 +19,12 @@ from aiogram.types import (
 from . import __version__
 from .album import AlbumBuffer
 from .business import BusinessMessageCaptureMiddleware, BusinessMonitor
+from .emoji_theme import (
+    CustomEmoji,
+    EmojiTheme,
+    OwnerEmojiPaletteFilter,
+    extract_sticker_set_emojis,
+)
 from .gemini import ModelSelectionError
 from .guide import GUIDE_CALLBACK_DATA, GuideVideoSender, guide_keyboard
 from .processor import MessageProcessor
@@ -32,13 +39,15 @@ def create_router(
     albums: AlbumBuffer,
     monitor: BusinessMonitor,
     usage: UsageTracker,
+    emoji_theme: EmojiTheme | None = None,
 ) -> Router:
     router = Router(name="gemini-assistant")
     router.message.outer_middleware(BotUsageMiddleware(usage))
     router.business_message.outer_middleware(
         BusinessMessageCaptureMiddleware(monitor)
     )
-    guide = GuideVideoSender()
+    emoji_theme = emoji_theme or EmojiTheme(processor.storage)
+    guide = GuideVideoSender(emoji_theme=emoji_theme)
 
     async def send_guide(message: Message) -> None:
         try:
@@ -61,12 +70,51 @@ def create_router(
     ) -> None:
         await monitor.handle_deleted_messages(event)
 
+    @router.message(OwnerEmojiPaletteFilter(processor.settings.owner_ids))
+    async def custom_emoji_palette_handler(
+        message: Message,
+        custom_emojis: tuple[CustomEmoji, ...],
+        emoji_pack_names: tuple[str, ...],
+    ) -> None:
+        collected = list(custom_emojis)
+        unavailable_packs = 0
+        for pack_name in emoji_pack_names:
+            try:
+                sticker_set = await message.bot.get_sticker_set(pack_name)
+            except TelegramBadRequest:
+                unavailable_packs += 1
+                logger.warning("Could not load custom emoji pack %s", pack_name)
+                continue
+            pack_emojis = extract_sticker_set_emojis(sticker_set)
+            if not pack_emojis:
+                unavailable_packs += 1
+                continue
+            collected.extend(pack_emojis)
+
+        added, total = await emoji_theme.add(tuple(collected))
+        if not total:
+            await message.reply(
+                "Не удалось получить кастомные эмодзи из сообщения. "
+                "Пришлите эмодзи или ссылку вида t.me/addemoji/название."
+            )
+            return
+        text = (
+            f"Сохранил новых эмодзи: {added}. В оформлении доступно: {total}."
+        )
+        if unavailable_packs:
+            text += f" Не удалось открыть наборов: {unavailable_packs}."
+        themed = await emoji_theme.decorate(text, fallback="✨")
+        try:
+            await message.reply(themed.text, entities=themed.entities)
+        except TelegramBadRequest:
+            await message.reply(f"✨ {text}")
+
     @router.message(Command("start"))
     @router.business_message(Command("start"))
     async def start_handler(message: Message) -> None:
         if not await processor.can_respond(message):
             return
-        await message.reply(
+        text = (
             "Привет! Я передаю сообщения Gemini и отвечаю с учётом контекста.\n\n"
             "Если подключить меня к Telegram Business с правом чтения сообщений, "
             "я уведомлю вас об изменённых и удалённых сообщениях собеседников, а "
@@ -74,9 +122,18 @@ def create_router(
             "Мне можно отправлять текст, фото, PDF, текстовые документы, аудио, "
             "голосовые, видео, стикеры, геолокацию, контакты и опросы. Я также "
             "понимаю подписи, альбомы и сообщения, на которые вы отвечаете.\n\n"
-            "Команда /help покажет режимы работы.",
-            reply_markup=guide_keyboard(),
+            "Команда /help покажет режимы работы."
         )
+        themed = await emoji_theme.decorate(text, fallback="👋")
+        icon_id = await emoji_theme.first_id()
+        try:
+            await message.reply(
+                themed.text,
+                entities=themed.entities,
+                reply_markup=guide_keyboard(icon_id),
+            )
+        except TelegramBadRequest:
+            await message.reply(text, reply_markup=guide_keyboard())
 
     @router.message(Command("guide"))
     @router.business_message(Command("guide"))
