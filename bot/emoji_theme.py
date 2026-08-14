@@ -7,7 +7,7 @@ import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from aiogram.enums import MessageEntityType, StickerType
+from aiogram.enums import ChatType, MessageEntityType, StickerType
 from aiogram.filters import BaseFilter
 from aiogram.types import Message, MessageEntity, StickerSet
 
@@ -139,7 +139,11 @@ class OwnerEmojiPaletteFilter(BaseFilter):
 
     async def __call__(self, message: Message) -> bool | dict[str, object]:
         user = message.from_user
-        if user is None or user.id not in self._owner_ids:
+        if (
+            message.chat.type != ChatType.PRIVATE
+            or user is None
+            or user.id not in self._owner_ids
+        ):
             return False
         emojis = extract_custom_emojis(message)
         pack_names = extract_emoji_pack_names(message.text or message.caption or "")
@@ -149,6 +153,15 @@ class OwnerEmojiPaletteFilter(BaseFilter):
             "custom_emojis": emojis,
             "emoji_pack_names": pack_names,
         }
+
+
+class GroupCustomEmojiOnlyFilter(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        if message.chat.type == ChatType.PRIVATE:
+            return False
+        return bool(extract_custom_emojis(message)) and _contains_only_custom_emojis(
+            message
+        )
 
 
 def extract_emoji_pack_names(text: str) -> tuple[str, ...]:

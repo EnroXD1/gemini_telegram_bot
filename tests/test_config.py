@@ -87,7 +87,32 @@ def test_groq_fallback_is_enabled_when_key_is_present(monkeypatch, tmp_path) -> 
 
     assert settings.groq_fallback_ready is True
     assert settings.groq_model == "llama-3.1-8b-instant"
+    assert settings.groq_fallback_models == (
+        "openai/gpt-oss-20b",
+        "llama-3.3-70b-versatile",
+    )
     assert settings.groq_max_output_tokens == 1024
+
+
+def test_free_model_pool_defaults_and_can_be_disabled(monkeypatch, tmp_path) -> None:
+    for name in TOKEN_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("AI_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.delenv("OPENROUTER_FALLBACK_MODELS", raising=False)
+
+    settings = Settings.from_env(tmp_path / "missing.env")
+
+    assert settings.openrouter_fallback_models == (
+        "openai/gpt-oss-20b:free",
+        "nvidia/nemotron-3.5-lightning:free",
+        "openrouter/free",
+    )
+
+    monkeypatch.setenv("OPENROUTER_FALLBACK_MODELS", "")
+    disabled = Settings.from_env(tmp_path / "missing.env")
+    assert disabled.openrouter_fallback_models == ()
 
 
 def test_groq_can_be_the_primary_provider(monkeypatch, tmp_path) -> None:

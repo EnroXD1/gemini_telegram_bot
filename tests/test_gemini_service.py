@@ -373,6 +373,70 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["model"], "llama-3.1-8b-instant")
         self.assertEqual(payload["max_completion_tokens"], 256)
 
+    async def test_openrouter_402_can_switch_to_free_model_without_balance(self) -> None:
+        service = make_openrouter_service("unused")
+        service._settings.openrouter_fallback_models = (
+            "openai/gpt-oss-20b:free",
+        )
+        service._openrouter_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse({}, error_code=402),
+                FakeOpenRouterResponse(
+                    {"choices": [{"message": {"content": "бесплатный ответ"}}]}
+                ),
+            ]
+        )
+
+        result = await service.generate(PromptBundle(prompt="вопрос"), None)
+
+        self.assertEqual(result.text, "бесплатный ответ")
+        self.assertEqual(
+            [payload["model"] for _, payload in service._openrouter_client.calls],
+            ["google/gemini-3.5-flash", "openai/gpt-oss-20b:free"],
+        )
+
+    async def test_configured_free_models_are_added_to_fallback_pool(self) -> None:
+        service = make_openrouter_service("unused")
+        service._settings.openrouter_fallback_models = (
+            "openai/gpt-oss-20b:free",
+            "nvidia/nemotron-3.5-lightning:free",
+            "openrouter/free",
+        )
+        service._settings.groq_fallback_models = (
+            "openai/gpt-oss-20b",
+            "llama-3.3-70b-versatile",
+        )
+        service._groq_client = FakeOpenRouterClient([])
+
+        routes = service._candidate_routes(PromptBundle(prompt="вопрос"))
+
+        self.assertEqual(
+            [(route.provider, route.model) for route in routes],
+            [
+                ("openrouter", "google/gemini-3.5-flash"),
+                ("openrouter", "openai/gpt-oss-20b:free"),
+                ("openrouter", "nvidia/nemotron-3.5-lightning:free"),
+                ("openrouter", "openrouter/free"),
+                ("groq", "llama-3.1-8b-instant"),
+                ("groq", "openai/gpt-oss-20b"),
+                ("groq", "llama-3.3-70b-versatile"),
+            ],
+        )
+
+        media_routes = service._candidate_routes(
+            PromptBundle(
+                prompt="опиши",
+                media=(MediaPayload("фото", "image", "image/jpeg", b"image"),),
+            )
+        )
+        self.assertEqual(
+            [(route.provider, route.model) for route in media_routes],
+            [
+                ("openrouter", "google/gemini-3.5-flash"),
+                ("openrouter", "openrouter/free"),
+            ],
+        )
+
     async def test_google_limit_switches_to_openrouter_and_starts_cooldown(self) -> None:
         service = make_service([FakeHttpError(429)])
         service._settings.openrouter_model = "openrouter/fallback-model"

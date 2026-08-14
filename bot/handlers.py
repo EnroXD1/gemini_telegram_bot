@@ -22,6 +22,7 @@ from .business import BusinessMessageCaptureMiddleware, BusinessMonitor
 from .emoji_theme import (
     CustomEmoji,
     EmojiTheme,
+    GroupCustomEmojiOnlyFilter,
     OwnerEmojiPaletteFilter,
     extract_sticker_set_emojis,
 )
@@ -122,6 +123,8 @@ def create_router(
         custom_emojis: tuple[CustomEmoji, ...],
         emoji_pack_names: tuple[str, ...],
     ) -> None:
+        if message.chat.type != "private":
+            return
         collected = list(custom_emojis)
         unavailable_packs = 0
         for pack_name in emoji_pack_names:
@@ -167,6 +170,10 @@ def create_router(
             await message.reply(themed.text, entities=themed.entities)
         except TelegramBadRequest:
             await message.reply(f"✨ {text}")
+
+    @router.message(GroupCustomEmojiOnlyFilter())
+    async def ignore_group_custom_emoji_handler(message: Message) -> None:
+        return
 
     @router.message(Command("emoji"))
     async def service_emoji_handler(
@@ -495,6 +502,7 @@ def create_router(
         available = processor.gemini.configured_providers()
         argument = (command.args or "").strip()
         if not argument:
+            fallback_routes = processor.gemini.fallback_routes()
             lines = [
                 "Текущая AI-конфигурация:",
                 f"{processor.gemini.current_provider} / "
@@ -506,6 +514,12 @@ def create_router(
                 f"• {provider}: {default_model}"
                 for provider, default_model in available.items()
             )
+            if fallback_routes:
+                lines.extend(["", "Автоматический резервный пул:"])
+                lines.extend(
+                    f"• {provider}: {model}"
+                    for provider, model in fallback_routes
+                )
             lines.extend(
                 [
                     "",

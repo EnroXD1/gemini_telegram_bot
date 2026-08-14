@@ -33,6 +33,16 @@ DEFAULT_BUSINESS_WELCOME_TEXT = """👋 Здравствуйте! Вам отв�
 /reset — начать диалог с чистого контекста
 /cancel — остановить текущий запрос"""
 
+DEFAULT_OPENROUTER_FALLBACK_MODELS = (
+    "openai/gpt-oss-20b:free",
+    "nvidia/nemotron-3.5-lightning:free",
+    "openrouter/free",
+)
+DEFAULT_GROQ_FALLBACK_MODELS = (
+    "openai/gpt-oss-20b",
+    "llama-3.3-70b-versatile",
+)
+
 
 def _required(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -109,6 +119,20 @@ def _id_set(name: str) -> frozenset[int]:
     return frozenset(result)
 
 
+def _model_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    values = default if raw is None else tuple(
+        part.strip() for part in raw.split(",") if part.strip()
+    )
+    values = tuple(dict.fromkeys(values))
+    if len(values) > 10:
+        raise ConfigError(f"{name} должен содержать не более 10 моделей")
+    for value in values:
+        if len(value) > 200 or any(ord(character) < 32 for character in value):
+            raise ConfigError(f"{name} содержит недопустимый ID модели")
+    return values
+
+
 def _choice(name: str, default: str, allowed: set[str]) -> str:
     value = os.getenv(name, default).strip().lower()
     if value not in allowed:
@@ -126,6 +150,7 @@ class Settings:
     gemini_model: str
     openrouter_api_key: str
     openrouter_model: str
+    openrouter_fallback_models: tuple[str, ...]
     openrouter_history_turns: int
     openrouter_history_item_chars: int
     openrouter_history_max_chars: int
@@ -133,6 +158,7 @@ class Settings:
     groq_api_key: str
     groq_fallback_enabled: bool
     groq_model: str
+    groq_fallback_models: tuple[str, ...]
     groq_max_output_tokens: int
     gemini_system_prompt: str
     gemini_temperature: float
@@ -230,6 +256,10 @@ class Settings:
                 ).strip()
                 or "google/gemini-3.5-flash"
             ),
+            openrouter_fallback_models=_model_list(
+                "OPENROUTER_FALLBACK_MODELS",
+                DEFAULT_OPENROUTER_FALLBACK_MODELS,
+            ),
             openrouter_history_turns=_int(
                 "OPENROUTER_HISTORY_TURNS", 6, minimum=0
             ),
@@ -249,6 +279,9 @@ class Settings:
             groq_model=(
                 os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
                 or "llama-3.1-8b-instant"
+            ),
+            groq_fallback_models=_model_list(
+                "GROQ_FALLBACK_MODELS", DEFAULT_GROQ_FALLBACK_MODELS
             ),
             groq_max_output_tokens=_int(
                 "GROQ_MAX_OUTPUT_TOKENS", 1024, minimum=1

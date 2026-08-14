@@ -13,7 +13,10 @@ import httpx
 from google import genai
 from google.genai import types
 
-from .config import Settings
+from .config import (
+    DEFAULT_OPENROUTER_FALLBACK_MODELS,
+    Settings,
+)
 from .gemini_response import (
     extract_interaction_id,
     extract_interaction_status,
@@ -26,6 +29,9 @@ logger = logging.getLogger(__name__)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/"
 OPENROUTER_APP_URL = "https://github.com/EnroXD1/gemini_telegram_bot"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1/"
+_TEXT_ONLY_OPENROUTER_FALLBACK_MODELS = frozenset(
+    DEFAULT_OPENROUTER_FALLBACK_MODELS[:2]
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +301,12 @@ class GeminiService:
             if provider == "groq" and bundle.media:
                 return
             if (
+                provider == "openrouter"
+                and bundle.media
+                and model in _TEXT_ONLY_OPENROUTER_FALLBACK_MODELS
+            ):
+                return
+            if (
                 provider == "groq"
                 and primary.provider != "groq"
                 and not getattr(self._settings, "groq_fallback_enabled", True)
@@ -305,6 +317,8 @@ class GeminiService:
         default_model = available.get(primary.provider)
         if default_model:
             add(primary.provider, default_model)
+        for model in self._fallback_models_for(primary.provider):
+            add(primary.provider, model)
 
         provider_order = {
             "google": ("openrouter", "groq"),
@@ -315,7 +329,18 @@ class GeminiService:
             model = available.get(provider)
             if model:
                 add(provider, model)
+                for fallback_model in self._fallback_models_for(provider):
+                    add(provider, fallback_model)
         return routes
+
+    def _fallback_models_for(self, provider: str) -> tuple[str, ...]:
+        if provider == "openrouter" and self._openrouter_client is not None:
+            return tuple(
+                getattr(self._settings, "openrouter_fallback_models", ())
+            )
+        if provider == "groq" and self._groq_client is not None:
+            return tuple(getattr(self._settings, "groq_fallback_models", ()))
+        return ()
 
     async def _generate_route(
         self,
@@ -375,9 +400,10 @@ class GeminiService:
         seconds = float(
             getattr(self._settings, "ai_fallback_cooldown_seconds", 600.0)
         )
+        provider_wide = error.status_code == 402 and route.provider != "openrouter"
         key = (
             (route.provider, "*")
-            if error.status_code == 402
+            if provider_wide
             else (route.provider, route.model)
         )
         self._route_cooldowns[key] = time.monotonic() + max(1.0, seconds)

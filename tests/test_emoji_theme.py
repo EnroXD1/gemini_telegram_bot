@@ -9,6 +9,7 @@ from bot.emoji_theme import (
     SERVICE_CUSTOM_EMOJI_IDS,
     CustomEmoji,
     EmojiTheme,
+    GroupCustomEmojiOnlyFilter,
     OwnerEmojiPaletteFilter,
     apply_service_custom_emojis,
     extract_custom_emojis,
@@ -19,11 +20,16 @@ from bot.emoji_theme import (
 from bot.storage import Storage
 
 
-def make_message(*, user_id: int = 100, text: str = "😀 😎") -> Message:
+def make_message(
+    *,
+    user_id: int = 100,
+    text: str = "😀 😎",
+    chat_type: ChatType = ChatType.PRIVATE,
+) -> Message:
     return Message(
         message_id=1,
         date=datetime.now(UTC),
-        chat=Chat(id=user_id, type=ChatType.PRIVATE, first_name="Owner"),
+        chat=Chat(id=user_id, type=chat_type, first_name="Owner"),
         from_user=User(id=user_id, is_bot=False, first_name="Owner"),
         text=text,
         entities=[
@@ -59,11 +65,28 @@ async def test_only_owner_emoji_palette_messages_are_captured() -> None:
     owner_result = await palette_filter(make_message())
     other_result = await palette_filter(make_message(user_id=200))
     mixed_result = await palette_filter(make_message(text="😀 подпись 😎"))
+    group_result = await palette_filter(make_message(chat_type=ChatType.GROUP))
 
     assert isinstance(owner_result, dict)
     assert len(owner_result["custom_emojis"]) == 2
     assert other_result is False
     assert mixed_result is False
+    assert group_result is False
+
+
+@pytest.mark.asyncio
+async def test_custom_emoji_only_messages_are_silently_consumed_in_groups() -> None:
+    group_filter = GroupCustomEmojiOnlyFilter()
+
+    assert await group_filter(make_message(chat_type=ChatType.GROUP)) is True
+    assert await group_filter(make_message(chat_type=ChatType.SUPERGROUP)) is True
+    assert await group_filter(make_message()) is False
+    assert (
+        await group_filter(
+            make_message(text="😀 подпись 😎", chat_type=ChatType.GROUP)
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio
