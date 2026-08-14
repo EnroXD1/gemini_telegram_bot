@@ -60,6 +60,36 @@ _INCOMPLETE_FINISH_REASONS = {
     "provider_error",
 }
 _INCOMPLETE_INTERACTION_STATUSES = {"incomplete", "budget_exceeded"}
+_BLOCKED_FINISH_REASONS = {
+    "blocked",
+    "content_filter",
+    "content-filter",
+    "content_filtered",
+    "safety",
+    "safety_blocked",
+}
+_NON_CHAT_MODEL_MARKERS = (
+    "content-safety",
+    "content_safety",
+    "moderation",
+    "guardrail",
+    "guardrails",
+    "classifier",
+)
+_SAFETY_REPORT_MARKERS = (
+    "user safety:",
+    "response safety:",
+    "safety categories:",
+)
+_REQUEST_BLOCK_MARKERS = (
+    "request blocked",
+    "blocked request",
+    "prompt blocked",
+    "content filter",
+    "content_filter",
+    "safety policy",
+    "policy violation",
+)
 _CONTINUATION_PROMPT = (
     "Продолжи предыдущий ответ точно с места остановки. Не повторяй уже "
     "написанное и не начинай решение заново. Верни только продолжение. "
@@ -88,6 +118,7 @@ class GeminiRequestError(RuntimeError):
         status_code: int | None = None,
         fallback_allowed: bool = False,
         quota_exhausted: bool = False,
+        fallback_reason: str | None = None,
     ) -> None:
         super().__init__(user_message)
         self.user_message = user_message
@@ -96,6 +127,7 @@ class GeminiRequestError(RuntimeError):
         self.status_code = status_code
         self.fallback_allowed = fallback_allowed
         self.quota_exhausted = quota_exhausted
+        self.fallback_reason = fallback_reason
 
 
 class ModelSelectionError(ValueError):
@@ -235,11 +267,7 @@ class GeminiService:
                         on_fallback,
                         failed_route,
                         route,
-                        reason=(
-                            "limit"
-                            if last_error.quota_exhausted
-                            else "unavailable"
-                        ),
+                        reason=_fallback_reason(last_error),
                     )
                 else:
                     logger.info(
@@ -269,7 +297,8 @@ class GeminiService:
 
         if last_error is not None and attempted > 1:
             raise GeminiRequestError(
-                "Все доступные модели временно недоступны или исчерпали лимит. "
+                "Все доступные модели временно недоступны, исчерпали лимит или "
+                "не смогли обработать этот запрос. "
                 "Попробуйте немного позже.",
                 delete_after_seconds=20.0,
                 fallback_allowed=False,
@@ -516,9 +545,19 @@ class GeminiService:
                             truncated = _needs_continuation(finish_reason)
 
                     if not text:
+                        if _is_blocked_finish_reason(finish_reason):
+                            raise GeminiRequestError(
+                                "Gemini заблокировал этот запрос правилами безопасности. "
+                                "Пробую другую модель.",
+                                provider="google",
+                                fallback_allowed=True,
+                                fallback_reason="blocked",
+                            )
                         raise GeminiRequestError(
                             "Gemini обработал запрос, но не вернул текстовый ответ. "
-                            "Попробуйте переформулировать сообщение."
+                            "Попробуйте переформулировать сообщение.",
+                            provider="google",
+                            fallback_allowed=True,
                         )
                     combined_text = _merge_continuation(combined_text, text)
                     logger.info(
@@ -651,6 +690,9 @@ class GeminiService:
                         status_code=code,
                         fallback_allowed=_allows_automatic_fallback(exc, code),
                         quota_exhausted=_is_quota_error(exc, code),
+                        fallback_reason=(
+                            "blocked" if _is_safety_block_error(exc) else None
+                        ),
                     ) from exc
 
     async def _generate_openrouter(
@@ -689,10 +731,17 @@ class GeminiService:
                         )
                         response.raise_for_status()
                     completion = _extract_chat_completion(response.json())
+                    _raise_if_unusable_chat_completion(
+                        completion,
+                        provider="openrouter",
+                        requested_model=model,
+                    )
                     if not completion.text:
                         raise GeminiRequestError(
                             "Модель обработала запрос через OpenRouter, но не вернула "
-                            "текстовый ответ. Попробуйте переформулировать сообщение."
+                            "текстовый ответ. Попробуйте переформулировать сообщение.",
+                            provider="openrouter",
+                            fallback_allowed=True,
                         )
                     combined_text = _merge_continuation(
                         combined_text, completion.text
@@ -791,6 +840,9 @@ class GeminiService:
                         status_code=code,
                         fallback_allowed=_allows_automatic_fallback(exc, code),
                         quota_exhausted=_is_quota_error(exc, code),
+                        fallback_reason=(
+                            "blocked" if _is_safety_block_error(exc) else None
+                        ),
                     ) from exc
 
     async def _generate_groq(
@@ -822,11 +874,18 @@ class GeminiService:
                     response = await client.post("chat/completions", json=payload)
                     response.raise_for_status()
                 completion = _extract_chat_completion(response.json())
+                _raise_if_unusable_chat_completion(
+                    completion,
+                    provider="groq",
+                    requested_model=model,
+                )
                 if not completion.text:
                     label = "Резервная модель Groq" if is_fallback else "Модель Groq"
                     raise GeminiRequestError(
                         f"{label} не вернула текстовый ответ. "
-                        "Попробуйте переформулировать сообщение."
+                        "Попробуйте переформулировать сообщение.",
+                        provider="groq",
+                        fallback_allowed=True,
                     )
                 combined_text = _merge_continuation(
                     combined_text, completion.text
@@ -925,6 +984,9 @@ class GeminiService:
                     status_code=code,
                     fallback_allowed=_allows_automatic_fallback(exc, code),
                     quota_exhausted=_is_quota_error(exc, code),
+                    fallback_reason=(
+                        "blocked" if _is_safety_block_error(exc) else None
+                    ),
                 ) from exc
 
     def _build_chat_messages(
@@ -1141,6 +1203,74 @@ def _needs_continuation(finish_reason: str | None) -> bool:
     return normalized in _INCOMPLETE_FINISH_REASONS
 
 
+def _is_blocked_finish_reason(finish_reason: str | None) -> bool:
+    if finish_reason is None:
+        return False
+    normalized = finish_reason.strip().lower().rsplit(".", 1)[-1]
+    return normalized in _BLOCKED_FINISH_REASONS
+
+
+def _fallback_reason(error: GeminiRequestError) -> str:
+    if error.fallback_reason:
+        return error.fallback_reason
+    if error.quota_exhausted:
+        return "limit"
+    return "unavailable"
+
+
+def _raise_if_unusable_chat_completion(
+    completion: _ChatCompletion,
+    *,
+    provider: str,
+    requested_model: str,
+) -> None:
+    actual_model = completion.model or requested_model
+    label = {"openrouter": "OpenRouter", "groq": "Groq"}.get(provider, provider)
+    if provider == "openrouter" and _is_non_chat_model(actual_model):
+        raise GeminiRequestError(
+            f"{label} выбрал служебную safety-модель вместо чат-модели. "
+            "Пробую другой маршрут.",
+            provider=provider,
+            fallback_allowed=True,
+            fallback_reason="blocked",
+        )
+    if _is_blocked_finish_reason(completion.finish_reason):
+        raise GeminiRequestError(
+            f"{label} заблокировал этот запрос правилами безопасности. "
+            "Пробую другую модель.",
+            provider=provider,
+            fallback_allowed=True,
+            fallback_reason="blocked",
+        )
+    if _looks_like_blocked_response(completion.text):
+        raise GeminiRequestError(
+            f"{label} вернул служебное сообщение о блокировке запроса. "
+            "Пробую другую модель.",
+            provider=provider,
+            fallback_allowed=True,
+            fallback_reason="blocked",
+        )
+
+
+def _is_non_chat_model(model: str) -> bool:
+    normalized = model.lower()
+    return any(marker in normalized for marker in _NON_CHAT_MODEL_MARKERS)
+
+
+def _looks_like_blocked_response(text: str) -> bool:
+    normalized = text.strip().lower()
+    if not normalized:
+        return False
+    safety_lines = sum(
+        1 for marker in _SAFETY_REPORT_MARKERS if marker in normalized
+    )
+    if safety_lines >= 2:
+        return True
+    if any(marker in normalized for marker in _REQUEST_BLOCK_MARKERS):
+        return len(normalized) <= 600
+    return False
+
+
 def _max_continuations(settings: object) -> int:
     try:
         value = int(getattr(settings, "ai_max_continuations", 2))
@@ -1255,9 +1385,18 @@ def _is_quota_error(exc: Exception, code: int | None) -> bool:
 
 
 def _allows_automatic_fallback(exc: Exception, code: int | None) -> bool:
-    return code in {402, 408, 429, 500, 502, 503, 504} or _is_retryable(
-        exc, code
+    return (
+        code in {402, 408, 429, 500, 502, 503, 504}
+        or _is_retryable(exc, code)
+        or _is_safety_block_error(exc)
     )
+
+
+def _is_safety_block_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    body = getattr(response, "text", "") if response is not None else ""
+    text = f"{exc} {body}".lower()
+    return any(marker in text for marker in _REQUEST_BLOCK_MARKERS)
 
 
 def _friendly_error(code: int | None) -> str:

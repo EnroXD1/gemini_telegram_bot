@@ -53,14 +53,19 @@ class FakeClient:
 
 class FakeOpenRouterResponse:
     def __init__(
-        self, payload: dict[str, object], *, error_code: int | None = None
+        self,
+        payload: dict[str, object],
+        *,
+        error_code: int | None = None,
+        error_message: str | None = None,
     ) -> None:
         self.payload = payload
         self.error_code = error_code
+        self.error_message = error_message
 
     def raise_for_status(self) -> None:
         if self.error_code is not None:
-            raise FakeHttpError(self.error_code)
+            raise FakeHttpError(self.error_code, self.error_message)
 
     def json(self) -> dict[str, object]:
         return self.payload
@@ -77,8 +82,8 @@ class FakeOpenRouterClient:
 
 
 class FakeHttpError(RuntimeError):
-    def __init__(self, code: int) -> None:
-        super().__init__(f"HTTP {code}")
+    def __init__(self, code: int, message: str | None = None) -> None:
+        super().__init__(message or f"HTTP {code}")
         self.code = code
 
 
@@ -372,6 +377,83 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         _, payload = service._groq_client.calls[0]
         self.assertEqual(payload["model"], "llama-3.1-8b-instant")
         self.assertEqual(payload["max_completion_tokens"], 256)
+
+    async def test_openrouter_safety_router_switches_text_request_to_groq(
+        self,
+    ) -> None:
+        service = make_openrouter_service("unused")
+        service._openrouter_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {
+                        "model": "nvidia/nemotron-3.5-content-safety:free",
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": (
+                                        "User Safety: unsafe\n"
+                                        "Response Safety: safe\n"
+                                        "Safety Categories: Profanity"
+                                    )
+                                }
+                            }
+                        ],
+                    }
+                )
+            ]
+        )
+        service._groq_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {"choices": [{"message": {"content": "нормальный ответ Groq"}}]}
+                )
+            ]
+        )
+        switches: list[ModelSwitchNotice] = []
+
+        async def on_fallback(notice: ModelSwitchNotice) -> None:
+            switches.append(notice)
+
+        result = await service.generate(
+            PromptBundle(prompt="вопрос"), None, on_fallback=on_fallback
+        )
+
+        self.assertEqual(result.text, "нормальный ответ Groq")
+        self.assertEqual(result.provider, "groq")
+        self.assertEqual(len(switches), 1)
+        self.assertEqual(switches[0].reason, "blocked")
+        self.assertEqual(switches[0].target_provider, "groq")
+
+    async def test_openrouter_request_blocked_error_can_switch_to_groq(self) -> None:
+        service = make_openrouter_service("unused")
+        service._openrouter_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {},
+                    error_code=400,
+                    error_message="request blocked by provider safety policy",
+                )
+            ]
+        )
+        service._groq_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {"choices": [{"message": {"content": "ответ после блокировки"}}]}
+                )
+            ]
+        )
+        switches: list[ModelSwitchNotice] = []
+
+        async def on_fallback(notice: ModelSwitchNotice) -> None:
+            switches.append(notice)
+
+        result = await service.generate(
+            PromptBundle(prompt="вопрос"), None, on_fallback=on_fallback
+        )
+
+        self.assertEqual(result.text, "ответ после блокировки")
+        self.assertEqual(result.provider, "groq")
+        self.assertEqual(switches[0].reason, "blocked")
 
     async def test_openrouter_402_can_switch_to_free_model_without_balance(self) -> None:
         service = make_openrouter_service("unused")

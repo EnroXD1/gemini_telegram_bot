@@ -117,6 +117,11 @@ class ProgressReporter:
                 headline = (
                     f"⚡ Лимит модели {source} ({notice.source_model}) исчерпан."
                 )
+            elif notice.reason == "blocked":
+                headline = (
+                    f"⚠️ Модель {source} ({notice.source_model}) не смогла "
+                    "обработать этот запрос."
+                )
             else:
                 headline = (
                     f"⚠️ Модель {source} ({notice.source_model}) временно недоступна."

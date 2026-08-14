@@ -137,6 +137,25 @@ async def test_fallback_status_uses_saved_custom_emoji() -> None:
     )
 
 
+async def test_show_progress_displays_blocked_fallback_reason() -> None:
+    message = FakeSourceMessage()
+
+    async with show_progress(message, interval=10.0) as progress:
+        await progress.show_fallback(
+            ModelSwitchNotice(
+                source_provider="openrouter",
+                source_model="openrouter/free",
+                target_provider="groq",
+                target_model="llama-3.1-8b-instant",
+                reason="blocked",
+            )
+        )
+
+    assert "не смогла обработать этот запрос" in message.status.edits[-1]
+    assert "Переключаюсь на Groq" in message.status.edits[-1]
+    assert message.status.deleted is True
+
+
 async def test_show_progress_uses_business_delete_method() -> None:
     message = FakeSourceMessage()
     message.business_connection_id = "business-123"
