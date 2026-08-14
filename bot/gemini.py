@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import gc
+import json
 import logging
 import random
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -134,6 +135,40 @@ class _ChatCompletion:
     model: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _Base64Data:
+    data: bytes
+
+
+class _OpenRouterMediaBody:
+    """Re-iterable JSON body that encodes raw media in bounded chunks."""
+
+    _RAW_CHUNK_BYTES = 48 * 1024
+
+    def __init__(self, segments: list[bytes | _Base64Data]) -> None:
+        self._segments = tuple(segments)
+        self.content_length = sum(
+            len(segment)
+            if isinstance(segment, bytes)
+            else 4 * ((len(segment.data) + 2) // 3)
+            for segment in self._segments
+        )
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return self._iterate()
+
+    async def _iterate(self) -> AsyncIterator[bytes]:
+        for segment in self._segments:
+            if isinstance(segment, bytes):
+                yield segment
+                continue
+            view = memoryview(segment.data)
+            for offset in range(0, len(view), self._RAW_CHUNK_BYTES):
+                yield base64.b64encode(
+                    view[offset : offset + self._RAW_CHUNK_BYTES]
+                )
+
+
 class GeminiRequestError(RuntimeError):
     def __init__(
         self,
@@ -198,7 +233,13 @@ class GeminiService:
             client_kwargs: dict[str, Any] = {
                 "api_key": settings.gemini_api_key,
                 "http_options": types.HttpOptions(
-                    retry_options=types.HttpRetryOptions(attempts=0)
+                    # The GAOS transport mutates attempts=0 into one retry.
+                    # One attempt plus an unused status code disables both its
+                    # retry layers; explicit bot retries remain in this module.
+                    retry_options=types.HttpRetryOptions(
+                        attempts=1,
+                        http_status_codes=[418],
+                    )
                 ),
             }
             if settings.gemini_vertex_ai:
@@ -789,7 +830,10 @@ class GeminiService:
         if client is None:
             raise RuntimeError("OpenRouter client is not initialized")
 
-        base_messages = self._build_chat_messages(bundle, history)
+        has_media = bool(bundle.media)
+        base_messages = (
+            None if has_media else self._build_chat_messages(bundle, history)
+        )
         request_messages = base_messages
         combined_text = ""
         continuation_count = 0
@@ -798,19 +842,44 @@ class GeminiService:
         async with self._semaphore:
             while True:
                 try:
-                    payload = {
-                        "model": model,
-                        "messages": request_messages,
-                        "temperature": self._settings.gemini_temperature,
-                        "max_tokens": self._settings.gemini_max_output_tokens,
-                        "stream": False,
-                    }
                     async with asyncio.timeout(
                         self._settings.gemini_timeout_seconds
                     ):
-                        response = await client.post(
-                            "chat/completions", json=payload
-                        )
+                        if has_media:
+                            body = _build_openrouter_media_body(
+                                bundle,
+                                history,
+                                system_instruction=(
+                                    self._settings.gemini_system_prompt
+                                ),
+                                model=model,
+                                temperature=self._settings.gemini_temperature,
+                                max_tokens=(
+                                    self._settings.gemini_max_output_tokens
+                                ),
+                                combined_text=combined_text,
+                            )
+                            response = await client.post(
+                                "chat/completions",
+                                content=body,
+                                headers={
+                                    "Content-Type": "application/json",
+                                    "Content-Length": str(body.content_length),
+                                },
+                            )
+                        else:
+                            payload = {
+                                "model": model,
+                                "messages": request_messages,
+                                "temperature": self._settings.gemini_temperature,
+                                "max_tokens": (
+                                    self._settings.gemini_max_output_tokens
+                                ),
+                                "stream": False,
+                            }
+                            response = await client.post(
+                                "chat/completions", json=payload
+                            )
                         response.raise_for_status()
                     completion = _extract_chat_completion(response.json())
                     _raise_if_unusable_chat_completion(
@@ -840,9 +909,10 @@ class GeminiService:
                         self._settings
                     ):
                         continuation_count += 1
-                        request_messages = _continuation_messages(
-                            base_messages, combined_text
-                        )
+                        if base_messages is not None:
+                            request_messages = _continuation_messages(
+                                base_messages, combined_text
+                            )
                         attempt = 0
                         logger.info(
                             "Continuing truncated OpenRouter response part=%s",
@@ -1214,6 +1284,128 @@ def _build_openrouter_content(bundle: PromptBundle) -> str | list[dict[str, Any]
             )
     content.append({"type": "text", "text": bundle.prompt})
     return content
+
+
+def _build_openrouter_media_body(
+    bundle: PromptBundle,
+    history: tuple[ConversationMessage, ...],
+    *,
+    system_instruction: str,
+    model: str,
+    temperature: float,
+    max_tokens: int,
+    combined_text: str,
+) -> _OpenRouterMediaBody:
+    if not bundle.media:
+        raise ValueError("Streaming OpenRouter body requires media")
+
+    segments: list[bytes | _Base64Data] = [
+        b'{"model":',
+        _json_bytes(model),
+        b',"messages":[',
+    ]
+    first_message = True
+
+    def add_message(role: str, content: str) -> None:
+        nonlocal first_message
+        if not first_message:
+            segments.append(b",")
+        first_message = False
+        segments.append(_json_bytes({"role": role, "content": content}))
+
+    add_message("system", system_instruction)
+    for item in history:
+        add_message(item.role, item.content)
+
+    if not first_message:
+        segments.append(b",")
+    first_message = False
+    segments.append(b'{"role":"user","content":[')
+    first_part = True
+
+    def start_part() -> None:
+        nonlocal first_part
+        if not first_part:
+            segments.append(b",")
+        first_part = False
+
+    for item in bundle.media:
+        start_part()
+        segments.append(_json_bytes({"type": "text", "text": item.label}))
+        start_part()
+        if item.kind == "image":
+            segments.extend(
+                (
+                    b'{"type":"image_url","image_url":{"url":',
+                    _json_open_string(f"data:{item.mime_type};base64,"),
+                    _Base64Data(item.data),
+                    b'"}}',
+                )
+            )
+        elif item.kind == "document":
+            segments.extend(
+                (
+                    b'{"type":"file","file":{"filename":"document.pdf",'
+                    b'"file_data":',
+                    _json_open_string(f"data:{item.mime_type};base64,"),
+                    _Base64Data(item.data),
+                    b'"}}',
+                )
+            )
+        elif item.kind == "audio":
+            segments.extend(
+                (
+                    b'{"type":"input_audio","input_audio":{"data":',
+                    _json_open_string(""),
+                    _Base64Data(item.data),
+                    b'","format":',
+                    _json_bytes(_audio_format(item.mime_type)),
+                    b"}}",
+                )
+            )
+        elif item.kind == "video":
+            segments.extend(
+                (
+                    b'{"type":"video_url","video_url":{"url":',
+                    _json_open_string(f"data:{item.mime_type};base64,"),
+                    _Base64Data(item.data),
+                    b'"}}',
+                )
+            )
+        else:
+            raise GeminiRequestError(
+                f"OpenRouter не поддерживает тип вложения {item.kind!r}."
+            )
+
+    start_part()
+    segments.append(_json_bytes({"type": "text", "text": bundle.prompt}))
+    segments.append(b"]}")
+    if combined_text:
+        add_message("assistant", combined_text)
+        add_message("user", _CONTINUATION_PROMPT)
+    segments.extend(
+        (
+            b'],"temperature":',
+            _json_bytes(temperature),
+            b',"max_tokens":',
+            _json_bytes(max_tokens),
+            b',"stream":false}',
+        )
+    )
+    return _OpenRouterMediaBody(segments)
+
+
+def _json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _json_open_string(value: str) -> bytes:
+    encoded = _json_bytes(value)
+    return encoded[:-1]
 
 
 def _audio_format(mime_type: str) -> str:

@@ -1,16 +1,21 @@
 import asyncio
 import base64
 import gc
+import json as jsonlib
+import tracemalloc
 import unittest
 import weakref
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import httpx
 
 from bot.gemini import (
     GeminiRequestError,
     GeminiService,
     ModelSelectionError,
     ModelSwitchNotice,
+    _build_openrouter_media_body,
 )
 from bot.models import ConversationMessage, GeminiResult, MediaPayload, PromptBundle
 
@@ -77,9 +82,30 @@ class FakeOpenRouterClient:
     def __init__(self, responses: list[FakeOpenRouterResponse]) -> None:
         self.responses = responses
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.streamed: list[bool] = []
+        self.stream_chunk_sizes: list[int] = []
 
-    async def post(self, url: str, *, json: dict[str, object]) -> FakeOpenRouterResponse:
-        self.calls.append((url, json))
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict[str, object] | None = None,
+        content=None,
+        headers: dict[str, str] | None = None,
+    ) -> FakeOpenRouterResponse:
+        is_streamed = content is not None
+        self.streamed.append(is_streamed)
+        if is_streamed:
+            chunks = [chunk async for chunk in content]
+            self.stream_chunk_sizes.append(max(map(len, chunks), default=0))
+            raw_body = b"".join(chunks)
+            if headers and "Content-Length" in headers:
+                assert len(raw_body) == int(headers["Content-Length"])
+            payload = jsonlib.loads(raw_body)
+        else:
+            assert json is not None
+            payload = json
+        self.calls.append((url, payload))
         return self.responses.pop(0)
 
 
@@ -168,7 +194,11 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client_kwargs["api_key"], "AQ.test-key")
         self.assertTrue(client_kwargs["vertexai"])
         self.assertEqual(
-            client_kwargs["http_options"].retry_options.attempts, 0
+            client_kwargs["http_options"].retry_options.attempts, 1
+        )
+        self.assertEqual(
+            client_kwargs["http_options"].retry_options.http_status_codes,
+            [418],
         )
         self.assertFalse(service._interactions_available)
 
@@ -184,6 +214,7 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(url, "chat/completions")
         self.assertEqual(payload["model"], "google/gemini-3.5-flash")
         self.assertEqual(payload["messages"][1]["content"], "вопрос")
+        self.assertEqual(service._openrouter_client.streamed, [False])
 
     async def test_openrouter_continues_response_stopped_by_token_limit(self) -> None:
         service = make_openrouter_service("unused")
@@ -555,6 +586,152 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         request = service._openrouter_client.calls[0][1]
         content = request["messages"][-1]["content"]
         self.assertTrue(any(part["type"] == "video_url" for part in content))
+        self.assertEqual(service._openrouter_client.streamed, [True])
+
+    async def test_large_openrouter_media_body_has_bounded_peak_memory(self) -> None:
+        raw_media = b"x" * (2 * 1024 * 1024)
+        bundle = PromptBundle(
+            prompt="опиши видео",
+            media=(
+                MediaPayload("видео", "video", "video/mp4", raw_media),
+            ),
+        )
+        body = _build_openrouter_media_body(
+            bundle,
+            (),
+            system_instruction="system",
+            model="openrouter/free",
+            temperature=0.5,
+            max_tokens=100,
+            combined_text="",
+        )
+
+        tracemalloc.start()
+        total_bytes = 0
+        max_chunk_bytes = 0
+        async for chunk in body:
+            total_bytes += len(chunk)
+            max_chunk_bytes = max(max_chunk_bytes, len(chunk))
+        _, peak_bytes = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        self.assertEqual(total_bytes, body.content_length)
+        self.assertLessEqual(max_chunk_bytes, 64 * 1024)
+        self.assertLess(peak_bytes, 2 * 1024 * 1024)
+
+    async def test_httpx_sends_streamed_media_with_content_length(self) -> None:
+        captured: dict[str, object] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            raw_body = await request.aread()
+            captured["length"] = len(raw_body)
+            captured["header"] = request.headers.get("content-length")
+            captured["payload"] = jsonlib.loads(raw_body)
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "готово"}}]},
+            )
+
+        service = make_openrouter_service("unused")
+        client = httpx.AsyncClient(
+            base_url="https://openrouter.test/",
+            transport=httpx.MockTransport(handler),
+        )
+        service._openrouter_client = client
+        bundle = PromptBundle(
+            prompt="опиши видео",
+            media=(MediaPayload("видео", "video", "video/mp4", b"video"),),
+        )
+        try:
+            result = await service.generate(bundle, None)
+        finally:
+            await client.aclose()
+
+        self.assertEqual(result.text, "готово")
+        self.assertEqual(captured["header"], str(captured["length"]))
+        payload = captured["payload"]
+        self.assertEqual(payload["model"], "google/gemini-3.5-flash")
+
+    async def test_openrouter_media_continuation_is_streamed_again(self) -> None:
+        service = make_openrouter_service("unused")
+        service._settings.ai_max_continuations = 2
+        service._openrouter_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "length",
+                                "message": {"content": "первая часть"},
+                            }
+                        ]
+                    }
+                ),
+                FakeOpenRouterResponse(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "message": {"content": "вторая часть"},
+                            }
+                        ]
+                    }
+                ),
+            ]
+        )
+        bundle = PromptBundle(
+            prompt="опиши видео",
+            media=(MediaPayload("видео", "video", "video/mp4", b"video"),),
+        )
+
+        result = await service.generate(bundle, None)
+
+        self.assertEqual(result.text, "первая часть\n\nвторая часть")
+        self.assertEqual(service._openrouter_client.streamed, [True, True])
+        second_messages = service._openrouter_client.calls[1][1]["messages"]
+        self.assertEqual(second_messages[-2]["role"], "assistant")
+        self.assertEqual(second_messages[-2]["content"], "первая часть")
+
+    async def test_large_media_quota_fallback_stays_within_memory_budget(self) -> None:
+        streamed_bytes = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal streamed_bytes
+            async for chunk in request.stream:
+                streamed_bytes += len(chunk)
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "готово"}}]},
+            )
+
+        service = make_service([FakeHttpError(429)])
+        service._settings.openrouter_model = "openrouter/free"
+        service._settings.openrouter_fallback_models = ()
+        client = httpx.AsyncClient(
+            base_url="https://openrouter.test/",
+            transport=httpx.MockTransport(handler),
+        )
+        service._openrouter_client = client
+        raw_media = b"x" * 5_738_236
+        bundle = PromptBundle(
+            prompt="опиши видео",
+            media=(
+                MediaPayload("видео", "video", "video/mp4", raw_media),
+            ),
+        )
+
+        tracemalloc.start()
+        try:
+            result = await service.generate(bundle, None)
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+            await client.aclose()
+
+        self.assertEqual(result.text, "готово")
+        self.assertEqual(len(service._client.aio.interactions.calls), 1)
+        self.assertGreater(streamed_bytes, len(raw_media))
+        self.assertLess(peak_bytes, 25 * 1024 * 1024)
 
     async def test_media_routes_are_serialized(self) -> None:
         service = make_openrouter_service("unused")
