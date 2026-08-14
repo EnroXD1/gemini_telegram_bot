@@ -41,6 +41,7 @@ SERVICE_EMOJI_GUIDE = (
     "2. Скопируйте числовой ID.\n"
     "3. Отправьте, например: /emoji set ✅ 123456789\n\n"
     "/emoji list — показать все соответствия\n"
+    "/emoji test ⚡ — проверить отображение настроенного эмодзи\n"
     "/emoji remove ✅ — оставить для символа обычный эмодзи\n"
     "/emoji reset 🔄 — вернуть встроенный вариант; добавленный символ удалить\n"
     "/emoji defaults — восстановить четыре встроенных соответствия\n"
@@ -205,6 +206,26 @@ def create_router(
             elif len(parts) == 1 and parts[0].lower() == "clear":
                 await emoji_theme.clear_service_emojis()
                 response = "Все кастомные замены отключены."
+            elif len(parts) == 2 and parts[0].lower() == "test":
+                test_text = (
+                    f"{parts[1]} Проверка оформления. "
+                    "Если слева виден выбранный кастомный эмодзи, настройка работает."
+                )
+                themed = await emoji_theme.service_text(test_text)
+                if not themed.entities:
+                    await message.reply(
+                        f"Для {parts[1]} соответствие пока не настроено. "
+                        "Сначала используйте /emoji set."
+                    )
+                    return
+                try:
+                    await message.reply(themed.text, entities=themed.entities)
+                except TelegramBadRequest:
+                    await message.reply(
+                        f"Telegram отклонил custom_emoji_id для {parts[1]}. "
+                        "Проверьте ID и повторите /emoji set."
+                    )
+                return
             elif not parts or parts == ["list"]:
                 response = "Текущие соответствия эмодзи:"
             else:

@@ -15,6 +15,7 @@ from bot.emoji_theme import (
     extract_custom_emojis,
     extract_emoji_pack_names,
     extract_sticker_set_emojis,
+    find_first_service_custom_emoji,
     merge_service_custom_emojis,
 )
 from bot.storage import Storage
@@ -151,6 +152,50 @@ async def test_any_emoji_mapping_can_be_persisted_removed_and_cleared(
         await storage.close()
 
 
+@pytest.mark.asyncio
+async def test_variation_selector_mapping_is_normalized_and_persisted(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    await storage.open()
+    try:
+        theme = EmojiTheme(storage)
+        await theme.set_service_emoji("⚡️", "5458371041954897946")
+
+        restored = EmojiTheme(storage)
+        assert (await restored.service_ids())["⚡"] == "5458371041954897946"
+        assert "⚡️" not in await restored.service_ids()
+
+        for text in ("⚡ Лимит модели исчерпан", "⚡️ Лимит модели исчерпан"):
+            themed = await restored.service_text(text)
+            assert themed.entities is not None
+            assert themed.entities[0].custom_emoji_id == "5458371041954897946"
+            assert themed.entities[0].extract_from(text) == text.split()[0]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_old_variation_selector_mapping_is_migrated_when_loaded(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    await storage.open()
+    try:
+        await storage.set_runtime_setting(
+            "service_custom_emoji_ids",
+            '{"⚡️":"5458371041954897946"}',
+        )
+
+        theme = EmojiTheme(storage)
+        assert await theme.service_ids() == {"⚡": "5458371041954897946"}
+        themed = await theme.service_text("⚡ Лимит модели исчерпан")
+        assert themed.entities is not None
+        assert themed.entities[0].custom_emoji_id == "5458371041954897946"
+    finally:
+        await storage.close()
+
+
 def test_extract_emoji_pack_names_deduplicates_links() -> None:
     assert extract_emoji_pack_names(
         "https://t.me/addemoji/FirstPack и t.me/addemoji/Second_pack "
@@ -206,19 +251,21 @@ def test_service_custom_emoji_mapping_uses_configured_ids() -> None:
     ]
 
 
-def test_longest_custom_emoji_mapping_wins_without_overlapping_entities() -> None:
+def test_variation_selector_forms_share_one_custom_emoji_mapping() -> None:
     text = "❤️ и ❤"
     themed = apply_service_custom_emojis(
         text,
-        {"❤": "5000000000000000200", "❤️": "5000000000000000201"},
+        {"❤️": "5000000000000000201"},
     )
 
     assert themed.entities is not None
     assert [entity.extract_from(text) for entity in themed.entities] == ["❤️", "❤"]
     assert [entity.custom_emoji_id for entity in themed.entities] == [
         "5000000000000000201",
-        "5000000000000000200",
+        "5000000000000000201",
     ]
+
+    assert find_first_service_custom_emoji(text, {"❤": "123"}) == (0, 2, "123")
 
 
 def test_custom_emoji_entities_merge_with_formatting_but_skip_code() -> None:

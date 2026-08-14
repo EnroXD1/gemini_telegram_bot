@@ -75,6 +75,24 @@ def test_outgoing_caption_and_inline_button_are_themed() -> None:
     assert button.icon_custom_emoji_id == "5000000000000000401"
 
 
+def test_inline_button_matches_emoji_with_or_without_variation_selector() -> None:
+    method = SendMessage(
+        chat_id=1,
+        text="Проверка",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⚡ Лимит", callback_data="limit")]
+            ]
+        ),
+    )
+
+    themed = apply_outgoing_custom_emojis(method, {"⚡️": EMOJI_ID})
+
+    button = themed.reply_markup.inline_keyboard[0][0]
+    assert button.text == "Лимит"
+    assert button.icon_custom_emoji_id == EMOJI_ID
+
+
 class FakeTheme:
     async def service_ids(self) -> dict[str, str]:
         return {"✅": EMOJI_ID}

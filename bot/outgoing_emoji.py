@@ -8,7 +8,11 @@ from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 
-from .emoji_theme import EmojiTheme, merge_service_custom_emojis
+from .emoji_theme import (
+    EmojiTheme,
+    find_first_service_custom_emoji,
+    merge_service_custom_emojis,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,19 +98,11 @@ def _theme_inline_button(
 ) -> InlineKeyboardButton:
     if button.icon_custom_emoji_id:
         return button
-    matches: list[tuple[int, int, str, str]] = []
-    for alternative, custom_emoji_id in service_ids.items():
-        if not alternative or not custom_emoji_id.isdigit():
-            continue
-        index = button.text.find(alternative)
-        if index >= 0:
-            matches.append((index, -len(alternative), alternative, custom_emoji_id))
-    if not matches:
+    match = find_first_service_custom_emoji(button.text, service_ids)
+    if match is None:
         return button
-    index, _, alternative, custom_emoji_id = min(matches)
-    text = (
-        button.text[:index] + button.text[index + len(alternative) :]
-    ).strip()
+    start, end, custom_emoji_id = match
+    text = (button.text[:start] + button.text[end:]).strip()
     if not text:
         return button
     return button.model_copy(

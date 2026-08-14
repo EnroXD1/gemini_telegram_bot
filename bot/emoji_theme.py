@@ -15,6 +15,7 @@ from .storage import Storage
 
 _SERVICE_SETTING_KEY = "service_custom_emoji_ids"
 _MAX_SERVICE_ITEMS = 128
+_VARIATION_SELECTORS = frozenset({"\ufe0e", "\ufe0f"})
 _PACK_LINK_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?t\.me/addemoji/([A-Za-z0-9_]+)",
     re.IGNORECASE,
@@ -55,6 +56,7 @@ class EmojiTheme:
     async def set_service_emoji(
         self, alternative: str, custom_emoji_id: str
     ) -> None:
+        alternative = _canonical_service_alternative(alternative)
         _validate_service_alternative(alternative)
         if not custom_emoji_id.isdigit():
             raise ValueError("custom_emoji_id должен состоять только из цифр")
@@ -71,18 +73,23 @@ class EmojiTheme:
             await self._save_service_ids_locked(service_ids)
 
     async def reset_service_emoji(self, alternative: str | None = None) -> None:
+        if alternative is not None:
+            alternative = _canonical_service_alternative(alternative)
+            _validate_service_alternative(alternative)
         async with self._lock:
             service_ids = dict(await self._load_service_ids_locked())
             if alternative is None:
-                service_ids = dict(SERVICE_CUSTOM_EMOJI_IDS)
-            elif alternative in SERVICE_CUSTOM_EMOJI_IDS:
-                service_ids[alternative] = SERVICE_CUSTOM_EMOJI_IDS[alternative]
+                service_ids = _normalized_service_ids(SERVICE_CUSTOM_EMOJI_IDS)
+            elif alternative in _normalized_service_ids(SERVICE_CUSTOM_EMOJI_IDS):
+                service_ids[alternative] = _normalized_service_ids(
+                    SERVICE_CUSTOM_EMOJI_IDS
+                )[alternative]
             else:
-                _validate_service_alternative(alternative)
                 service_ids.pop(alternative, None)
             await self._save_service_ids_locked(service_ids)
 
     async def remove_service_emoji(self, alternative: str) -> None:
+        alternative = _canonical_service_alternative(alternative)
         _validate_service_alternative(alternative)
         async with self._lock:
             service_ids = dict(await self._load_service_ids_locked())
@@ -105,23 +112,27 @@ class EmojiTheme:
             return self._service_ids
         raw = await self._storage.get_runtime_setting(_SERVICE_SETTING_KEY)
         if raw is None:
-            service_ids = dict(SERVICE_CUSTOM_EMOJI_IDS)
+            service_ids = _normalized_service_ids(SERVICE_CUSTOM_EMOJI_IDS)
         else:
             service_ids = {}
             try:
                 payload = json.loads(raw)
                 if isinstance(payload, dict):
                     for alternative, custom_emoji_id in payload.items():
+                        normalized = (
+                            _canonical_service_alternative(alternative)
+                            if isinstance(alternative, str)
+                            else ""
+                        )
                         if (
-                            len(service_ids) < _MAX_SERVICE_ITEMS
-                            and isinstance(alternative, str)
+                            (normalized in service_ids or len(service_ids) < _MAX_SERVICE_ITEMS)
                             and isinstance(custom_emoji_id, str)
                             and custom_emoji_id.isdigit()
-                            and _is_service_alternative(alternative)
+                            and _is_service_alternative(normalized)
                         ):
-                            service_ids[alternative] = custom_emoji_id
+                            service_ids[normalized] = custom_emoji_id
             except (TypeError, ValueError):
-                service_ids = dict(SERVICE_CUSTOM_EMOJI_IDS)
+                service_ids = _normalized_service_ids(SERVICE_CUSTOM_EMOJI_IDS)
         self._service_ids = service_ids
         return self._service_ids
 
@@ -201,8 +212,9 @@ def merge_service_custom_emojis(
             MessageEntityType.CUSTOM_EMOJI,
         }
     ]
+    normalized_text, original_positions = _text_without_variation_selectors(text)
     mappings = sorted(
-        service_ids.items(),
+        _normalized_service_ids(service_ids).items(),
         key=lambda item: (_utf16_length(item[0]), len(item[0])),
         reverse=True,
     )
@@ -211,17 +223,24 @@ def merge_service_custom_emojis(
             continue
         start = 0
         while True:
-            index = text.find(alternative, start)
+            index = normalized_text.find(alternative, start)
             if index < 0:
                 break
-            offset = _utf16_length(text[:index])
-            end = offset + _utf16_length(alternative)
+            normalized_end = index + len(alternative)
+            original_start = original_positions[index]
+            original_end = (
+                original_positions[normalized_end]
+                if normalized_end < len(original_positions)
+                else len(text)
+            )
+            offset = _utf16_length(text[:original_start])
+            end = _utf16_length(text[:original_end])
             overlaps = any(
                 offset < existing_end and end > existing_start
                 for existing_start, existing_end in (*occupied, *blocked)
             )
             if overlaps:
-                start = index + len(alternative)
+                start = normalized_end
                 continue
             entities.append(
                 MessageEntity(
@@ -232,9 +251,33 @@ def merge_service_custom_emojis(
                 )
             )
             occupied.append((offset, end))
-            start = index + len(alternative)
+            start = normalized_end
     entities.sort(key=lambda entity: (entity.offset, -entity.length))
     return ThemedText(text=text, entities=entities or None)
+
+
+def find_first_service_custom_emoji(
+    text: str,
+    service_ids: Mapping[str, str] = SERVICE_CUSTOM_EMOJI_IDS,
+) -> tuple[int, int, str] | None:
+    """Return the first matching emoji span as Python indexes and its custom ID."""
+    normalized_text, original_positions = _text_without_variation_selectors(text)
+    matches: list[tuple[int, int, str]] = []
+    for alternative, custom_emoji_id in _normalized_service_ids(service_ids).items():
+        index = normalized_text.find(alternative)
+        if index < 0:
+            continue
+        normalized_end = index + len(alternative)
+        original_start = original_positions[index]
+        original_end = (
+            original_positions[normalized_end]
+            if normalized_end < len(original_positions)
+            else len(text)
+        )
+        matches.append((original_start, original_end, custom_emoji_id))
+    if not matches:
+        return None
+    return min(matches, key=lambda item: (item[0], -(item[1] - item[0])))
 
 
 def extract_sticker_set_emojis(sticker_set: StickerSet) -> tuple[CustomEmoji, ...]:
@@ -324,6 +367,40 @@ def _validate_service_alternative(alternative: str) -> None:
         raise ValueError(
             "Укажите один эмодзи без пробелов (составные эмодзи тоже поддерживаются)"
         )
+
+
+def _canonical_service_alternative(alternative: str) -> str:
+    return "".join(
+        character
+        for character in alternative
+        if character not in _VARIATION_SELECTORS
+    )
+
+
+def _normalized_service_ids(
+    service_ids: Mapping[str, str],
+) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for alternative, custom_emoji_id in service_ids.items():
+        canonical = _canonical_service_alternative(alternative)
+        if (
+            canonical
+            and isinstance(custom_emoji_id, str)
+            and custom_emoji_id.isdigit()
+        ):
+            normalized[canonical] = custom_emoji_id
+    return normalized
+
+
+def _text_without_variation_selectors(text: str) -> tuple[str, list[int]]:
+    characters: list[str] = []
+    original_positions: list[int] = []
+    for index, character in enumerate(text):
+        if character in _VARIATION_SELECTORS:
+            continue
+        characters.append(character)
+        original_positions.append(index)
+    return "".join(characters), original_positions
 
 
 def _is_service_alternative(alternative: str) -> bool:
