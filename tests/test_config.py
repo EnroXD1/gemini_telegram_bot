@@ -142,6 +142,18 @@ def test_ai_continuations_default_to_two(monkeypatch, tmp_path) -> None:
     assert settings.ai_max_continuations == 2
 
 
+def test_media_limit_defaults_to_eight_mebibytes(monkeypatch, tmp_path) -> None:
+    for name in TOKEN_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.delenv("MAX_MEDIA_BYTES", raising=False)
+
+    settings = Settings.from_env(tmp_path / "missing.env")
+
+    assert settings.max_media_bytes == 8 * 1024 * 1024
+
+
 def test_automatic_fallback_and_spam_protection_defaults(monkeypatch, tmp_path) -> None:
     for name in TOKEN_NAMES:
         monkeypatch.delenv(name, raising=False)

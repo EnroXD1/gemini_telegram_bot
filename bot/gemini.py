@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
 import logging
 import random
 import time
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/"
 OPENROUTER_APP_URL = "https://github.com/EnroXD1/gemini_telegram_bot"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1/"
-_TEXT_ONLY_OPENROUTER_FALLBACK_MODELS = frozenset(
+_OPENROUTER_MEDIA_UNSUPPORTED_MODELS = frozenset(
     DEFAULT_OPENROUTER_FALLBACK_MODELS[:2]
 )
 
@@ -163,6 +164,7 @@ class GeminiService:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
+        self._media_semaphore = asyncio.Semaphore(1)
         self._client: Any | None = None
         self._openrouter_client: httpx.AsyncClient | None = None
         self._groq_client: httpx.AsyncClient | None = None
@@ -193,7 +195,12 @@ class GeminiService:
                 timeout=settings.gemini_timeout_seconds,
             )
         if getattr(settings, "gemini_api_key", ""):
-            client_kwargs: dict[str, Any] = {"api_key": settings.gemini_api_key}
+            client_kwargs: dict[str, Any] = {
+                "api_key": settings.gemini_api_key,
+                "http_options": types.HttpOptions(
+                    retry_options=types.HttpRetryOptions(attempts=0)
+                ),
+            }
             if settings.gemini_vertex_ai:
                 client_kwargs["vertexai"] = True
             self._client = genai.Client(**client_kwargs)
@@ -305,6 +312,27 @@ class GeminiService:
                     )
             try:
                 attempted += 1
+                logger.info(
+                    "Starting AI route provider=%s model=%s media_items=%s "
+                    "media_bytes=%s",
+                    route.provider,
+                    route.model,
+                    len(bundle.media),
+                    _bundle_media_bytes(bundle),
+                )
+                if bundle.media:
+                    media_semaphore = getattr(self, "_media_semaphore", None)
+                    if media_semaphore is None:
+                        media_semaphore = asyncio.Semaphore(1)
+                        self._media_semaphore = media_semaphore
+                    async with media_semaphore:
+                        return await self._generate_route(
+                            route,
+                            bundle,
+                            previous_interaction_id,
+                            history,
+                            is_fallback=failed_route is not None,
+                        )
                 return await self._generate_route(
                     route,
                     bundle,
@@ -313,12 +341,15 @@ class GeminiService:
                     is_fallback=failed_route is not None,
                 )
             except GeminiRequestError as exc:
-                last_error = exc
                 failed_route = route
                 notify_switch = True
                 if not automatic_fallback or not exc.fallback_allowed:
                     raise
-                self._start_route_cooldown(route, exc)
+                last_error = _detached_request_error(exc)
+                self._start_route_cooldown(route, last_error)
+                if bundle.media:
+                    _release_exception_chain(exc)
+                    gc.collect()
 
         if last_error is not None and attempted > 1:
             raise GeminiRequestError(
@@ -357,7 +388,7 @@ class GeminiService:
             if (
                 provider == "openrouter"
                 and bundle.media
-                and model in _TEXT_ONLY_OPENROUTER_FALLBACK_MODELS
+                and not _openrouter_model_supports_media(model)
             ):
                 return
             if (
@@ -406,6 +437,13 @@ class GeminiService:
         is_fallback: bool,
     ) -> GeminiResult:
         if route.provider == "openrouter":
+            if bundle.media and not _openrouter_model_supports_media(route.model):
+                raise GeminiRequestError(
+                    "Динамическая или текстовая модель OpenRouter не подходит "
+                    "для обработки медиа. Пробую другой маршрут.",
+                    provider="openrouter",
+                    fallback_allowed=True,
+                )
             return await self._generate_openrouter(
                 bundle,
                 previous_interaction_id,
@@ -501,9 +539,14 @@ class GeminiService:
         model: str,
     ) -> GeminiResult:
 
-        base_request_input = _build_input(bundle)
-        request_input = base_request_input
-        generate_contents = _build_generate_content(bundle)
+        base_request_input: Any | None = None
+        request_input: Any | None = None
+        generate_contents: Any | None = None
+        if self._interactions_available:
+            base_request_input = _build_input(bundle)
+            request_input = base_request_input
+        else:
+            generate_contents = _build_generate_content(bundle)
         current_previous_id = (
             previous_interaction_id
             if self._settings.gemini_store_interactions
@@ -520,23 +563,30 @@ class GeminiService:
         async with self._semaphore:
             while True:
                 try:
-                    kwargs: dict[str, Any] = {
-                        "model": model,
-                        "input": request_input,
-                        "system_instruction": self._settings.gemini_system_prompt,
-                        "generation_config": {
-                            "temperature": self._settings.gemini_temperature,
-                            "max_output_tokens": self._settings.gemini_max_output_tokens,
-                        },
-                        "store": self._settings.gemini_store_interactions,
-                    }
-                    if current_previous_id:
-                        kwargs["previous_interaction_id"] = current_previous_id
-
                     async with asyncio.timeout(
                         self._settings.gemini_timeout_seconds
                     ):
                         if self._interactions_available:
+                            kwargs: dict[str, Any] = {
+                                "model": model,
+                                "input": request_input,
+                                "system_instruction": (
+                                    self._settings.gemini_system_prompt
+                                ),
+                                "generation_config": {
+                                    "temperature": (
+                                        self._settings.gemini_temperature
+                                    ),
+                                    "max_output_tokens": (
+                                        self._settings.gemini_max_output_tokens
+                                    ),
+                                },
+                                "store": self._settings.gemini_store_interactions,
+                            }
+                            if current_previous_id:
+                                kwargs["previous_interaction_id"] = (
+                                    current_previous_id
+                                )
                             interaction = await self._client.aio.interactions.create(
                                 **kwargs
                             )
@@ -551,6 +601,8 @@ class GeminiService:
                                 finish_reason in _INCOMPLETE_INTERACTION_STATUSES
                             )
                         else:
+                            if generate_contents is None:
+                                generate_contents = _build_generate_content(bundle)
                             response = await self._client.aio.models.generate_content(
                                 model=model,
                                 contents=generate_contents,
@@ -660,6 +712,8 @@ class GeminiService:
                         )
                         self._interactions_available = False
                         current_previous_id = None
+                        base_request_input = None
+                        request_input = None
                         context_was_reset = context_was_reset or bool(
                             previous_interaction_id
                         )
@@ -667,6 +721,8 @@ class GeminiService:
                             generate_contents = _build_generate_content_continuation(
                                 bundle, combined_text
                             )
+                        else:
+                            generate_contents = _build_generate_content(bundle)
                         attempt = 0
                         continue
                     if current_previous_id and _is_expired_context_error(exc, code):
@@ -683,6 +739,7 @@ class GeminiService:
                     attempt += 1
                     if (
                         _is_retryable(exc, code)
+                        and not _is_quota_error(exc, code)
                         and attempt < self._settings.gemini_retry_attempts
                     ):
                         delay = min(8.0, (2 ** (attempt - 1)) + random.random())
@@ -833,6 +890,7 @@ class GeminiService:
                     attempt += 1
                     if (
                         _is_retryable(exc, code)
+                        and not _is_quota_error(exc, code)
                         and attempt < self._settings.gemini_retry_attempts
                     ):
                         delay = min(8.0, (2 ** (attempt - 1)) + random.random())
@@ -977,7 +1035,7 @@ class GeminiService:
                 attempt += 1
                 if (
                     _is_retryable(exc, code)
-                    and code != 429
+                    and not _is_quota_error(exc, code)
                     and attempt < self._settings.gemini_retry_attempts
                 ):
                     delay = min(4.0, (2 ** (attempt - 1)) + random.random())
@@ -1241,6 +1299,33 @@ def _fallback_reason(error: GeminiRequestError) -> str:
     if error.quota_exhausted:
         return "limit"
     return "unavailable"
+
+
+def _bundle_media_bytes(bundle: PromptBundle) -> int:
+    return sum(len(item.data) for item in bundle.media)
+
+
+def _openrouter_model_supports_media(model: str) -> bool:
+    return model.strip().lower() not in _OPENROUTER_MEDIA_UNSUPPORTED_MODELS
+
+
+def _detached_request_error(error: GeminiRequestError) -> GeminiRequestError:
+    """Copy user-facing metadata without retaining provider traceback buffers."""
+    return GeminiRequestError(
+        error.user_message,
+        delete_after_seconds=error.delete_after_seconds,
+        provider=error.provider,
+        status_code=error.status_code,
+        fallback_allowed=error.fallback_allowed,
+        quota_exhausted=error.quota_exhausted,
+        fallback_reason=error.fallback_reason,
+    )
+
+
+def _release_exception_chain(error: BaseException) -> None:
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
 
 
 def _raise_if_unusable_chat_completion(

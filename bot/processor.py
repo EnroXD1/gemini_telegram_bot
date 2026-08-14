@@ -53,6 +53,10 @@ class MessageProcessor:
             block_seconds=settings.spam_block_seconds,
         )
         self._scope_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # Keep the complete attachment lifecycle inside one slot. Limiting only
+        # the provider call is too late: queued requests would still retain the
+        # downloaded files in RAM while waiting for the AI service.
+        self._attachment_semaphore = asyncio.Semaphore(1)
         self._active_tasks: dict[str, asyncio.Task[object]] = {}
         self._active_users: set[str] = set()
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
@@ -149,45 +153,62 @@ class MessageProcessor:
                         "Could not load local conversation history scope=%s",
                         scope_key,
                     )
-                async with show_progress(
-                    lead, emoji_theme=self.emoji_theme
-                ) as progress:
-                    bundle = await self.media.prepare(
-                        bot=self.bot, messages=ordered, user_text=clean_text
-                    )
-                    result = await self.gemini.generate(
-                        bundle,
-                        previous_id,
-                        history=history,
-                        on_fallback=progress.show_fallback,
-                    )
-                    await self.usage.record(
-                        lead,
-                        ai_provider=result.provider or self.gemini.current_provider,
-                    )
-
+                has_attachment = _has_attachment_input(ordered)
+                if has_attachment:
+                    await self._attachment_semaphore.acquire()
+                bundle = PromptBundle(prompt="")
                 try:
-                    await self.storage.append_conversation_exchange(
-                        scope_key=scope_key,
-                        user_content=_history_user_content(
+                    async with show_progress(
+                        lead, emoji_theme=self.emoji_theme
+                    ) as progress:
+                        bundle = await self.media.prepare(
+                            bot=self.bot, messages=ordered, user_text=clean_text
+                        )
+                        result = await self.gemini.generate(
                             bundle,
-                            self.settings.openrouter_history_item_chars,
-                        ),
-                        assistant_content=_trim_history_item(
-                            result.text,
-                            self.settings.openrouter_history_item_chars,
-                        ),
-                        max_exchanges=self.settings.openrouter_history_turns,
-                    )
-                    await self.storage.set_interaction_id(
-                        scope_key,
-                        result.interaction_id if result.provider == "google" else None,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Could not persist conversation context chat_id=%s",
-                        lead.chat.id,
-                    )
+                            previous_id,
+                            history=history,
+                            on_fallback=progress.show_fallback,
+                        )
+                        await self.usage.record(
+                            lead,
+                            ai_provider=(
+                                result.provider or self.gemini.current_provider
+                            ),
+                        )
+
+                    try:
+                        await self.storage.append_conversation_exchange(
+                            scope_key=scope_key,
+                            user_content=_history_user_content(
+                                bundle,
+                                self.settings.openrouter_history_item_chars,
+                            ),
+                            assistant_content=_trim_history_item(
+                                result.text,
+                                self.settings.openrouter_history_item_chars,
+                            ),
+                            max_exchanges=self.settings.openrouter_history_turns,
+                        )
+                        await self.storage.set_interaction_id(
+                            scope_key,
+                            (
+                                result.interaction_id
+                                if result.provider == "google"
+                                else None
+                            ),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not persist conversation context chat_id=%s",
+                            lead.chat.id,
+                        )
+                finally:
+                    # Drop the raw attachment bytes before another media request
+                    # is allowed to start downloading.
+                    bundle = PromptBundle(prompt="")
+                    if has_attachment:
+                        self._attachment_semaphore.release()
                 await self.reply(
                     lead,
                     result.text,
@@ -395,6 +416,36 @@ def _has_processable_content(message: Message) -> bool:
         "story",
     )
     return any(bool(getattr(message, name, None)) for name in attributes)
+
+
+def _has_attachment_input(messages: list[Message]) -> bool:
+    attachment_attributes = (
+        "photo",
+        "live_photo",
+        "animation",
+        "audio",
+        "voice",
+        "video",
+        "video_note",
+        "sticker",
+        "document",
+    )
+    for message in messages:
+        candidates = (
+            message,
+            getattr(message, "reply_to_message", None),
+            getattr(message, "external_reply", None),
+        )
+        if any(
+            candidate is not None
+            and any(
+                bool(getattr(candidate, attribute, None))
+                for attribute in attachment_attributes
+            )
+            for candidate in candidates
+        ):
+            return True
+    return False
 
 
 def _effective_sender_id(message: Message) -> int:

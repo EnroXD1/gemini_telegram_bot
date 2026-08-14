@@ -329,7 +329,7 @@ class Settings:
                 or DEFAULT_BUSINESS_WELCOME_TEXT
             ),
             max_media_bytes=_int(
-                "MAX_MEDIA_BYTES", 20 * 1024 * 1024, minimum=1
+                "MAX_MEDIA_BYTES", 8 * 1024 * 1024, minimum=1
             ),
             max_media_items=_int("MAX_MEDIA_ITEMS", 10, minimum=1),
             max_text_file_chars=_int("MAX_TEXT_FILE_CHARS", 100_000, minimum=1),

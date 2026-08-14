@@ -1,6 +1,8 @@
 import asyncio
 import base64
+import gc
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -10,7 +12,7 @@ from bot.gemini import (
     ModelSelectionError,
     ModelSwitchNotice,
 )
-from bot.models import ConversationMessage, MediaPayload, PromptBundle
+from bot.models import ConversationMessage, GeminiResult, MediaPayload, PromptBundle
 
 
 class FakeInteractions:
@@ -161,8 +163,12 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
 
         service = GeminiService(settings)
 
-        client_factory.assert_called_once_with(
-            api_key="AQ.test-key", vertexai=True
+        client_factory.assert_called_once()
+        client_kwargs = client_factory.call_args.kwargs
+        self.assertEqual(client_kwargs["api_key"], "AQ.test-key")
+        self.assertTrue(client_kwargs["vertexai"])
+        self.assertEqual(
+            client_kwargs["http_options"].retry_options.attempts, 0
         )
         self.assertFalse(service._interactions_available)
 
@@ -533,6 +539,108 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_dynamic_openrouter_free_accepts_media(self) -> None:
+        service = make_openrouter_service("ответ OpenRouter")
+        service._provider = "openrouter"
+        service._model = "openrouter/free"
+        bundle = PromptBundle(
+            prompt="опиши видео",
+            media=(MediaPayload("видео", "video", "video/mp4", b"video"),),
+        )
+
+        result = await service.generate(bundle, None)
+
+        self.assertEqual(result.text, "ответ OpenRouter")
+        self.assertEqual(result.provider, "openrouter")
+        request = service._openrouter_client.calls[0][1]
+        content = request["messages"][-1]["content"]
+        self.assertTrue(any(part["type"] == "video_url" for part in content))
+
+    async def test_media_routes_are_serialized(self) -> None:
+        service = make_openrouter_service("unused")
+        active = 0
+        max_active = 0
+
+        async def fake_generate_route(
+            route,
+            bundle,
+            previous_interaction_id,
+            history,
+            *,
+            is_fallback,
+        ) -> GeminiResult:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return GeminiResult(
+                text="готово",
+                interaction_id=None,
+                context_was_reset=False,
+                provider=route.provider,
+            )
+
+        service._generate_route = fake_generate_route
+        bundle = PromptBundle(
+            prompt="опиши",
+            media=(MediaPayload("фото", "image", "image/jpeg", b"image"),),
+        )
+
+        await asyncio.gather(
+            service.generate(bundle, None),
+            service.generate(bundle, None),
+        )
+
+        self.assertEqual(max_active, 1)
+
+    async def test_media_fallback_releases_failed_route_traceback(self) -> None:
+        class ProviderBuffer:
+            pass
+
+        service = make_openrouter_service("unused")
+        service._settings.openrouter_fallback_models = ("openrouter/free",)
+        references: list[weakref.ReferenceType[ProviderBuffer]] = []
+        calls = 0
+
+        async def fake_generate_route(
+            route,
+            bundle,
+            previous_interaction_id,
+            history,
+            *,
+            is_fallback,
+        ) -> GeminiResult:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                provider_buffer = ProviderBuffer()
+                references.append(weakref.ref(provider_buffer))
+                raise GeminiRequestError(
+                    "первая модель недоступна",
+                    provider=route.provider,
+                    fallback_allowed=True,
+                )
+            return GeminiResult(
+                text="резервный ответ",
+                interaction_id=None,
+                context_was_reset=False,
+                provider=route.provider,
+            )
+
+        service._generate_route = fake_generate_route
+        bundle = PromptBundle(
+            prompt="опиши",
+            media=(MediaPayload("фото", "image", "image/jpeg", b"image"),),
+        )
+
+        result = await service.generate(bundle, None)
+        gc.collect()
+
+        self.assertEqual(result.text, "резервный ответ")
+        self.assertEqual(calls, 2)
+        self.assertIsNone(references[0]())
+
     async def test_google_limit_switches_to_openrouter_and_starts_cooldown(self) -> None:
         service = make_service([FakeHttpError(429)])
         service._settings.openrouter_model = "openrouter/fallback-model"
@@ -574,6 +682,34 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
             all(item.target_provider == "openrouter" for item in switches)
         )
 
+    async def test_google_quota_error_is_not_retried_by_service(self) -> None:
+        service = make_service(
+            [FakeHttpError(429), SimpleNamespace(id="unused", output_text="unused")]
+        )
+        service._settings.gemini_retry_attempts = 3
+
+        with self.assertRaises(GeminiRequestError):
+            await service.generate(PromptBundle(prompt="вопрос"), None)
+
+        self.assertEqual(len(service._client.aio.interactions.calls), 1)
+
+    async def test_openrouter_quota_error_is_not_retried_by_service(self) -> None:
+        service = make_openrouter_service("unused")
+        service._settings.gemini_retry_attempts = 3
+        service._openrouter_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse({}, error_code=429),
+                FakeOpenRouterResponse(
+                    {"choices": [{"message": {"content": "unused"}}]}
+                ),
+            ]
+        )
+
+        with self.assertRaises(GeminiRequestError):
+            await service.generate(PromptBundle(prompt="вопрос"), None)
+
+        self.assertEqual(len(service._openrouter_client.calls), 1)
+
     async def test_owner_selection_can_use_groq_as_primary(self) -> None:
         service = make_openrouter_service("unused")
         service._groq_client = FakeOpenRouterClient(
@@ -596,8 +732,14 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selected_groq_limit_switches_to_openrouter(self) -> None:
         service = make_openrouter_service("unused")
+        service._settings.gemini_retry_attempts = 3
         service._groq_client = FakeOpenRouterClient(
-            [FakeOpenRouterResponse({}, error_code=429)]
+            [
+                FakeOpenRouterResponse({}, error_code=429),
+                FakeOpenRouterResponse(
+                    {"choices": [{"message": {"content": "unused"}}]}
+                ),
+            ]
         )
         service._openrouter_client = FakeOpenRouterClient(
             [
@@ -621,6 +763,7 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(switches), 1)
         self.assertEqual(switches[0].source_provider, "groq")
         self.assertEqual(switches[0].target_provider, "openrouter")
+        self.assertEqual(len(service._groq_client.calls), 1)
 
     async def test_groq_primary_continues_truncated_response(self) -> None:
         service = make_openrouter_service("unused")
@@ -727,6 +870,21 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
             base64.b64decode(request_input[1]["data"]), b"image-bytes"
         )
 
+    async def test_google_interactions_do_not_build_second_media_copy(self) -> None:
+        service = make_service(
+            [SimpleNamespace(id="new-id", output_text="ответ")]
+        )
+        bundle = PromptBundle(
+            prompt="вопрос",
+            media=(MediaPayload("фото", "image", "image/jpeg", b"image"),),
+        )
+
+        with patch("bot.gemini._build_generate_content") as generate_builder:
+            result = await service.generate(bundle, None)
+
+        self.assertEqual(result.text, "ответ")
+        generate_builder.assert_not_called()
+
     async def test_google_interaction_continues_incomplete_response(self) -> None:
         service = make_service(
             [
@@ -785,6 +943,28 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
             [content.role for content in continuation_contents],
             ["user", "model", "user"],
         )
+
+    async def test_google_generate_content_does_not_build_base64_input(self) -> None:
+        service = make_service(
+            [],
+            [
+                SimpleNamespace(
+                    text="ответ",
+                    candidates=[SimpleNamespace(finish_reason="STOP")],
+                )
+            ],
+        )
+        service._interactions_available = False
+        bundle = PromptBundle(
+            prompt="вопрос",
+            media=(MediaPayload("фото", "image", "image/jpeg", b"image"),),
+        )
+
+        with patch("bot.gemini._build_input") as input_builder:
+            result = await service.generate(bundle, None)
+
+        self.assertEqual(result.text, "ответ")
+        input_builder.assert_not_called()
 
     async def test_google_blocked_partial_response_switches_to_groq(self) -> None:
         service = make_service(
