@@ -455,6 +455,20 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.provider, "groq")
         self.assertEqual(switches[0].reason, "blocked")
 
+    async def test_openrouter_keeps_normal_explanation_of_blocked_request(self) -> None:
+        explanation = (
+            "Request blocked означает, что провайдер отклонил запрос "
+            "встроенным фильтром безопасности."
+        )
+        service = make_openrouter_service(explanation)
+
+        result = await service.generate(
+            PromptBundle(prompt="Что означает request blocked?"), None
+        )
+
+        self.assertEqual(result.text, explanation)
+        self.assertEqual(result.provider, "openrouter")
+
     async def test_openrouter_402_can_switch_to_free_model_without_balance(self) -> None:
         service = make_openrouter_service("unused")
         service._settings.openrouter_fallback_models = (
@@ -771,6 +785,43 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
             [content.role for content in continuation_contents],
             ["user", "model", "user"],
         )
+
+    async def test_google_blocked_partial_response_switches_to_groq(self) -> None:
+        service = make_service(
+            [],
+            [
+                SimpleNamespace(
+                    text="Частичный ответ, который нельзя отправлять",
+                    candidates=[
+                        SimpleNamespace(finish_reason="PROHIBITED_CONTENT")
+                    ],
+                )
+            ],
+        )
+        service._interactions_available = False
+        service._settings.ai_auto_fallback_enabled = True
+        service._settings.groq_model = "llama-3.1-8b-instant"
+        service._settings.groq_max_output_tokens = 256
+        service._groq_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse(
+                    {"choices": [{"message": {"content": "безопасный ответ Groq"}}]}
+                )
+            ]
+        )
+        switches: list[ModelSwitchNotice] = []
+
+        async def on_fallback(notice: ModelSwitchNotice) -> None:
+            switches.append(notice)
+
+        result = await service.generate(
+            PromptBundle(prompt="вопрос"), None, on_fallback=on_fallback
+        )
+
+        self.assertEqual(result.text, "безопасный ответ Groq")
+        self.assertEqual(result.provider, "groq")
+        self.assertEqual(len(switches), 1)
+        self.assertEqual(switches[0].reason, "blocked")
 
     async def test_expired_context_is_retried_without_previous_id(self) -> None:
         service = make_service(

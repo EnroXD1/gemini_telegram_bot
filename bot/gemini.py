@@ -62,11 +62,18 @@ _INCOMPLETE_FINISH_REASONS = {
 _INCOMPLETE_INTERACTION_STATUSES = {"incomplete", "budget_exceeded"}
 _BLOCKED_FINISH_REASONS = {
     "blocked",
+    "blocklist",
     "content_filter",
     "content-filter",
     "content_filtered",
+    "image_prohibited_content",
+    "image_recitation",
+    "image_safety",
+    "prohibited_content",
+    "recitation",
     "safety",
     "safety_blocked",
+    "spii",
 }
 _NON_CHAT_MODEL_MARKERS = (
     "content-safety",
@@ -89,6 +96,24 @@ _REQUEST_BLOCK_MARKERS = (
     "content_filter",
     "safety policy",
     "policy violation",
+)
+_BLOCKED_RESPONSE_MESSAGES = frozenset(
+    {
+        "blocked request",
+        "content filter",
+        "content filtered",
+        "content filtered by provider",
+        "content filtered by safety policy",
+        "content_filter",
+        "policy violation",
+        "prompt blocked",
+        "prompt blocked by provider",
+        "prompt blocked by safety policy",
+        "request blocked",
+        "request blocked by provider",
+        "request blocked by provider safety policy",
+        "safety policy violation",
+    }
 )
 _CONTINUATION_PROMPT = (
     "Продолжи предыдущий ответ точно с места остановки. Не повторяй уже "
@@ -544,15 +569,15 @@ class GeminiService:
                             finish_reason = _extract_google_finish_reason(response)
                             truncated = _needs_continuation(finish_reason)
 
+                    if _is_blocked_finish_reason(finish_reason):
+                        raise GeminiRequestError(
+                            "Gemini заблокировал этот запрос правилами безопасности. "
+                            "Пробую другую модель.",
+                            provider="google",
+                            fallback_allowed=True,
+                            fallback_reason="blocked",
+                        )
                     if not text:
-                        if _is_blocked_finish_reason(finish_reason):
-                            raise GeminiRequestError(
-                                "Gemini заблокировал этот запрос правилами безопасности. "
-                                "Пробую другую модель.",
-                                provider="google",
-                                fallback_allowed=True,
-                                fallback_reason="blocked",
-                            )
                         raise GeminiRequestError(
                             "Gemini обработал запрос, но не вернул текстовый ответ. "
                             "Попробуйте переформулировать сообщение.",
@@ -1266,9 +1291,8 @@ def _looks_like_blocked_response(text: str) -> bool:
     )
     if safety_lines >= 2:
         return True
-    if any(marker in normalized for marker in _REQUEST_BLOCK_MARKERS):
-        return len(normalized) <= 600
-    return False
+    compact = " ".join(normalized.split()).rstrip(" .!;:")
+    return compact in _BLOCKED_RESPONSE_MESSAGES
 
 
 def _max_continuations(settings: object) -> int:
