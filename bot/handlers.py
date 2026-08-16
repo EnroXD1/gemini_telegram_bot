@@ -369,7 +369,7 @@ def create_router(
         if not await processor.can_respond(message):
             return
 
-        argument = (command.args or "").strip().split(maxsplit=1)[0]
+        argument = _first_command_argument(command.args)
         parts: int | None = None
         if argument:
             try:
@@ -965,6 +965,11 @@ def _truncate_button_text(value: str, limit: int) -> str:
 def _parse_users_limit(argument: str | None) -> int:
     if not argument:
         return 10
+
+
+def _first_command_argument(argument: str | None) -> str:
+    parts = (argument or "").strip().split(maxsplit=1)
+    return parts[0] if parts else ""
     try:
         return max(1, min(15, int(argument.strip())))
     except ValueError:
