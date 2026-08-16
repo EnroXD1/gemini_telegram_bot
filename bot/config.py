@@ -183,6 +183,9 @@ class Settings:
     max_media_items: int
     max_text_file_chars: int
     media_download_timeout_seconds: float
+    wall_max_source_bytes: int
+    wall_max_pixels: int
+    wall_tile_size: int
     max_concurrent_requests: int
     gemini_timeout_seconds: float
     gemini_retry_attempts: int
@@ -239,6 +242,14 @@ class Settings:
         ai_max_continuations = _int("AI_MAX_CONTINUATIONS", 2, minimum=0)
         if ai_max_continuations > 5:
             raise ConfigError("AI_MAX_CONTINUATIONS не должен превышать 5")
+        wall_tile_size = _int("WALL_TILE_SIZE", 1080, minimum=128)
+        if wall_tile_size > 1440:
+            raise ConfigError("WALL_TILE_SIZE не должен превышать 1440")
+        wall_max_pixels = _int("WALL_MAX_PIXELS", 12_000_000, minimum=1_000_000)
+        if wall_max_pixels > 12_000_000:
+            raise ConfigError(
+                "WALL_MAX_PIXELS не должен превышать безопасные 12000000"
+            )
 
         return cls(
             telegram_bot_token=_telegram_bot_token(),
@@ -336,6 +347,11 @@ class Settings:
             media_download_timeout_seconds=_float(
                 "MEDIA_DOWNLOAD_TIMEOUT_SECONDS", 45.0, minimum=1.0
             ),
+            wall_max_source_bytes=_int(
+                "WALL_MAX_SOURCE_BYTES", 8 * 1024 * 1024, minimum=1
+            ),
+            wall_max_pixels=wall_max_pixels,
+            wall_tile_size=wall_tile_size,
             max_concurrent_requests=_int(
                 "MAX_CONCURRENT_REQUESTS", 4, minimum=1
             ),

@@ -4,3 +4,4 @@ httpx>=0.28.0,<1.0.0
 telegramify-markdown>=1.2.0,<2.0.0
 aiosqlite>=0.20.0,<1.0.0
 python-dotenv>=1.0.0,<2.0.0
+Pillow>=12.0.0,<13.0.0

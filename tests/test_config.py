@@ -154,6 +154,44 @@ def test_media_limit_defaults_to_eight_mebibytes(monkeypatch, tmp_path) -> None:
     assert settings.max_media_bytes == 8 * 1024 * 1024
 
 
+def test_wall_limits_are_safe_for_small_container(monkeypatch, tmp_path) -> None:
+    for name in TOKEN_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.delenv("WALL_MAX_SOURCE_BYTES", raising=False)
+    monkeypatch.delenv("WALL_MAX_PIXELS", raising=False)
+    monkeypatch.delenv("WALL_TILE_SIZE", raising=False)
+
+    settings = Settings.from_env(tmp_path / "missing.env")
+
+    assert settings.wall_max_source_bytes == 8 * 1024 * 1024
+    assert settings.wall_max_pixels == 12_000_000
+    assert settings.wall_tile_size == 1080
+
+
+def test_wall_tile_size_is_capped(monkeypatch, tmp_path) -> None:
+    for name in TOKEN_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("WALL_TILE_SIZE", "1441")
+
+    with pytest.raises(ConfigError, match="WALL_TILE_SIZE"):
+        Settings.from_env(tmp_path / "missing.env")
+
+
+def test_wall_pixel_limit_cannot_exceed_safe_cap(monkeypatch, tmp_path) -> None:
+    for name in TOKEN_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("WALL_MAX_PIXELS", "12000001")
+
+    with pytest.raises(ConfigError, match="WALL_MAX_PIXELS"):
+        Settings.from_env(tmp_path / "missing.env")
+
+
 def test_automatic_fallback_and_spam_protection_defaults(monkeypatch, tmp_path) -> None:
     for name in TOKEN_NAMES:
         monkeypatch.delenv(name, raising=False)

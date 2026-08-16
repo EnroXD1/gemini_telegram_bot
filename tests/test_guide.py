@@ -12,6 +12,7 @@ from bot.guide import (
     GuideVideoSender,
     guide_keyboard,
 )
+from bot.wall import WALL_START_CALLBACK
 
 
 class FakeMessage:
@@ -50,6 +51,7 @@ async def test_guide_upload_is_replaced_with_cached_telegram_file_id(
 
 def test_guide_button_and_bundled_video_are_available() -> None:
     button = guide_keyboard().inline_keyboard[0][0]
+    wall_button = guide_keyboard().inline_keyboard[1][0]
 
     assert button.callback_data == GUIDE_CALLBACK_DATA
     assert button.text.startswith("🎬")
@@ -57,6 +59,8 @@ def test_guide_button_and_bundled_video_are_available() -> None:
     assert "Гайд" in button.text
     assert GUIDE_VIDEO_PATH.is_file()
     assert GUIDE_VIDEO_PATH.stat().st_size > 0
+    assert wall_button.callback_data == WALL_START_CALLBACK
+    assert "стенку" in wall_button.text.lower()
 
 
 @pytest.mark.asyncio
@@ -68,3 +72,4 @@ async def test_guide_is_present_in_telegram_command_menus() -> None:
     assert len(bot.command_sets) == 2
     assert all("guide" in {item.command for item in commands} for commands in bot.command_sets)
     assert all("emoji" in {item.command for item in commands} for commands in bot.command_sets)
+    assert all("wall" in {item.command for item in commands} for commands in bot.command_sets)

@@ -12,6 +12,7 @@ from aiogram.types import (
 )
 
 from .emoji_theme import EmojiTheme
+from .wall import WALL_START_CALLBACK
 
 GUIDE_CALLBACK_DATA = "guide:hidden-media"
 GUIDE_VIDEO_PATH = Path(__file__).with_name("assets") / "hidden_media_guide.mp4"
@@ -30,7 +31,13 @@ def guide_keyboard() -> InlineKeyboardMarkup:
                     text="🎬 Гайд по скрытым медиа",
                     callback_data=GUIDE_CALLBACK_DATA,
                 )
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🖼 Создать стенку из фото",
+                    callback_data=WALL_START_CALLBACK,
+                )
+            ],
         ]
     )
 

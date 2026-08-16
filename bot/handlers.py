@@ -31,6 +31,19 @@ from .guide import GUIDE_CALLBACK_DATA, GuideVideoSender, guide_keyboard
 from .processor import MessageProcessor
 from .storage import BotUserRecord
 from .usage import BotUsageMiddleware, UsageTracker
+from .wall import (
+    WALL_CALLBACK_PREFIX,
+    WALL_CANCEL_CALLBACK,
+    WALL_PART_COUNTS,
+    WALL_START_CALLBACK,
+    PendingWallPhotoFilter,
+    WallError,
+    WallService,
+    WallSource,
+    callback_wall_parts,
+    wall_keyboard,
+    wall_source_from_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +101,7 @@ def create_router(
     monitor: BusinessMonitor,
     usage: UsageTracker,
     emoji_theme: EmojiTheme | None = None,
+    wall: WallService | None = None,
 ) -> Router:
     router = Router(name="gemini-assistant")
     router.message.outer_middleware(BotUsageMiddleware(usage))
@@ -96,6 +110,12 @@ def create_router(
     )
     emoji_theme = emoji_theme or EmojiTheme(processor.storage)
     guide = GuideVideoSender(emoji_theme=emoji_theme)
+    wall = wall or WallService(
+        max_source_bytes=processor.settings.wall_max_source_bytes,
+        max_pixels=processor.settings.wall_max_pixels,
+        tile_size=processor.settings.wall_tile_size,
+        download_timeout_seconds=processor.settings.media_download_timeout_seconds,
+    )
 
     async def send_guide(message: Message) -> None:
         try:
@@ -103,6 +123,29 @@ def create_router(
         except Exception:
             logger.exception("Could not send bundled hidden-media guide")
             await message.reply("Гайд временно недоступен. Попробуйте немного позже.")
+
+    async def send_wall(
+        message: Message,
+        *,
+        source: WallSource,
+        parts: int,
+        requester_id: int,
+    ) -> None:
+        try:
+            await wall.create_and_send(
+                anchor=message,
+                source=source,
+                parts=parts,
+                requester_id=requester_id,
+            )
+        except WallError as exc:
+            await message.answer(f"Не удалось создать стенку: {exc}")
+        except Exception:
+            logger.exception("Unexpected wall rendering failure")
+            await message.answer(
+                "Не удалось создать стенку из-за внутренней ошибки. "
+                "Попробуйте другое изображение немного позже."
+            )
 
     @router.business_connection()
     async def business_connection_handler(connection: BusinessConnection) -> None:
@@ -255,7 +298,8 @@ def create_router(
             "также сохраню входящие фото, видео, голосовые и кружки.\n\n"
             "Мне можно отправлять текст, фото, PDF, текстовые документы, аудио, "
             "голосовые, видео, стикеры, геолокацию, контакты и опросы. Я также "
-            "понимаю подписи, альбомы и сообщения, на которые вы отвечаете.\n\n"
+            "понимаю подписи, альбомы и сообщения, на которые вы отвечаете. "
+            "Команда /wall нарежет фотографию на бесшовную стенку профиля.\n\n"
             "Команда /help покажет режимы работы."
         )
         themed = await emoji_theme.service_text(f"👋 {text}")
@@ -290,6 +334,7 @@ def create_router(
             "Команды:\n"
             "/ask запрос — явно обратиться к боту в группе; команду можно добавить "
             "к подписи файла\n"
+            "/wall — нарезать фотографию на стенку из 3–24 частей\n"
             "/reset — начать диалог с чистым контекстом\n"
             "/cancel — остановить текущий запрос\n"
             "/status — показать модель и режим этого чата\n"
@@ -310,6 +355,138 @@ def create_router(
             "В личном чате я отвечаю на все поддерживаемые сообщения. В группе по "
             "умолчанию отвечаю на /ask, упоминание моего @username или ответ на моё "
             "сообщение."
+        )
+
+    @router.message(Command("wall", "grid", "stenka"))
+    async def wall_handler(message: Message, command: CommandObject) -> None:
+        user = message.from_user
+        if message.chat.type != "private" or user is None:
+            await message.reply(
+                "Создание стенки доступно в личном чате с ботом, "
+                "чтобы не засорять группу файлами."
+            )
+            return
+        if not await processor.can_respond(message):
+            return
+
+        argument = (command.args or "").strip().split(maxsplit=1)[0]
+        parts: int | None = None
+        if argument:
+            try:
+                parts = int(argument)
+            except ValueError:
+                parts = None
+            if parts not in WALL_PART_COUNTS:
+                allowed = ", ".join(str(value) for value in WALL_PART_COUNTS)
+                await message.reply(
+                    f"Неизвестный размер. Доступны: {allowed}.\n"
+                    "Пример: /wall 9 — сетка 3×3."
+                )
+                return
+
+        source = wall_source_from_message(message)
+        if source is not None and parts is not None:
+            await send_wall(
+                message,
+                source=source,
+                parts=parts,
+                requester_id=user.id,
+            )
+            return
+        if source is not None:
+            pending = wall.sessions.consume_photo(message.chat.id, user.id, source)
+            if pending is not None:
+                pending_parts, pending_source = pending
+                await send_wall(
+                    message,
+                    source=pending_source,
+                    parts=pending_parts,
+                    requester_id=user.id,
+                )
+                return
+            wall.sessions.remember_source(message.chat.id, user.id, source)
+            await message.reply(
+                "Фотография принята. Выберите количество частей:",
+                reply_markup=wall_keyboard(),
+            )
+            return
+        if parts is not None:
+            wall.sessions.select_parts(message.chat.id, user.id, parts)
+            await message.reply(
+                f"Выбрана сетка 3×{parts // 3}. Теперь отправьте одну фотографию "
+                "как фото или файл. Ожидание действует 10 минут."
+            )
+            return
+
+        wall.sessions.cancel(message.chat.id, user.id)
+        await message.reply(
+            "Отправьте фотографию с подписью /wall или ответьте командой /wall "
+            "на уже отправленное изображение. Затем выберите размер сетки "
+            "от 3 до 24 частей.\n\n"
+            "Можно короче: ответьте на фото командой /wall 9.",
+            reply_markup=wall_keyboard(),
+        )
+
+    @router.callback_query(F.data.startswith(WALL_CALLBACK_PREFIX))
+    async def wall_callback_handler(callback: CallbackQuery) -> None:
+        if not isinstance(callback.message, Message):
+            await callback.answer("Сообщение с настройкой уже недоступно.", show_alert=True)
+            return
+        if callback.message.chat.type != "private":
+            await callback.answer("Откройте личный чат с ботом.", show_alert=True)
+            return
+
+        user = callback.from_user
+        if callback.data == WALL_CANCEL_CALLBACK:
+            wall.sessions.cancel(callback.message.chat.id, user.id)
+            await callback.answer("Создание стенки отменено.")
+            await callback.message.edit_text("Создание стенки отменено.")
+            return
+        if callback.data == WALL_START_CALLBACK:
+            wall.sessions.cancel(callback.message.chat.id, user.id)
+            await callback.answer()
+            await callback.message.answer(
+                "Выберите количество частей, затем отправьте фотографию:",
+                reply_markup=wall_keyboard(),
+            )
+            return
+
+        parts = callback_wall_parts(callback)
+        if parts is None:
+            await callback.answer("Некорректный размер сетки.", show_alert=True)
+            return
+        source = wall.sessions.select_parts(callback.message.chat.id, user.id, parts)
+        await callback.answer()
+        if source is None:
+            await callback.message.edit_text(
+                f"Выбрана сетка 3×{parts // 3}. Теперь отправьте одну фотографию "
+                "как фото или файл. Ожидание действует 10 минут."
+            )
+            return
+        await callback.message.edit_text(
+            f"Выбрана сетка 3×{parts // 3}. Начинаю нарезку…"
+        )
+        await send_wall(
+            callback.message,
+            source=source,
+            parts=parts,
+            requester_id=user.id,
+        )
+
+    @router.message(PendingWallPhotoFilter(wall.sessions))
+    async def pending_wall_photo_handler(
+        message: Message,
+        wall_parts: int,
+        wall_source: WallSource,
+    ) -> None:
+        user = message.from_user
+        if user is None or not await processor.can_respond(message):
+            return
+        await send_wall(
+            message,
+            source=wall_source,
+            parts=wall_parts,
+            requester_id=user.id,
         )
 
     @router.message(Command("ask"))

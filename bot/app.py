@@ -22,6 +22,7 @@ from .outgoing_emoji import OutgoingEmojiMiddleware
 from .processor import MessageProcessor
 from .storage import Storage
 from .usage import UsageTracker
+from .wall import WallService
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +60,14 @@ async def run_bot(settings: Settings) -> None:
             emoji_theme=emoji_theme,
         )
         monitor = BusinessMonitor(bot=bot, settings=settings, storage=storage)
+        wall = WallService(
+            max_source_bytes=settings.wall_max_source_bytes,
+            max_pixels=settings.wall_max_pixels,
+            tile_size=settings.wall_tile_size,
+            download_timeout_seconds=settings.media_download_timeout_seconds,
+        )
         dispatcher.include_router(
-            create_router(processor, albums, monitor, usage, emoji_theme)
+            create_router(processor, albums, monitor, usage, emoji_theme, wall)
         )
         media_removed = await monitor.prune_archived_media(
             settings.business_message_retention_days
@@ -113,6 +120,7 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="start", description="Запустить бота"),
         BotCommand(command="help", description="Справка и возможности"),
         BotCommand(command="guide", description="Видеоинструкция"),
+        BotCommand(command="wall", description="Нарезать фото на стенку"),
         BotCommand(command="emoji", description="Настроить эмодзи (владелец)"),
         BotCommand(command="ask", description="Задать вопрос Gemini"),
         BotCommand(command="reset", description="Сбросить контекст"),
