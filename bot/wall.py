@@ -10,13 +10,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Filter
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaDocument,
     Message,
 )
 from PIL import (
@@ -250,19 +250,36 @@ class WallService:
             ),
         )
 
-        for group_number, paths in enumerate(media_group_batches(result.piece_paths), start=1):
-            media: list[InputMediaDocument] = []
-            for index, path in enumerate(paths):
-                caption = None
-                if group_number == 1 and index == 0:
-                    caption = "01 — загрузить первой. Файлы уже расположены по порядку."
-                media.append(
-                    InputMediaDocument(
-                        media=FSInputFile(path, filename=path.name),
-                        caption=caption,
-                    )
+        logger.info("Sending wall pieces sequentially count=%s", count)
+        for index, path in enumerate(result.piece_paths, start=1):
+            caption = f"Фрагмент {index:02d}/{count:02d}"
+            if index == 1:
+                caption += " — публикуйте первым"
+            await self._send_document_with_retry(
+                anchor,
+                path,
+                caption=caption,
+            )
+
+    async def _send_document_with_retry(
+        self,
+        anchor: Message,
+        path: Path,
+        *,
+        caption: str,
+    ) -> None:
+        for attempt in range(3):
+            try:
+                await anchor.answer_document(
+                    document=FSInputFile(path, filename=path.name),
+                    caption=caption,
+                    disable_notification=True,
                 )
-            await anchor.answer_media_group(media=media)
+                return
+            except TelegramRetryAfter as exc:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(float(exc.retry_after) + 0.1)
 
 
 def validate_wall_parts(parts: int) -> None:
@@ -315,23 +332,6 @@ def wall_source_from_message(
                 file_name=file_name,
             )
     return None
-
-
-def media_group_batches(paths: tuple[Path, ...]) -> tuple[tuple[Path, ...], ...]:
-    """Split files into Telegram-valid 2..10 item media groups."""
-    batches: list[tuple[Path, ...]] = []
-    offset = 0
-    while offset < len(paths):
-        remaining = len(paths) - offset
-        size = min(10, remaining)
-        if remaining == 11:
-            size = 9
-        batch = paths[offset : offset + size]
-        if len(batch) == 1:
-            raise WallError("Не удалось безопасно сгруппировать части стенки.")
-        batches.append(batch)
-        offset += size
-    return tuple(batches)
 
 
 def render_wall(
