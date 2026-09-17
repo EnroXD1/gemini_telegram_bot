@@ -728,7 +728,7 @@ def create_router(
                     "",
                     "Указать точный ID модели:",
                     "/model openrouter google/gemini-2.5-flash",
-                    "/model groq llama-3.1-8b-instant",
+                    "/model groq openai/gpt-oss-20b",
                     "",
                     "/model default — вернуть настройку из переменных окружения.",
                 ]

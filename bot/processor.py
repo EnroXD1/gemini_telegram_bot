@@ -24,6 +24,13 @@ from .usage import UsageTracker
 
 logger = logging.getLogger(__name__)
 
+_UNAVAILABLE_BUSINESS_PEER_ERRORS = (
+    "BUSINESS_PEER_INVALID",
+    "BUSINESS_CONNECTION_INVALID",
+    "BUSINESS_CONNECTION_NOT_ALLOWED",
+    "BUSINESS_PEER_USAGE_MISSING",
+)
+
 
 class MessageProcessor:
     def __init__(
@@ -157,6 +164,7 @@ class MessageProcessor:
                 if has_attachment:
                     await self._attachment_semaphore.acquire()
                 bundle = PromptBundle(prompt="")
+                history_user_content = ""
                 try:
                     async with show_progress(
                         lead, emoji_theme=self.emoji_theme
@@ -176,44 +184,47 @@ class MessageProcessor:
                                 result.provider or self.gemini.current_provider
                             ),
                         )
+                        history_user_content = _history_user_content(
+                            bundle,
+                            self.settings.openrouter_history_item_chars,
+                        )
 
-                    try:
-                        await self.storage.append_conversation_exchange(
-                            scope_key=scope_key,
-                            user_content=_history_user_content(
-                                bundle,
-                                self.settings.openrouter_history_item_chars,
-                            ),
-                            assistant_content=_trim_history_item(
-                                result.text,
-                                self.settings.openrouter_history_item_chars,
-                            ),
-                            max_exchanges=self.settings.openrouter_history_turns,
-                        )
-                        await self.storage.set_interaction_id(
-                            scope_key,
-                            (
-                                result.interaction_id
-                                if result.provider == "google"
-                                else None
-                            ),
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Could not persist conversation context chat_id=%s",
-                            lead.chat.id,
-                        )
                 finally:
                     # Drop the raw attachment bytes before another media request
                     # is allowed to start downloading.
                     bundle = PromptBundle(prompt="")
                     if has_attachment:
                         self._attachment_semaphore.release()
-                await self.reply(
+                sent = await self.reply(
                     lead,
                     result.text,
                     formatted=not result.truncated,
                 )
+                if not sent:
+                    return
+                try:
+                    await self.storage.append_conversation_exchange(
+                        scope_key=scope_key,
+                        user_content=history_user_content,
+                        assistant_content=_trim_history_item(
+                            result.text,
+                            self.settings.openrouter_history_item_chars,
+                        ),
+                        max_exchanges=self.settings.openrouter_history_turns,
+                    )
+                    await self.storage.set_interaction_id(
+                        scope_key,
+                        (
+                            result.interaction_id
+                            if result.provider == "google"
+                            else None
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not persist conversation context chat_id=%s",
+                        lead.chat.id,
+                    )
             except GeminiRequestError as exc:
                 await self.usage.record(
                     lead, ai_provider=self.gemini.current_provider
@@ -346,6 +357,15 @@ class MessageProcessor:
                 except TelegramRetryAfter as exc:
                     await asyncio.sleep(max(0.1, float(exc.retry_after)))
                 except TelegramBadRequest as exc:
+                    if _is_unavailable_business_peer(message, exc):
+                        logger.warning(
+                            "Telegram Business peer is unavailable; reply skipped "
+                            "chat_id=%s connection_id=%s error=%s",
+                            message.chat.id,
+                            message.business_connection_id,
+                            exc,
+                        )
+                        return sent_messages
                     if entities is None:
                         raise
                     logger.warning(
@@ -368,6 +388,17 @@ class MessageProcessor:
         )
         self._cleanup_tasks.add(task)
         task.add_done_callback(self._cleanup_tasks.discard)
+
+
+def _is_unavailable_business_peer(
+    message: Message, error: TelegramBadRequest
+) -> bool:
+    if not message.business_connection_id:
+        return False
+    normalized = str(error).upper().replace(" ", "_").replace("-", "_")
+    return any(
+        marker in normalized for marker in _UNAVAILABLE_BUSINESS_PEER_ERRORS
+    )
 
 
 def _collect_text(messages: list[Message]) -> str:

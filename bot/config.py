@@ -34,7 +34,6 @@ DEFAULT_BUSINESS_WELCOME_TEXT = """👋 Здравствуйте! Вам отв�
 /cancel — остановить текущий запрос"""
 
 DEFAULT_OPENROUTER_FALLBACK_MODELS = (
-    "openai/gpt-oss-20b:free",
     "nvidia/nemotron-3.5-lightning:free",
     "openrouter/free",
 )
@@ -262,10 +261,8 @@ class Settings:
             ),
             openrouter_api_key=openrouter_api_key,
             openrouter_model=(
-                os.getenv(
-                    "OPENROUTER_MODEL", "google/gemini-3.5-flash"
-                ).strip()
-                or "google/gemini-3.5-flash"
+                os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
+                or "openrouter/free"
             ),
             openrouter_fallback_models=_model_list(
                 "OPENROUTER_FALLBACK_MODELS",
@@ -288,8 +285,8 @@ class Settings:
                 "GROQ_FALLBACK_ENABLED", bool(groq_api_key)
             ),
             groq_model=(
-                os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
-                or "llama-3.1-8b-instant"
+                os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+                or "openai/gpt-oss-20b"
             ),
             groq_fallback_models=_model_list(
                 "GROQ_FALLBACK_MODELS", DEFAULT_GROQ_FALLBACK_MODELS

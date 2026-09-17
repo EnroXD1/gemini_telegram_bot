@@ -509,7 +509,7 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_openrouter_402_can_switch_to_free_model_without_balance(self) -> None:
         service = make_openrouter_service("unused")
         service._settings.openrouter_fallback_models = (
-            "openai/gpt-oss-20b:free",
+            "nvidia/nemotron-3.5-lightning:free",
         )
         service._openrouter_client = FakeOpenRouterClient(
             [
@@ -525,13 +525,52 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.text, "бесплатный ответ")
         self.assertEqual(
             [payload["model"] for _, payload in service._openrouter_client.calls],
-            ["google/gemini-3.5-flash", "openai/gpt-oss-20b:free"],
+            [
+                "google/gemini-3.5-flash",
+                "nvidia/nemotron-3.5-lightning:free",
+            ],
+        )
+
+    async def test_openrouter_404_skips_removed_model_and_starts_cooldown(
+        self,
+    ) -> None:
+        service = make_openrouter_service("unused")
+        service._provider = "openrouter"
+        service._model = "openai/gpt-oss-20b:free"
+        service._settings.openrouter_model = "openai/gpt-oss-20b:free"
+        service._settings.openrouter_fallback_models = (
+            "nvidia/nemotron-3.5-lightning:free",
+        )
+        service._settings.ai_fallback_cooldown_seconds = 600.0
+        service._openrouter_client = FakeOpenRouterClient(
+            [
+                FakeOpenRouterResponse({}, error_code=404),
+                FakeOpenRouterResponse(
+                    {"choices": [{"message": {"content": "первый ответ"}}]}
+                ),
+                FakeOpenRouterResponse(
+                    {"choices": [{"message": {"content": "второй ответ"}}]}
+                ),
+            ]
+        )
+
+        first = await service.generate(PromptBundle(prompt="вопрос"), None)
+        second = await service.generate(PromptBundle(prompt="ещё вопрос"), None)
+
+        self.assertEqual(first.text, "первый ответ")
+        self.assertEqual(second.text, "второй ответ")
+        self.assertEqual(
+            [payload["model"] for _, payload in service._openrouter_client.calls],
+            [
+                "openai/gpt-oss-20b:free",
+                "nvidia/nemotron-3.5-lightning:free",
+                "nvidia/nemotron-3.5-lightning:free",
+            ],
         )
 
     async def test_configured_free_models_are_added_to_fallback_pool(self) -> None:
         service = make_openrouter_service("unused")
         service._settings.openrouter_fallback_models = (
-            "openai/gpt-oss-20b:free",
             "nvidia/nemotron-3.5-lightning:free",
             "openrouter/free",
         )
@@ -547,7 +586,6 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
             [(route.provider, route.model) for route in routes],
             [
                 ("openrouter", "google/gemini-3.5-flash"),
-                ("openrouter", "openai/gpt-oss-20b:free"),
                 ("openrouter", "nvidia/nemotron-3.5-lightning:free"),
                 ("openrouter", "openrouter/free"),
                 ("groq", "llama-3.1-8b-instant"),

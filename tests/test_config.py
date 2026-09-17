@@ -61,7 +61,7 @@ def test_openrouter_provider_does_not_require_google_key(monkeypatch, tmp_path) 
 
     assert settings.ai_provider == "openrouter"
     assert settings.gemini_api_key == ""
-    assert settings.active_model == "google/gemini-3.5-flash"
+    assert settings.active_model == "openrouter/free"
 
 
 def test_openrouter_provider_requires_its_key(monkeypatch, tmp_path) -> None:
@@ -86,7 +86,7 @@ def test_groq_fallback_is_enabled_when_key_is_present(monkeypatch, tmp_path) -> 
     settings = Settings.from_env(tmp_path / "missing.env")
 
     assert settings.groq_fallback_ready is True
-    assert settings.groq_model == "llama-3.1-8b-instant"
+    assert settings.groq_model == "openai/gpt-oss-20b"
     assert settings.groq_fallback_models == (
         "openai/gpt-oss-20b",
         "llama-3.3-70b-versatile",
@@ -105,7 +105,6 @@ def test_free_model_pool_defaults_and_can_be_disabled(monkeypatch, tmp_path) -> 
     settings = Settings.from_env(tmp_path / "missing.env")
 
     assert settings.openrouter_fallback_models == (
-        "openai/gpt-oss-20b:free",
         "nvidia/nemotron-3.5-lightning:free",
         "openrouter/free",
     )
@@ -127,7 +126,7 @@ def test_groq_can_be_the_primary_provider(monkeypatch, tmp_path) -> None:
     settings = Settings.from_env(tmp_path / "missing.env")
 
     assert settings.ai_provider == "groq"
-    assert settings.active_model == "llama-3.1-8b-instant"
+    assert settings.active_model == "openai/gpt-oss-20b"
 
 
 def test_ai_continuations_default_to_two(monkeypatch, tmp_path) -> None:

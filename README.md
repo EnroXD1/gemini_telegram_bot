@@ -1,6 +1,6 @@
 # Telegram-бот с Gemini, OpenRouter и резервом Groq
 
-**Текущая версия: 1.10.2**
+**Текущая версия: 1.10.3**
 
 Готовый асинхронный Telegram-бот, который умеет обращаться к Gemini напрямую
 или через OpenRouter, а при исчерпании лимита выбранной модели — автоматически
@@ -15,14 +15,24 @@ polling, поэтому домен и HTTPS-сертификат для перв
 - официальный Google Gen AI SDK 2.11+;
 - прямой Google API, OpenRouter или Groq, выбираемый через `.env` или командой
   владельца;
-- модели `gemini-3.6-flash` для Google, `google/gemini-3.5-flash` для OpenRouter
-  и `llama-3.1-8b-instant` для Groq, а также настраиваемый пул бесплатных
+- модели `gemini-3.6-flash` для Google, динамический `openrouter/free` для OpenRouter
+  и `openai/gpt-oss-20b` для Groq, а также настраиваемый пул бесплатных
   моделей OpenRouter и Groq;
 - SQLite для настроек, ограниченной истории, Business-снимков и минимальной
   статистики использования.
 - Pillow 12+ для безопасной локальной нарезки фотографий без обращения к AI.
 
-## Версия 1.10.2
+## Версия 1.10.3
+
+- Удалён недоступный `openai/gpt-oss-20b:free`; бесплатный маршрут OpenRouter
+  теперь начинается с `openrouter/free`, а затем пробует Nemotron 3.5 Lightning.
+- Ответ `404` от удалённой модели больше не обрывает всю резервную цепочку:
+  бот переключается на следующий маршрут и временно не повторяет неудачный ID.
+- Ошибка Telegram Business `BUSINESS_PEER_INVALID` больше не вызывает второе
+  аварийное сообщение; недоставленный ответ не записывается в историю диалога.
+- Бесплатная модель Groq по умолчанию заменена на `openai/gpt-oss-20b`.
+
+### Версия 1.10.2
 
 - Фрагменты стенки больше не отправляются альбомами документов: Telegram мог
   визуально переставить файлы внутри медиагруппы, например показать `18` после
@@ -417,7 +427,7 @@ GEMINI_API_KEY=ключ_из_Google_AI_Studio
 TELEGRAM_BOT_TOKEN=токен_от_BotFather
 AI_PROVIDER=openrouter
 OPENROUTER_API_KEY=ключ_из_OpenRouter
-OPENROUTER_MODEL=google/gemini-3.5-flash
+OPENROUTER_MODEL=openrouter/free
 ```
 
 5. Запустите:
@@ -452,7 +462,7 @@ docker compose logs -f bot
 2. Используйте стандартную Python-сборку Bothost (`requirements.txt` уже есть).
    Собственный `Dockerfile` также поддерживается, но для этого проекта не нужен.
 3. Для OpenRouter добавьте `AI_PROVIDER=openrouter`, `OPENROUTER_API_KEY` и
-   `OPENROUTER_MODEL=google/gemini-3.5-flash`. Для прямого Google API добавьте
+   `OPENROUTER_MODEL=openrouter/free`. Для прямого Google API добавьте
    `GEMINI_API_KEY`; для ключа Vertex AI Express Mode (например, с префиксом
    `AQ.`) также установите `GEMINI_VERTEX_AI=true`. Если токен из формы
    создания не передаётся в контейнер, добавьте его как
@@ -540,14 +550,14 @@ Telegram с включённой приватностью отдаёт боту 
 | `AI_PROVIDER` | `google` | `google`, `openrouter` или `groq` |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | ID модели Gemini |
 | `GEMINI_VERTEX_AI` | `false` | Использовать Vertex AI Express Mode |
-| `OPENROUTER_MODEL` | `google/gemini-3.5-flash` | Модель через OpenRouter |
-| `OPENROUTER_FALLBACK_MODELS` | три бесплатных маршрута | Резервный пул OpenRouter через запятую |
+| `OPENROUTER_MODEL` | `openrouter/free` | Динамический бесплатный маршрут OpenRouter |
+| `OPENROUTER_FALLBACK_MODELS` | два бесплатных маршрута | Резервный пул OpenRouter через запятую |
 | `OPENROUTER_HISTORY_TURNS` | `6` | Число локальных обменов в контексте |
 | `OPENROUTER_HISTORY_MAX_CHARS` | `16000` | Общий лимит передаваемой истории |
 | `OPENROUTER_HISTORY_RETENTION_DAYS` | `30` | Срок неактивной локальной истории |
 | `GROQ_API_KEY` | пусто | Ключ бесплатного текстового резерва Groq |
 | `GROQ_FALLBACK_ENABLED` | зависит от ключа | Разрешить Groq участвовать в резервной цепочке |
-| `GROQ_MODEL` | `llama-3.1-8b-instant` | Резервная текстовая модель Groq |
+| `GROQ_MODEL` | `openai/gpt-oss-20b` | Резервная текстовая модель Groq |
 | `GROQ_FALLBACK_MODELS` | `gpt-oss-20b`, `llama-3.3-70b` | Дополнительный бесплатный пул Groq |
 | `GROQ_MAX_OUTPUT_TOKENS` | `1024` | Лимит ответа резерва, экономящий бесплатную квоту |
 | `GEMINI_SYSTEM_PROMPT` | встроенный русский prompt | Роль и стиль бота |

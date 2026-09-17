@@ -15,10 +15,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-from .config import (
-    DEFAULT_OPENROUTER_FALLBACK_MODELS,
-    Settings,
-)
+from .config import Settings
 from .gemini_response import (
     extract_interaction_id,
     extract_interaction_status,
@@ -32,7 +29,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/"
 OPENROUTER_APP_URL = "https://github.com/EnroXD1/gemini_telegram_bot"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1/"
 _OPENROUTER_MEDIA_UNSUPPORTED_MODELS = frozenset(
-    DEFAULT_OPENROUTER_FALLBACK_MODELS[:2]
+    {"nvidia/nemotron-3.5-lightning:free"}
 )
 
 
@@ -207,7 +204,7 @@ class GeminiService:
         if self._provider == "openrouter":
             self._model = getattr(settings, "openrouter_model", "openrouter/free")
         elif self._provider == "groq":
-            self._model = getattr(settings, "groq_model", "llama-3.1-8b-instant")
+            self._model = getattr(settings, "groq_model", "openai/gpt-oss-20b")
         else:
             self._model = getattr(settings, "gemini_model", "gemini-3.6-flash")
         self._interactions_available = False
@@ -528,7 +525,8 @@ class GeminiService:
     def _start_route_cooldown(
         self, route: _ModelRoute, error: GeminiRequestError
     ) -> None:
-        if not error.quota_exhausted:
+        model_missing = route.provider == "openrouter" and error.status_code == 404
+        if not error.quota_exhausted and not model_missing:
             return
         seconds = float(
             getattr(self._settings, "ai_fallback_cooldown_seconds", 600.0)
@@ -991,7 +989,10 @@ class GeminiService:
                         delete_after_seconds=20.0 if code == 429 else None,
                         provider="openrouter",
                         status_code=code,
-                        fallback_allowed=_allows_automatic_fallback(exc, code),
+                        fallback_allowed=(
+                            code == 404
+                            or _allows_automatic_fallback(exc, code)
+                        ),
                         quota_exhausted=_is_quota_error(exc, code),
                         fallback_reason=(
                             "blocked" if _is_safety_block_error(exc) else None
@@ -1733,6 +1734,11 @@ def _friendly_openrouter_error(code: int | None) -> str:
         return (
             "На балансе OpenRouter недостаточно средств для этого запроса. "
             "Владельцу бота нужно пополнить баланс."
+        )
+    if code == 404:
+        return (
+            "Выбранная модель OpenRouter больше недоступна. "
+            "Пробую следующий настроенный маршрут."
         )
     if code == 429:
         return "Лимит запросов OpenRouter временно исчерпан. Попробуйте немного позже."
