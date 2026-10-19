@@ -13,10 +13,13 @@ from bot.control_panel import create_control_router, diagnostics_view, restore_a
 from bot.gemini import GeminiRequestError, GeminiService, ModelSelectionError
 from bot.handlers import create_router
 from bot.keyboards import (
+    BACK_BUTTON,
     DIAGNOSTICS_BUTTON,
     HELP_BUTTON,
     HIDE_KEYBOARD_BUTTON,
+    MORE_BUTTON,
     RESET_BUTTON,
+    SETTINGS_BUTTON,
     STATUS_BUTTON,
     WALL_BUTTON,
     main_keyboard,
@@ -386,9 +389,47 @@ async def test_diagnostics_command_and_reply_button_reach_same_report(panel, tex
 
 
 def test_regular_users_keyboard_does_not_expose_owner_controls():
-    keyboard = main_keyboard(owner=False)
-    assert len(keyboard.keyboard) == 3
-    assert len(main_keyboard(owner=True).keyboard) == 4
+    for page in ("main", "other"):
+        keyboard = main_keyboard(owner=False, page=page)
+        labels = {button.text for row in keyboard.keyboard for button in row}
+        assert SETTINGS_BUTTON not in labels
+        assert DIAGNOSTICS_BUTTON not in labels
+        assert HIDE_KEYBOARD_BUTTON not in labels
+
+
+@pytest.mark.parametrize("user_id", [42, 99])
+async def test_reply_menu_navigation_changes_pages_without_ai_requests(panel, user_id):
+    bot, dispatcher, processor, session = panel
+    processor.process = AsyncMock()
+
+    async def press(text):
+        update = Update.model_validate(
+            {
+                "update_id": 4,
+                "message": {
+                    "message_id": 4,
+                    "date": 0,
+                    "text": text,
+                    "from": {"id": user_id, "is_bot": False, "first_name": "user"},
+                    "chat": {"id": user_id, "type": "private"},
+                },
+            }
+        )
+        await dispatcher.feed_update(bot, update)
+        return {
+            button.text for row in session.calls[-1].reply_markup.keyboard for button in row
+        }
+
+    other = await press(MORE_BUTTON)
+    assert BACK_BUTTON in other and STATUS_BUTTON in other
+    assert MORE_BUTTON not in other and HIDE_KEYBOARD_BUTTON not in other
+    assert (SETTINGS_BUTTON in other) == (user_id == 42)
+    assert (DIAGNOSTICS_BUTTON in other) == (user_id == 42)
+    main = await press(BACK_BUTTON)
+    assert MORE_BUTTON in main and RESET_BUTTON in main and WALL_BUTTON in main
+    assert BACK_BUTTON not in main and HIDE_KEYBOARD_BUTTON not in main
+    assert await press("/menu") == main
+    processor.process.assert_not_awaited()
 
 
 @pytest.mark.parametrize("text", ["/hidekeyboard", HIDE_KEYBOARD_BUTTON])

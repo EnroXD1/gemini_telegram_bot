@@ -20,8 +20,10 @@ from aiogram.types import (
 from . import __version__
 from .gemini import GeminiService, ModelSelectionError, _is_free_openrouter_route
 from .keyboards import (
+    BACK_BUTTON,
     DIAGNOSTICS_BUTTON,
     HIDE_KEYBOARD_BUTTON,
+    MORE_BUTTON,
     SETTINGS_BUTTON,
     main_keyboard,
 )
@@ -211,14 +213,25 @@ def create_control_router(processor: MessageProcessor) -> Router:
                 raise
 
     @router.message(Command("menu"))
+    @router.message(
+        F.text.in_({MORE_BUTTON, BACK_BUTTON}),
+        F.chat.type == "private",
+        ~F.business_connection_id,
+    )
     async def menu_handler(message: Message) -> None:
         if message.chat.type != "private" or message.business_connection_id:
             await message.reply("Меню доступно в личном чате с ботом.")
             return
         owner = bool(message.from_user and message.from_user.id in processor.settings.owner_ids)
+        page = "other" if message.text == MORE_BUTTON else "main"
+        text = (
+            "Дополнительное меню. «Назад» — вернуться к основным действиям."
+            if page == "other"
+            else "⌨️ Главное меню. Вопрос можно написать обычным сообщением."
+        )
         await message.reply(
-            "⌨️ Меню открыто. Вопрос можно написать обычным сообщением.",
-            reply_markup=main_keyboard(owner=owner),
+            text,
+            reply_markup=main_keyboard(owner=owner, page=page),
         )
 
     @router.message(Command("hidekeyboard"))

@@ -1,3 +1,5 @@
+from typing import Literal
+
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -14,13 +16,19 @@ HELP_BUTTON = "ℹ️ Помощь"
 SETTINGS_BUTTON = "⚙️ Настройки"
 DIAGNOSTICS_BUTTON = "🩺 Диагностика"
 HIDE_KEYBOARD_BUTTON = "⌨️ Скрыть клавиатуру"
+MORE_BUTTON = "➡️ Другое"
+BACK_BUTTON = "⬅️ Назад"
 
 
-def main_keyboard(*, owner: bool = False) -> ReplyKeyboardMarkup:
-    rows = [[RESET_BUTTON, WALL_BUTTON], [STATUS_BUTTON, HELP_BUTTON]]
-    if owner:
-        rows.append([SETTINGS_BUTTON, DIAGNOSTICS_BUTTON])
-    rows.append([HIDE_KEYBOARD_BUTTON])
+def main_keyboard(
+    *, owner: bool = False, page: Literal["main", "other"] = "main"
+) -> ReplyKeyboardMarkup:
+    if page == "other":
+        rows = [[STATUS_BUTTON, BACK_BUTTON]]
+        if owner:
+            rows.insert(0, [SETTINGS_BUTTON, DIAGNOSTICS_BUTTON])
+    else:
+        rows = [[RESET_BUTTON, WALL_BUTTON], [HELP_BUTTON, MORE_BUTTON]]
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=text) for text in row] for row in rows],
         resize_keyboard=True,
