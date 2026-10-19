@@ -19,7 +19,12 @@ from aiogram.types import (
 
 from . import __version__
 from .gemini import GeminiService, ModelSelectionError, _is_free_openrouter_route
-from .keyboards import DIAGNOSTICS_BUTTON, SETTINGS_BUTTON, main_keyboard
+from .keyboards import (
+    DIAGNOSTICS_BUTTON,
+    HIDE_KEYBOARD_BUTTON,
+    SETTINGS_BUTTON,
+    main_keyboard,
+)
 from .processor import MessageProcessor
 from .storage import Storage
 
@@ -217,6 +222,9 @@ def create_control_router(processor: MessageProcessor) -> Router:
         )
 
     @router.message(Command("hidekeyboard"))
+    @router.message(
+        F.text == HIDE_KEYBOARD_BUTTON, F.chat.type == "private", ~F.business_connection_id
+    )
     async def hide_keyboard_handler(message: Message) -> None:
         if message.chat.type == "private" and not message.business_connection_id:
             await message.reply(

@@ -7,7 +7,7 @@ import httpx
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
-from aiogram.types import Chat, Message, Update, User
+from aiogram.types import Chat, Message, ReplyKeyboardRemove, Update, User
 
 from bot.control_panel import create_control_router, diagnostics_view, restore_ai_settings
 from bot.gemini import GeminiRequestError, GeminiService, ModelSelectionError
@@ -15,6 +15,7 @@ from bot.handlers import create_router
 from bot.keyboards import (
     DIAGNOSTICS_BUTTON,
     HELP_BUTTON,
+    HIDE_KEYBOARD_BUTTON,
     RESET_BUTTON,
     STATUS_BUTTON,
     WALL_BUTTON,
@@ -386,8 +387,30 @@ async def test_diagnostics_command_and_reply_button_reach_same_report(panel, tex
 
 def test_regular_users_keyboard_does_not_expose_owner_controls():
     keyboard = main_keyboard(owner=False)
-    assert len(keyboard.keyboard) == 2
-    assert len(main_keyboard(owner=True).keyboard) == 3
+    assert len(keyboard.keyboard) == 3
+    assert len(main_keyboard(owner=True).keyboard) == 4
+
+
+@pytest.mark.parametrize("text", ["/hidekeyboard", HIDE_KEYBOARD_BUTTON])
+async def test_hide_keyboard_button_and_command_remove_reply_keyboard(panel, text):
+    bot, dispatcher, _, session = panel
+    update = Update.model_validate(
+        {
+            "update_id": 3,
+            "message": {
+                "message_id": 3,
+                "date": 0,
+                "text": text,
+                "from": {"id": 99, "is_bot": False, "first_name": "user"},
+                "chat": {"id": 99, "type": "private"},
+            },
+        }
+    )
+    await dispatcher.feed_update(bot, update)
+    response = session.calls[-1]
+    assert isinstance(response.reply_markup, ReplyKeyboardRemove)
+    assert response.reply_markup.remove_keyboard
+    assert "/menu" in response.text
 
 
 @pytest.mark.parametrize("text", [RESET_BUTTON, WALL_BUTTON, STATUS_BUTTON, HELP_BUTTON])
