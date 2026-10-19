@@ -196,6 +196,7 @@ class Settings:
     reply_chunk_size: int
     drop_pending_updates: bool
     log_level: str
+    ai_free_only: bool = False
 
     @property
     def active_model(self) -> str:
@@ -370,4 +371,5 @@ class Settings:
             reply_chunk_size=reply_chunk_size,
             drop_pending_updates=_bool("DROP_PENDING_UPDATES", False),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
+            ai_free_only=_bool("AI_FREE_ONLY", False),
         )

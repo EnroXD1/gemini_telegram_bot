@@ -305,6 +305,29 @@ class Storage:
             await db.execute("DELETE FROM conversation_exchanges")
             await db.commit()
 
+    async def set_ai_preferences(
+        self, *, free_only: bool, provider: str, model: str
+    ) -> None:
+        """Persist the spending guard and its compatible selection atomically."""
+        db = self._connection()
+        now = int(time.time())
+        async with self._lock:
+            await db.executemany(
+                """
+                INSERT INTO runtime_settings(setting_key, setting_value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    ("ai_free_only", "true" if free_only else "false", now),
+                    ("ai_provider", provider, now),
+                    ("ai_model", model, now),
+                ),
+            )
+            await db.commit()
+
     async def get_interaction_id(self, scope_key: str) -> str | None:
         db = self._connection()
         async with self._lock:

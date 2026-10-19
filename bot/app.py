@@ -14,8 +14,9 @@ from . import __version__
 from .album import AlbumBuffer
 from .business import BusinessMonitor
 from .config import Settings
+from .control_panel import create_control_router, restore_ai_settings
 from .emoji_theme import EmojiTheme
-from .gemini import GeminiService, ModelSelectionError
+from .gemini import GeminiService
 from .handlers import create_router
 from .media import MediaExtractor
 from .outgoing_emoji import OutgoingEmojiMiddleware
@@ -36,12 +37,7 @@ async def run_bot(settings: Settings) -> None:
 
     try:
         await storage.open()
-        saved_selection = await storage.get_ai_selection()
-        if saved_selection is not None:
-            try:
-                gemini.select_model(*saved_selection)
-            except ModelSelectionError as exc:
-                logger.warning("Ignoring unavailable saved AI selection: %s", exc)
+        await restore_ai_settings(storage, gemini)
         owners_removed = await storage.delete_bot_users(settings.owner_ids)
         if owners_removed:
             logger.info("Removed %s configured owners from usage audit", owners_removed)
@@ -66,6 +62,7 @@ async def run_bot(settings: Settings) -> None:
             tile_size=settings.wall_tile_size,
             download_timeout_seconds=settings.media_download_timeout_seconds,
         )
+        dispatcher.include_router(create_control_router(processor))
         dispatcher.include_router(
             create_router(processor, albums, monitor, usage, emoji_theme, wall)
         )
@@ -90,12 +87,13 @@ async def run_bot(settings: Settings) -> None:
         await bot.delete_webhook(drop_pending_updates=settings.drop_pending_updates)
 
         logger.info(
-            "Starting @%s v%s with provider=%s model=%s fallback=%s",
+            "Starting @%s v%s with provider=%s model=%s fallback=%s free_only=%s",
             bot_user.username,
             __version__,
             gemini.current_provider,
             gemini.current_model,
             settings.groq_model if settings.groq_fallback_ready else "disabled",
+            gemini.free_only,
         )
         await dispatcher.start_polling(
             bot,
@@ -119,6 +117,10 @@ async def _set_commands(bot: Bot) -> None:
     private_commands = [
         BotCommand(command="start", description="Запустить бота"),
         BotCommand(command="help", description="Справка и возможности"),
+        BotCommand(command="menu", description="Показать клавиатуру"),
+        BotCommand(command="hidekeyboard", description="Скрыть клавиатуру"),
+        BotCommand(command="settings", description="Настройки бота (владелец)"),
+        BotCommand(command="diagnostics", description="Диагностика моделей (владелец)"),
         BotCommand(command="guide", description="Видеоинструкция"),
         BotCommand(command="wall", description="Нарезать фото на стенку"),
         BotCommand(command="emoji", description="Настроить эмодзи (владелец)"),

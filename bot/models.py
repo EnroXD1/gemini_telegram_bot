@@ -30,3 +30,4 @@ class GeminiResult:
     context_was_reset: bool = False
     provider: str | None = None
     truncated: bool = False
+    model: str | None = None

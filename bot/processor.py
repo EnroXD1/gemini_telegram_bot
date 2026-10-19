@@ -12,6 +12,7 @@ from aiogram.types import Message, User
 from .config import Settings
 from .emoji_theme import EmojiTheme
 from .gemini import GeminiRequestError, GeminiService
+from .keyboards import answer_keyboard
 from .markdown import FormattedChunk, render_markdown_chunks
 from .media import MediaExtractor
 from .models import ConversationMessage, PromptBundle
@@ -199,6 +200,7 @@ class MessageProcessor:
                     lead,
                     result.text,
                     formatted=not result.truncated,
+                    controls=True,
                 )
                 if not sent:
                     return
@@ -328,7 +330,7 @@ class MessageProcessor:
         return True
 
     async def reply(
-        self, message: Message, text: str, *, formatted: bool = True
+        self, message: Message, text: str, *, formatted: bool = True, controls: bool = False
     ) -> list[Message]:
         if formatted:
             chunks = render_markdown_chunks(text, self.settings.reply_chunk_size)
@@ -342,6 +344,10 @@ class MessageProcessor:
         sent_messages: list[Message] = []
         for index, chunk in enumerate(chunks):
             entities = list(chunk.entities) or None
+            kwargs = {}
+            if (controls and index == len(chunks) - 1 and message.chat.type == "private"
+                    and not message.business_connection_id):
+                kwargs["reply_markup"] = answer_keyboard()
             while True:
                 try:
                     if index == 0:
@@ -349,9 +355,10 @@ class MessageProcessor:
                             chunk.text,
                             entities=entities,
                             allow_sending_without_reply=True,
+                            **kwargs,
                         )
                     else:
-                        sent = await message.answer(chunk.text, entities=entities)
+                        sent = await message.answer(chunk.text, entities=entities, **kwargs)
                     sent_messages.append(sent)
                     break
                 except TelegramRetryAfter as exc:

@@ -6,9 +6,11 @@ import gc
 import json
 import logging
 import random
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
@@ -21,7 +23,8 @@ from .gemini_response import (
     extract_interaction_status,
     extract_interaction_text,
 )
-from .models import ConversationMessage, GeminiResult, PromptBundle
+from .model_health import ModelHealth, error_label
+from .models import ConversationMessage, GeminiResult, MediaPayload, PromptBundle
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +247,104 @@ class GeminiService:
             self._client = genai.Client(**client_kwargs)
             self._interactions_available = not settings.gemini_vertex_ai
 
+        self._free_only = False
+        self._health = ModelHealth()
+        self._catalog: dict[str, bool] | None = None
+        self._catalog_checked_at = 0.0
+        self._catalog_attempted_at = 0.0
+        self._catalog_error: str | None = None
+        self._catalog_lock = asyncio.Lock()
+        if getattr(settings, "ai_free_only", False):
+            # Starting without OpenRouter remains possible so the owner can
+            # inspect configuration; generation will fail closed in this mode.
+            self._free_only = True
+            if self._openrouter_client is not None:
+                self._provider, self._model = "openrouter", "openrouter/free"
+
+    @property
+    def free_only(self) -> bool:
+        return getattr(self, "_free_only", False)
+
+    @property
+    def health(self) -> ModelHealth:
+        if not hasattr(self, "_health"):
+            self._health = ModelHealth()
+        return self._health
+
+    def set_free_only(self, enabled: bool, *, allow_unconfigured: bool = False) -> None:
+        if enabled and self._openrouter_client is None and not allow_unconfigured:
+            raise ModelSelectionError(
+                "Для режима «Только бесплатно» нужен OPENROUTER_API_KEY. "
+                "Тариф Google/Groq по ключу проверить нельзя."
+            )
+        self._free_only = enabled
+        if (enabled and self._openrouter_client is not None
+                and not _is_free_openrouter_route(self._provider, self._model)):
+            self._provider, self._model = "openrouter", "openrouter/free"
+
+    @property
+    def catalog_state(self) -> str:
+        if getattr(self, "_catalog_error", None):
+            return "error"
+        return "loaded" if getattr(self, "_catalog", None) is not None else "unknown"
+
+    async def refresh_model_catalog(self) -> bool:
+        """Refresh metadata, never generate a test completion or reveal API errors."""
+        if self._openrouter_client is None:
+            return False
+        if not hasattr(self, "_catalog_lock"):
+            self._catalog_lock = asyncio.Lock()
+        async with self._catalog_lock:
+            now = time.monotonic()
+            previous = getattr(self, "_catalog_attempted_at", 0.0)
+            delay = 3600 if getattr(self, "_catalog_error", None) is None else 60
+            if previous and now - previous < delay:
+                return getattr(self, "_catalog", None) is not None
+            self._catalog_attempted_at = now
+            try:
+                response = await self._openrouter_client.get("models", timeout=15.0)
+                response.raise_for_status()
+                rows = response.json()["data"]
+                if not isinstance(rows, list) or not rows:
+                    raise ValueError("Invalid models catalogue")
+                catalog = {
+                    row["id"]: _has_zero_pricing(row.get("pricing"))
+                    for row in rows[:5000]
+                    if isinstance(row, dict) and isinstance(row.get("id"), str)
+                }
+                if not catalog:
+                    raise ValueError("Empty models catalogue")
+                self._catalog = catalog
+                self._catalog_checked_at = now
+                self._catalog_error = None
+                return True
+            except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                self._catalog_error = error_label(_error_code(exc))
+                logger.warning(
+                    "Could not refresh OpenRouter model catalogue code=%s", _error_code(exc)
+                )
+                return False
+
+    def route_allowed(self, provider: str, model: str) -> bool:
+        return not self.free_only or _is_free_openrouter_route(provider, model)
+
+    def route_catalog_status(self, provider: str, model: str) -> str | None:
+        catalog = getattr(self, "_catalog", None)
+        if provider != "openrouter" or catalog is None or model == "openrouter/free":
+            return None
+        if time.monotonic() - getattr(self, "_catalog_checked_at", 0.0) > 3600:
+            return None
+        if model not in catalog:
+            return "нет в актуальном каталоге"
+        if self.free_only and not catalog[model]:
+            return "нулевая цена не подтверждена каталогом"
+        return None
+
+    def cooldown_remaining(self, provider: str, model: str) -> float:
+        cooldowns = getattr(self, "_route_cooldowns", {})
+        until = max(cooldowns.get((provider, model), 0), cooldowns.get((provider, "*"), 0))
+        return max(0.0, until - time.monotonic())
+
     @property
     def current_provider(self) -> str:
         return self._provider
@@ -289,6 +390,12 @@ class GeminiService:
             raise ModelSelectionError("ID модели должен содержать от 1 до 200 символов.")
         if any(ord(character) < 32 for character in selected_model):
             raise ModelSelectionError("ID модели содержит недопустимые символы.")
+        if not self.route_allowed(normalized, selected_model):
+            raise ModelSelectionError(
+                "В режиме «Только бесплатно» разрешены openrouter/free и ID "
+                "OpenRouter с окончанием :free. Google/Groq исключены: "
+                "наличие ключа не подтверждает бесплатный тариф."
+            )
         self._provider = normalized
         self._model = selected_model
         cooldowns = getattr(self, "_route_cooldowns", None)
@@ -311,6 +418,8 @@ class GeminiService:
         history: tuple[ConversationMessage, ...] = (),
         on_fallback: FallbackNotifier | None = None,
     ) -> GeminiResult:
+        if self.free_only:
+            await self.refresh_model_catalog()
         routes = self._candidate_routes(bundle)
         automatic_fallback = getattr(
             self._settings, "ai_auto_fallback_enabled", True
@@ -348,6 +457,7 @@ class GeminiService:
                         route.provider,
                         route.model,
                     )
+            started = time.monotonic()
             try:
                 attempted += 1
                 logger.info(
@@ -364,21 +474,34 @@ class GeminiService:
                         media_semaphore = asyncio.Semaphore(1)
                         self._media_semaphore = media_semaphore
                     async with media_semaphore:
-                        return await self._generate_route(
+                        result = await self._generate_route(
                             route,
                             bundle,
                             previous_interaction_id,
                             history,
                             is_fallback=failed_route is not None,
                         )
-                return await self._generate_route(
-                    route,
-                    bundle,
-                    previous_interaction_id,
-                    history,
-                    is_fallback=failed_route is not None,
+                else:
+                    result = await self._generate_route(
+                        route,
+                        bundle,
+                        previous_interaction_id,
+                        history,
+                        is_fallback=failed_route is not None,
+                    )
+                self.health.record(
+                    route.provider, route.model, started,
+                    actual_model=result.model, truncated=result.truncated,
                 )
+                return replace(result, provider=result.provider or route.provider)
             except GeminiRequestError as exc:
+                self.health.record(
+                    route.provider, route.model, started,
+                    error=error_label(
+                        exc.status_code, blocked=exc.fallback_reason == "blocked"
+                    ),
+                    code=exc.status_code,
+                )
                 failed_route = route
                 notify_switch = True
                 if not automatic_fallback or not exc.fallback_allowed:
@@ -400,6 +523,11 @@ class GeminiService:
             ) from last_error
         if last_error is not None:
             raise last_error
+        if self.free_only:
+            raise GeminiRequestError(
+                "Нет доступной бесплатной модели для этого запроса. "
+                "Платные маршруты отключены. Владельцу: /diagnostics."
+            )
         raise GeminiRequestError(
             "Для этого запроса нет доступной AI-модели. Владельцу бота нужно "
             "проверить настроенные API-ключи."
@@ -409,7 +537,28 @@ class GeminiService:
         routes = self._candidate_routes(PromptBundle(prompt=""))
         return tuple((route.provider, route.model) for route in routes[1:])
 
+    def configured_routes(self) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            (route.provider, route.model)
+            for route in self._configured_routes(PromptBundle(prompt=""))
+        )
+
+    def effective_routes(self, *, media: bool = False) -> tuple[tuple[str, str], ...]:
+        bundle = PromptBundle(prompt="")
+        if media:
+            bundle = PromptBundle("", (MediaPayload("photo", "image", "image/jpeg", b""),))
+        return tuple((route.provider, route.model) for route in self._candidate_routes(bundle))
+
     def _candidate_routes(self, bundle: PromptBundle) -> list[_ModelRoute]:
+        available = self.configured_providers()
+        return [
+            route for route in self._configured_routes(bundle)
+            if route.provider in available
+            and self.route_allowed(route.provider, route.model)
+            and self.route_catalog_status(route.provider, route.model) is None
+        ]
+
+    def _configured_routes(self, bundle: PromptBundle) -> list[_ModelRoute]:
         primary = _ModelRoute(self._provider, self._model)
         routes = [primary]
         if not getattr(self._settings, "ai_auto_fallback_enabled", True):
@@ -474,6 +623,12 @@ class GeminiService:
         *,
         is_fallback: bool,
     ) -> GeminiResult:
+        if not self.route_allowed(route.provider, route.model):
+            raise GeminiRequestError(
+                "Маршрут отключён режимом «Только бесплатно».",
+                provider=route.provider,
+                fallback_allowed=True,
+            )
         if route.provider == "openrouter":
             if bundle.media and not _openrouter_model_supports_media(route.model):
                 raise GeminiRequestError(
@@ -834,12 +989,19 @@ class GeminiService:
         )
         request_messages = base_messages
         combined_text = ""
+        actual_model: str | None = None
         continuation_count = 0
         attempt = 0
 
         async with self._semaphore:
             while True:
                 try:
+                    if not self.route_allowed("openrouter", model):
+                        raise GeminiRequestError(
+                            "Маршрут отключён режимом «Только бесплатно».",
+                            provider="openrouter", fallback_allowed=True,
+                        )
+                    options = _free_openrouter_options(bundle) if self.free_only else {}
                     async with asyncio.timeout(
                         self._settings.gemini_timeout_seconds
                     ):
@@ -856,6 +1018,7 @@ class GeminiService:
                                     self._settings.gemini_max_output_tokens
                                 ),
                                 combined_text=combined_text,
+                                request_options=options,
                             )
                             response = await client.post(
                                 "chat/completions",
@@ -874,6 +1037,7 @@ class GeminiService:
                                     self._settings.gemini_max_output_tokens
                                 ),
                                 "stream": False,
+                                **options,
                             }
                             response = await client.post(
                                 "chat/completions", json=payload
@@ -895,6 +1059,7 @@ class GeminiService:
                     combined_text = _merge_continuation(
                         combined_text, completion.text
                     )
+                    actual_model = _safe_model_id(completion.model)
                     truncated = _needs_continuation(completion.finish_reason)
                     logger.info(
                         "OpenRouter completion model=%s finish_reason=%s "
@@ -923,6 +1088,7 @@ class GeminiService:
                         context_was_reset=bool(previous_interaction_id),
                         provider="openrouter",
                         truncated=truncated,
+                        model=actual_model,
                     )
                 except GeminiRequestError:
                     if combined_text:
@@ -932,6 +1098,7 @@ class GeminiService:
                             context_was_reset=bool(previous_interaction_id),
                             provider="openrouter",
                             truncated=True,
+                            model=actual_model,
                         )
                     raise
                 except TimeoutError as exc:
@@ -945,6 +1112,7 @@ class GeminiService:
                             context_was_reset=bool(previous_interaction_id),
                             provider="openrouter",
                             truncated=True,
+                            model=actual_model,
                         )
                     raise GeminiRequestError(
                         "OpenRouter не успел получить ответ модели за отведённое "
@@ -983,6 +1151,7 @@ class GeminiService:
                             context_was_reset=bool(previous_interaction_id),
                             provider="openrouter",
                             truncated=True,
+                            model=actual_model,
                         )
                     raise GeminiRequestError(
                         _friendly_openrouter_error(code),
@@ -1013,10 +1182,16 @@ class GeminiService:
         base_messages = messages
         request_messages = base_messages
         combined_text = ""
+        actual_model: str | None = None
         continuation_count = 0
         attempt = 0
         while True:
             try:
+                if self.free_only:
+                    raise GeminiRequestError(
+                        "Groq отключён режимом «Только бесплатно».",
+                        provider="groq", fallback_allowed=True,
+                    )
                 payload = {
                     "model": model,
                     "messages": request_messages,
@@ -1044,6 +1219,7 @@ class GeminiService:
                 combined_text = _merge_continuation(
                     combined_text, completion.text
                 )
+                actual_model = _safe_model_id(completion.model)
                 truncated = _needs_continuation(completion.finish_reason)
                 logger.info(
                     "Groq completion model=%s finish_reason=%s continuation=%s",
@@ -1070,6 +1246,7 @@ class GeminiService:
                     context_was_reset=bool(previous_interaction_id),
                     provider="groq",
                     truncated=truncated,
+                    model=actual_model,
                 )
             except GeminiRequestError:
                 if combined_text:
@@ -1079,6 +1256,7 @@ class GeminiService:
                         context_was_reset=bool(previous_interaction_id),
                         provider="groq",
                         truncated=True,
+                        model=actual_model,
                     )
                 raise
             except TimeoutError as exc:
@@ -1092,6 +1270,7 @@ class GeminiService:
                         context_was_reset=bool(previous_interaction_id),
                         provider="groq",
                         truncated=True,
+                        model=actual_model,
                     )
                 label = "Резервная модель Groq" if is_fallback else "Модель Groq"
                 raise GeminiRequestError(
@@ -1130,6 +1309,7 @@ class GeminiService:
                         context_was_reset=bool(previous_interaction_id),
                         provider="groq",
                         truncated=True,
+                        model=actual_model,
                     )
                 raise GeminiRequestError(
                     _friendly_groq_error(code, is_fallback=is_fallback),
@@ -1296,6 +1476,7 @@ def _build_openrouter_media_body(
     temperature: float,
     max_tokens: int,
     combined_text: str,
+    request_options: dict[str, Any] | None = None,
 ) -> _OpenRouterMediaBody:
     if not bundle.media:
         raise ValueError("Streaming OpenRouter body requires media")
@@ -1390,10 +1571,48 @@ def _build_openrouter_media_body(
             _json_bytes(temperature),
             b',"max_tokens":',
             _json_bytes(max_tokens),
-            b',"stream":false}',
+            b',"stream":false',
         )
     )
+    for name, value in (request_options or {}).items():
+        segments.extend((b",", _json_bytes(name), b":", _json_bytes(value)))
+    segments.append(b"}")
     return _OpenRouterMediaBody(segments)
+
+
+def _is_free_openrouter_route(provider: str, model: str) -> bool:
+    return provider == "openrouter" and (
+        model == "openrouter/free"
+        or re.fullmatch(r"[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+:free", model) is not None
+    )
+
+
+def _has_zero_pricing(pricing: object) -> bool:
+    if not isinstance(pricing, dict) or not {"prompt", "completion"} <= pricing.keys():
+        return False
+    try:
+        return all(
+            Decimal(str(value)).is_finite() and Decimal(str(value)) == 0
+            for value in pricing.values()
+        )
+    except (InvalidOperation, ValueError):
+        return False
+
+
+def _free_openrouter_options(bundle: PromptBundle) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "provider": {"max_price": {"prompt": 0, "completion": 0, "request": 0, "image": 0}}
+    }
+    if any(item.kind == "document" for item in bundle.media):
+        # The default PDF parser may charge for OCR even for a :free model.
+        options["plugins"] = [{"id": "file-parser", "pdf": {"engine": "cloudflare-ai"}}]
+    return options
+
+
+def _safe_model_id(value: str | None) -> str | None:
+    if value and len(value) <= 200 and re.fullmatch(r"[a-zA-Z0-9/._:-]+", value):
+        return value
+    return None
 
 
 def _json_bytes(value: object) -> bytes:

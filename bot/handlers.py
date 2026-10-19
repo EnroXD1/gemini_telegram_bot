@@ -28,6 +28,14 @@ from .emoji_theme import (
 )
 from .gemini import ModelSelectionError
 from .guide import GUIDE_CALLBACK_DATA, GuideVideoSender, guide_keyboard
+from .keyboards import (
+    HELP_BUTTON,
+    RESET_BUTTON,
+    STATUS_BUTTON,
+    WALL_BUTTON,
+    help_keyboard,
+    main_keyboard,
+)
 from .processor import MessageProcessor
 from .storage import BotUserRecord
 from .usage import BotUsageMiddleware, UsageTracker
@@ -292,7 +300,7 @@ def create_router(
         if not await processor.can_respond(message):
             return
         text = (
-            "Привет! Я передаю сообщения Gemini и отвечаю с учётом контекста.\n\n"
+            "Привет! Я ИИ-помощник и отвечаю с учётом контекста.\n\n"
             "Если подключить меня к Telegram Business с правом чтения сообщений, "
             "я уведомлю вас об изменённых и удалённых сообщениях собеседников, а "
             "также сохраню входящие фото, видео, голосовые и кружки.\n\n"
@@ -303,14 +311,21 @@ def create_router(
             "Команда /help покажет режимы работы."
         )
         themed = await emoji_theme.service_text(f"👋 {text}")
+        markup = (
+            main_keyboard(owner=bool(
+                message.from_user and _is_bot_owner(processor, message.from_user.id)
+            ))
+            if message.chat.type == "private" and not message.business_connection_id
+            else guide_keyboard()
+        )
         try:
             await message.reply(
                 themed.text,
                 entities=themed.entities,
-                reply_markup=guide_keyboard(),
+                reply_markup=markup,
             )
         except TelegramBadRequest:
-            await message.reply(text, reply_markup=guide_keyboard())
+            await message.reply(text, reply_markup=markup)
 
     @router.message(Command("guide"))
     @router.business_message(Command("guide"))
@@ -326,6 +341,7 @@ def create_router(
         await send_guide(callback.message)
 
     @router.message(Command("help"))
+    @router.message(F.text == HELP_BUTTON, F.chat.type == "private", ~F.business_connection_id)
     @router.business_message(Command("help"))
     async def help_handler(message: Message) -> None:
         if not await processor.can_respond(message):
@@ -338,6 +354,9 @@ def create_router(
             "/reset — начать диалог с чистым контекстом\n"
             "/cancel — остановить текущий запрос\n"
             "/status — показать модель и режим этого чата\n"
+            "/menu — показать клавиатуру; /hidekeyboard — скрыть\n"
+            "/settings — панель управления (только владелец)\n"
+            "/diagnostics — состояние AI-моделей (только владелец)\n"
             "/mode mentions|all|off — режим группы (только администратор)\n"
             "/autoreply on|off — общие Business-автоответы (только владелец)\n"
             "/chats — режимы отдельных Business-собеседников\n"
@@ -354,11 +373,19 @@ def create_router(
             "AI-запросов одновременно; частые нарушения дают временную блокировку.\n\n"
             "В личном чате я отвечаю на все поддерживаемые сообщения. В группе по "
             "умолчанию отвечаю на /ask, упоминание моего @username или ответ на моё "
-            "сообщение."
+            "сообщение.",
+            reply_markup=help_keyboard(
+                owner=bool(
+                    message.from_user and _is_bot_owner(processor, message.from_user.id)
+                    and not message.business_connection_id and message.chat.type == "private"
+                ),
+                show_menu=message.chat.type == "private" and not message.business_connection_id,
+            ),
         )
 
     @router.message(Command("wall", "grid", "stenka"))
-    async def wall_handler(message: Message, command: CommandObject) -> None:
+    @router.message(F.text == WALL_BUTTON, F.chat.type == "private", ~F.business_connection_id)
+    async def wall_handler(message: Message, command: CommandObject | None = None) -> None:
         user = message.from_user
         if message.chat.type != "private" or user is None:
             await message.reply(
@@ -369,7 +396,7 @@ def create_router(
         if not await processor.can_respond(message):
             return
 
-        argument = _first_command_argument(command.args)
+        argument = _first_command_argument(command.args if command else None)
         parts: int | None = None
         if argument:
             try:
@@ -500,6 +527,7 @@ def create_router(
             await processor.process([message], force=True)
 
     @router.message(Command("reset"))
+    @router.message(F.text == RESET_BUTTON, F.chat.type == "private", ~F.business_connection_id)
     @router.business_message(Command("reset"))
     async def reset_handler(message: Message) -> None:
         if not await processor.can_respond(message):
@@ -773,6 +801,9 @@ def create_router(
         )
 
     @router.message(Command("status"))
+    @router.message(
+        F.text == STATUS_BUTTON, F.chat.type == "private", ~F.business_connection_id
+    )
     @router.business_message(Command("status"))
     async def status_handler(message: Message) -> None:
         if not await processor.can_respond(message):
@@ -802,6 +833,7 @@ def create_router(
             f"⬆️ Версия: {__version__}\n"
             f"🌐 Провайдер: {processor.gemini.current_provider}\n"
             f"🤖 Модель: {processor.gemini.current_model}\n"
+            f"🔒 Только бесплатно: {'включён' if processor.gemini.free_only else 'выключен'}\n"
             f"🔋 Резерв: {fallback}\n"
             f"🔒 Режим чата: {mode}\n"
             f"💬 Контекст: {context}\n"

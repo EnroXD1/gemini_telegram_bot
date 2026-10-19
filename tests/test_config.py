@@ -232,3 +232,13 @@ def test_business_auto_reply_can_default_to_monitoring_only(
     settings = Settings.from_env(tmp_path / "missing.env")
 
     assert settings.business_auto_reply_enabled is False
+
+
+def test_free_only_flag_is_opt_in(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("AI_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.delenv("AI_FREE_ONLY", raising=False)
+    assert not Settings.from_env(tmp_path / "missing.env").ai_free_only
+    monkeypatch.setenv("AI_FREE_ONLY", "true")
+    assert Settings.from_env(tmp_path / "missing.env").ai_free_only
