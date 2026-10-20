@@ -81,10 +81,10 @@ async def run_bot(settings: Settings) -> None:
         dispatcher.callback_query.outer_middleware(ban_middleware)
         dispatcher.message.outer_middleware(CommandActivityMiddleware(activity))
         dispatcher.include_router(create_moderation_router(processor))
+        dispatcher.include_router(create_inline_router(inline))
 
 dispatcher.include_router(create_readme_router())
-        dispatcher.include_router(create_inline_router(inline))
-        dispatcher.include_router(create_control_router(processor))
+ dispatcher.include_router(create_control_router(processor))
         dispatcher.include_router(
             create_router(processor, albums, monitor, usage, emoji_theme, wall)
         )
