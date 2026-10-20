@@ -24,8 +24,7 @@ from .media import MediaExtractor
 from .moderation import BanMiddleware, create_moderation_router
 from .outgoing_emoji import OutgoingEmojiMiddleware
 from .processor import MessageProcessor
-from .readme import
-create_readme_router
+from .readme import create_readme_router
 from .storage import Storage
 from .usage import UsageTracker
 from .wall import WallService
