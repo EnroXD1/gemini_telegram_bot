@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import math
 from contextlib import suppress
-from datetime import UTC
+from datetime import UTC, datetime
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -27,8 +28,13 @@ from .keyboards import (
     SETTINGS_BUTTON,
     main_keyboard,
 )
+from .model_health import DIAGNOSTIC_PERIODS, DiagnosticsSnapshot
 from .processor import MessageProcessor
 from .storage import Storage
+
+logger = logging.getLogger(__name__)
+_PERIOD_LABELS = {"24h": "24 часа", "7d": "7 дней", "30d": "30 дней"}
+_DIAGNOSTICS_PAGE_SIZE = 5
 
 
 async def restore_ai_settings(storage: Storage, service: GeminiService) -> None:
@@ -114,20 +120,65 @@ async def settings_view(
     )
 
 
-def diagnostics_view(service: GeminiService) -> tuple[str, InlineKeyboardMarkup]:
+def diagnostics_view(
+    service: GeminiService,
+    snapshot: DiagnosticsSnapshot | None = None,
+    *,
+    period: str = "24h",
+    page: int = 0,
+    read_error: bool = False,
+) -> tuple[str, InlineKeyboardMarkup]:
+    if period not in DIAGNOSTIC_PERIODS:
+        raise ValueError("Unknown diagnostic period")
     health = service.health
     started = health.started_at.astimezone(UTC).strftime("%d.%m %H:%M UTC")
-    lines = [
-        "📊 Диагностика AI-маршрутов",
-        f"Наблюдения с запуска: {started}.",
-        "Наличие ключа или модели в каталоге не означает успешную проверку.",
-        "",
-    ]
+    historical = (
+        {(item.provider, item.model): item for item in snapshot.routes} if snapshot else {}
+    )
+    lines = ["📊 Диагностика AI-маршрутов"]
+    if snapshot is not None:
+        period = snapshot.period
+        since = datetime.fromtimestamp(snapshot.since, UTC).strftime("%d.%m.%Y %H:%M")
+        until = datetime.fromtimestamp(snapshot.until, UTC).strftime("%d.%m.%Y %H:%M")
+        attempts = sum(item.attempts for item in snapshot.routes)
+        successes = sum(item.successes for item in snapshot.routes)
+        failures = sum(item.failures for item in snapshot.routes)
+        seconds = sum(item.total_seconds for item in snapshot.routes)
+        lines.extend(
+            [
+                f"История SQLite: {_PERIOD_LABELS[period]}, почасовой учёт UTC.",
+                f"С {since} по {until} UTC.",
+                f"Всего попыток: {attempts}; успешных: {successes}; ошибок: {failures}.",
+            ]
+        )
+        if attempts:
+            lines.append(
+                f"Доля успешных попыток: {successes / attempts:.1%}; "
+                f"среднее время: {seconds / attempts:.1f} сек."
+            )
+        else:
+            lines.append("За выбранный период сохранённых попыток ещё нет.")
+    else:
+        lines.append(f"Наблюдения с запуска: {started}.")
+    if read_error:
+        lines.append("⚠️ История SQLite недоступна; ниже только показатели текущего запуска.")
+    if health.persistence_failures:
+        lines.append(
+            f"⚠️ Не удалось сохранить попыток за этот запуск: {health.persistence_failures}. "
+            "История может быть неполной."
+        )
+    lines.extend(
+        [
+            f"Текущее состояние — только с запуска {started}.",
+            "Наличие ключа или модели в каталоге не означает успешную проверку.",
+            "",
+        ]
+    )
     last = health.last_response
     if last:
         lines.extend(
             [
-                f"Последний ответ: {last.provider} / "
+                f"Последний ответ после запуска: {last.provider} / "
                 f"{_short(last.actual_model or last.route_model)}",
                 f"Маршрут: {_short(last.route_model)}; время попытки: {last.seconds:.1f} сек.",
                 "ID фактической модели не сообщён API." if last.actual_model is None else "",
@@ -138,11 +189,24 @@ def diagnostics_view(service: GeminiService) -> tuple[str, InlineKeyboardMarkup]
     else:
         lines.extend(["Успешных AI-ответов после запуска ещё нет.", ""])
     effective = service.effective_routes()
-    routes = list(dict.fromkeys([*effective, *service.configured_routes(), *health.routes]))
+    routes = list(
+        dict.fromkeys(
+            [
+                *effective,
+                *service.configured_routes(),
+                *historical,
+                *health.routes,
+            ]
+        )
+    )
+    pages = max(1, math.ceil(len(routes) / _DIAGNOSTICS_PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    start = page * _DIAGNOSTICS_PAGE_SIZE
     media = service.effective_routes(media=True)
-    for provider, model in routes[:10]:
+    for provider, model in routes[start : start + _DIAGNOSTICS_PAGE_SIZE]:
         key = (provider, model)
-        stats = health.routes.get(key)
+        observed = health.routes.get(key)
+        stats = historical.get(key) if snapshot is not None else observed
         catalog_status = service.route_catalog_status(provider, model)
         cooldown = math.ceil(service.cooldown_remaining(provider, model))
         if not service.route_allowed(provider, model):
@@ -155,15 +219,15 @@ def diagnostics_view(service: GeminiService) -> tuple[str, InlineKeyboardMarkup]
             state = f"⏳ пауза ещё {cooldown} сек."
         elif service.route_is_probing(provider, model):
             state = "⏳ проверка восстановления после паузы"
-        elif stats is None:
-            state = "⚪ запросов ещё не было"
+        elif observed is None:
+            state = "⚪ запросов ещё не было после запуска"
         else:
             state = (
                 "✅ последний запрос успешен"
-                if stats.last_error is None
+                if observed.last_error is None
                 else "❌ последняя попытка неуспешна"
             )
-        lines.append(f"{provider} / {_short(model, 60)}\n{state}")
+        lines.append(f"{provider} / {_short(model, 60)}\nСейчас: {state}")
         key_status = service.key_pool_status(provider, model)
         if key_status is not None:
             ready, total = key_status
@@ -173,28 +237,67 @@ def diagnostics_view(service: GeminiService) -> tuple[str, InlineKeyboardMarkup]
                 f"Успехов {stats.successes}/{stats.attempts}; ошибок {stats.failures}; "
                 f"среднее время {stats.total_seconds / stats.attempts:.1f} сек."
             )
-            if stats.last_error:
-                code = f"HTTP {stats.last_code}: " if stats.last_code else ""
-                lines.append(f"Причина: {code}{stats.last_error}.")
+            if snapshot is not None:
+                lines.append(
+                    f"Успешных: {stats.successes / stats.attempts:.1%}; "
+                    f"частичных ответов: {stats.truncated}."
+                )
+        elif snapshot is not None:
+            lines.append("За выбранный период попыток нет.")
+        if observed and observed.last_error:
+            code = f"HTTP {observed.last_code}: " if observed.last_code else ""
+            lines.append(f"Последняя ошибка после запуска: {code}{observed.last_error}.")
         if key in effective and key not in media:
             lines.append("Только текст; вложения идут другим маршрутом.")
         lines.append("")
-    if len(routes) > 10:
-        lines.append(f"Ещё маршрутов: {len(routes) - 10}. Полная цепочка: /model.")
+    if pages > 1:
+        lines.append(f"Маршруты: страница {page + 1}/{pages}. Полная цепочка: /model.")
     if service.catalog_state == "error":
         lines.append("Каталог сейчас недоступен; используются настройки и последний снимок.")
     elif service.catalog_state == "loaded":
         lines.append("Каталог OpenRouter загружен; обновление не чаще раза в час.")
     else:
         lines.append("Каталог OpenRouter ещё не загружен.")
-    lines.append("Показатели не содержат переписку и ключи; обнуляются при перезапуске.")
-    return "\n".join(line for line in lines if line is not None)[:4000], InlineKeyboardMarkup(
-        inline_keyboard=[
-            [_button("🔄 Обновить показатели", "diagnostics")],
-            [_button("📚 Обновить каталог моделей", "catalog")],
+    lines.append(
+        "История хранится 30 дней без переписки и ключей. "
+        "Карантин и последние ответы — только в ОЗУ."
+        if snapshot is not None
+        else "Показатели текущего запуска не содержат переписку и ключи."
+    )
+    rows = [
+        [
+            _button(f"{'• ' if period == value else ''}{label}", f"diagnostics:{value}:0")
+            for value, label in _PERIOD_LABELS.items()
+        ]
+    ]
+    navigation = []
+    if page:
+        navigation.append(_button("⬅️ Назад", f"diagnostics:{period}:{page - 1}"))
+    if page + 1 < pages:
+        navigation.append(_button("Далее ➡️", f"diagnostics:{period}:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.extend(
+        [
+            [_button("🔄 Обновить показатели", f"diagnostics:{period}:{page}")],
+            [_button("📚 Обновить каталог моделей", f"catalog:{period}:{page}")],
             [_button("⬅️ Настройки", "home")],
         ]
     )
+    return "\n".join(line for line in lines if line is not None)[:4000], InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+async def persistent_diagnostics_view(
+    processor: MessageProcessor, period: str = "24h", page: int = 0
+) -> tuple[str, InlineKeyboardMarkup]:
+    try:
+        snapshot = await processor.storage.get_model_diagnostics(period)
+    except Exception as exc:
+        logger.warning("Could not read AI diagnostics type=%s", type(exc).__name__)
+        return diagnostics_view(processor.gemini, period=period, page=page, read_error=True)
+    return diagnostics_view(processor.gemini, snapshot, period=period, page=page)
 
 
 def create_control_router(processor: MessageProcessor) -> Router:
@@ -291,7 +394,7 @@ def create_control_router(processor: MessageProcessor) -> Router:
             message.text == DIAGNOSTICS_BUTTON
             or (message.text or "").split(maxsplit=1)[0].split("@")[0] == "/diagnostics"
         ):
-            text, markup = diagnostics_view(processor.gemini)
+            text, markup = await persistent_diagnostics_view(processor)
         else:
             text, markup = await settings_view(processor, user.id)
         await message.reply(text, reply_markup=markup, parse_mode=None)
@@ -340,11 +443,25 @@ def create_control_router(processor: MessageProcessor) -> Router:
                 InlineKeyboardMarkup(inline_keyboard=rows),
             )
             return
-        if action == "catalog":
-            await service.refresh_model_catalog()
-            text, markup = diagnostics_view(service)
-        elif action == "diagnostics":
-            text, markup = diagnostics_view(service)
+        if action.split(":", 1)[0] in {"catalog", "diagnostics"}:
+            parts = action.split(":")
+            period, page = "24h", 0
+            if len(parts) != 1:
+                if (
+                    len(parts) != 3 or parts[1] not in DIAGNOSTIC_PERIODS
+                    or not parts[2].isascii() or not parts[2].isdigit() or len(parts[2]) > 6
+                ):
+                    await edit(
+                        callback, "Эта кнопка устарела. Откройте /diagnostics.",
+                        InlineKeyboardMarkup(
+                            inline_keyboard=[[_button("📊 Диагностика", "diagnostics")]]
+                        ),
+                    )
+                    return
+                period, page = parts[1], int(parts[2])
+            if parts[0] == "catalog":
+                await service.refresh_model_catalog()
+            text, markup = await persistent_diagnostics_view(processor, period, page)
         else:
             async with mutation_lock:
                 try:

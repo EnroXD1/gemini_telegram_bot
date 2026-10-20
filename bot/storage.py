@@ -7,6 +7,13 @@ from pathlib import Path
 
 import aiosqlite
 
+from .model_health import (
+    DIAGNOSTIC_PERIODS,
+    DIAGNOSTIC_RETENTION_HOURS,
+    DiagnosticObservation,
+    DiagnosticsSnapshot,
+    RouteAggregate,
+)
 from .models import ConversationMessage
 
 
@@ -124,6 +131,7 @@ class Storage:
         self._path = path
         self._db: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
+        self._diagnostics_pruned_hour: int | None = None
 
     async def open(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -274,6 +282,20 @@ class Storage:
                 setting_value TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS model_diagnostics (
+                bucket_start INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                attempts INTEGER NOT NULL CHECK(attempts > 0),
+                successes INTEGER NOT NULL CHECK(successes >= 0),
+                failures INTEGER NOT NULL CHECK(failures >= 0),
+                total_seconds REAL NOT NULL CHECK(total_seconds >= 0),
+                truncated INTEGER NOT NULL CHECK(truncated >= 0 AND truncated <= successes),
+                last_at INTEGER NOT NULL,
+                PRIMARY KEY(bucket_start, provider, model),
+                CHECK(attempts = successes + failures)
+            );
             """
         )
         cursor = await self._db.execute("PRAGMA table_info(bot_users)")
@@ -289,6 +311,8 @@ class Storage:
             "UPDATE user_activity SET outcome = 'cancelled' WHERE outcome = 'pending'"
         )
         await self._db.commit()
+        self._diagnostics_pruned_hour = None
+        await self.prune_model_diagnostics()
 
     def _connection(self) -> aiosqlite.Connection:
         if self._db is None:
@@ -299,6 +323,97 @@ class Storage:
         if self._db is not None:
             await self._db.close()
             self._db = None
+
+    async def record_model_diagnostic(self, observation: DiagnosticObservation) -> None:
+        db = self._connection()
+        bucket = observation.at // 3600 * 3600
+        async with self._lock:
+            try:
+                await db.execute(
+                    """
+                    INSERT INTO model_diagnostics (
+                        bucket_start, provider, model, attempts, successes, failures,
+                        total_seconds, truncated, last_at
+                    ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
+                    ON CONFLICT(bucket_start, provider, model) DO UPDATE SET
+                        attempts = model_diagnostics.attempts + 1,
+                        successes = model_diagnostics.successes + excluded.successes,
+                        failures = model_diagnostics.failures + excluded.failures,
+                        total_seconds =
+                            model_diagnostics.total_seconds + excluded.total_seconds,
+                        truncated = model_diagnostics.truncated + excluded.truncated,
+                        last_at = MAX(model_diagnostics.last_at, excluded.last_at)
+                    """,
+                    (
+                        bucket, observation.provider, observation.model,
+                        int(not observation.failed), int(observation.failed),
+                        observation.seconds, int(observation.truncated), observation.at,
+                    ),
+                )
+                # At most one retention sweep per wall-clock hour, within the same lock.
+                hour = int(time.time()) // 3600
+                if hour != self._diagnostics_pruned_hour:
+                    await db.execute(
+                        "DELETE FROM model_diagnostics WHERE bucket_start < ?",
+                        ((hour - DIAGNOSTIC_RETENTION_HOURS + 1) * 3600,),
+                    )
+                await db.commit()
+                self._diagnostics_pruned_hour = hour
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def prune_model_diagnostics(self, *, now: int | None = None) -> int:
+        db = self._connection()
+        hour = (int(time.time()) if now is None else now) // 3600
+        async with self._lock:
+            cursor = await db.execute(
+                "DELETE FROM model_diagnostics WHERE bucket_start < ?",
+                ((hour - DIAGNOSTIC_RETENTION_HOURS + 1) * 3600,),
+            )
+            removed = cursor.rowcount
+            await cursor.close()
+            await db.commit()
+            self._diagnostics_pruned_hour = hour
+        return removed
+
+    async def get_model_diagnostics(
+        self, period: str = "24h", *, now: int | None = None
+    ) -> DiagnosticsSnapshot:
+        if period not in DIAGNOSTIC_PERIODS:
+            raise ValueError("Unknown diagnostic period")
+        until = int(time.time()) if now is None else now
+        bucket = until // 3600 * 3600
+        since = bucket - (DIAGNOSTIC_PERIODS[period] - 1) * 3600
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT provider, model, SUM(attempts) AS attempts,
+                       SUM(successes) AS successes, SUM(failures) AS failures,
+                       SUM(total_seconds) AS total_seconds, SUM(truncated) AS truncated,
+                       MAX(last_at) AS last_at
+                FROM model_diagnostics
+                WHERE bucket_start >= ? AND bucket_start <= ?
+                GROUP BY provider, model
+                ORDER BY attempts DESC, provider, model
+                """,
+                (since, bucket),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return DiagnosticsSnapshot(
+            period, since, until,
+            tuple(
+                RouteAggregate(
+                    provider=str(row["provider"]), model=str(row["model"]),
+                    attempts=int(row["attempts"]), successes=int(row["successes"]),
+                    failures=int(row["failures"]), total_seconds=float(row["total_seconds"]),
+                    truncated=int(row["truncated"]), last_at=int(row["last_at"]),
+                )
+                for row in rows
+            ),
+        )
 
     async def get_runtime_setting(self, key: str) -> str | None:
         db = self._connection()

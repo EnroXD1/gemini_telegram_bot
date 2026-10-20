@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -9,7 +10,12 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from aiogram.types import Chat, Message, ReplyKeyboardRemove, Update, User
 
-from bot.control_panel import create_control_router, diagnostics_view, restore_ai_settings
+from bot.control_panel import (
+    create_control_router,
+    diagnostics_view,
+    persistent_diagnostics_view,
+    restore_ai_settings,
+)
 from bot.gemini import GeminiRequestError, GeminiService, ModelSelectionError
 from bot.handlers import create_router
 from bot.keyboards import (
@@ -24,6 +30,7 @@ from bot.keyboards import (
     WALL_BUTTON,
     main_keyboard,
 )
+from bot.model_health import DiagnosticObservation, DiagnosticsSnapshot, RouteAggregate
 from bot.models import MediaPayload, PromptBundle
 from bot.storage import Storage
 
@@ -497,3 +504,172 @@ async def test_unknown_inline_model_cannot_overwrite_saved_selection(panel):
     assert await processor.storage.get_ai_selection() is None
     assert processor.gemini.current_model == "openrouter/free"
     assert "Список изменился" in session.calls[-1].text
+
+
+async def test_real_generation_persists_route_failures_and_fallback_successes(
+    service_factory, tmp_path
+):
+    def handle(request):
+        model = json.loads(request.content)["model"]
+        if model == "vendor/main":
+            return httpx.Response(429, json={"error": {"message": "PRIVATE_PROVIDER_ERROR"}})
+        return completion()
+
+    storage = Storage(tmp_path / "generation.sqlite3")
+    await storage.open()
+    service = service_factory(handle, free_only=False)
+    service._model = "vendor/main"
+    service.health.attach_storage(storage)
+    try:
+        await service.generate(PromptBundle("PRIVATE_USER_PROMPT"), None)
+        await service.generate(PromptBundle("PRIVATE_SECOND_PROMPT"), None)
+        snapshot = await storage.get_model_diagnostics()
+        routes = {route.model: route for route in snapshot.routes}
+        assert routes["vendor/main"].failures == 1  # cooled route is skipped next time
+        assert routes["openrouter/free"].successes == 2
+        assert sum(route.attempts for route in snapshot.routes) == 3
+        assert "PRIVATE" not in str(snapshot)
+
+        # New service and reopened SQLite: counters survive, circuits and live state do not.
+        await storage.close()
+        await storage.open()
+        restarted = service_factory(handle, free_only=False)
+        restarted._model = "vendor/main"
+        restarted.health.attach_storage(storage)
+        report, _ = await persistent_diagnostics_view(
+            SimpleNamespace(storage=storage, gemini=restarted)
+        )
+        assert "ошибок: 1" in report and "успешных: 2" in report
+        assert "запросов ещё не было после запуска" in report
+        assert "пауза ещё" not in report and "последняя попытка неуспешна" not in report
+        assert restarted.cooldown_remaining("openrouter", "vendor/main") == 0
+        assert restarted.health.last_response is None and not restarted.health.routes
+    finally:
+        await storage.close()
+
+
+async def test_truncated_generation_is_saved_as_success_with_partial_marker(
+    service_factory, tmp_path
+):
+    def handle(request):
+        reply = completion().json()
+        reply["choices"][0]["finish_reason"] = "length"
+        return httpx.Response(200, json=reply)
+
+    service = service_factory(handle, free_only=False)
+    storage = Storage(tmp_path / "partial.sqlite3")
+    await storage.open()
+    service.health.attach_storage(storage)
+    try:
+        result = await service.generate(PromptBundle("Запрос"), None)
+        (route,) = (await storage.get_model_diagnostics()).routes
+        assert result.truncated and route.truncated == 1
+        assert (route.attempts, route.successes, route.failures) == (1, 1, 0)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize("period", ["24h", "7d", "30d"])
+async def test_diagnostic_period_buttons_use_sqlite_without_ai_calls(panel, period):
+    bot, dispatcher, processor, session = panel
+    processor.storage.get_model_diagnostics = AsyncMock(
+        wraps=processor.storage.get_model_diagnostics
+    )
+    processor.gemini.refresh_model_catalog = AsyncMock()
+    await dispatcher.feed_update(bot, callback_update(f"cfg:diagnostics:{period}:0"))
+    processor.storage.get_model_diagnostics.assert_awaited_once_with(period)
+    processor.gemini.refresh_model_catalog.assert_not_awaited()
+    report = session.calls[-1]
+    assert "История SQLite" in report.text and "почасовой учёт UTC" in report.text
+    assert "попыток ещё нет" in report.text
+    buttons = [button for row in report.reply_markup.inline_keyboard for button in row]
+    assert {f"cfg:diagnostics:{value}:0" for value in ("24h", "7d", "30d")} <= {
+        button.callback_data for button in buttons
+    }
+    assert any(button.text.startswith("• ") for button in buttons)
+
+
+@pytest.mark.parametrize("user_id,chat_id", [(99, 99), (99, 42), (42, 99)])
+async def test_history_periods_remain_owner_only(panel, user_id, chat_id):
+    bot, dispatcher, processor, session = panel
+    processor.storage.get_model_diagnostics = AsyncMock()
+    await dispatcher.feed_update(
+        bot, callback_update("cfg:diagnostics:30d:0", user_id=user_id, chat_id=chat_id)
+    )
+    processor.storage.get_model_diagnostics.assert_not_awaited()
+    assert session.calls[-1].show_alert
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "diagnostics:all:0",
+        "diagnostics:7d:-1",
+        "diagnostics:7d:1000000",
+        "catalog:7d",
+        "catalog::0",
+    ],
+)
+async def test_invalid_diagnostic_callbacks_are_rejected_without_io(panel, action):
+    bot, dispatcher, processor, session = panel
+    processor.storage.get_model_diagnostics = AsyncMock()
+    processor.gemini.refresh_model_catalog = AsyncMock()
+    await dispatcher.feed_update(bot, callback_update(f"cfg:{action}"))
+    assert "кнопка устарела" in session.calls[-1].text
+    processor.storage.get_model_diagnostics.assert_not_awaited()
+    processor.gemini.refresh_model_catalog.assert_not_awaited()
+
+
+async def test_pagination_and_catalog_refresh_preserve_selected_period(panel):
+    bot, dispatcher, processor, session = panel
+    for i in range(12):
+        await processor.storage.record_model_diagnostic(
+            DiagnosticObservation("google", f"model-{i}", 2, int(time.time()), False)
+        )
+    processor.gemini.refresh_model_catalog = AsyncMock()
+    await dispatcher.feed_update(bot, callback_update("cfg:catalog:7d:1"))
+    processor.gemini.refresh_model_catalog.assert_awaited_once()
+    report = session.calls[-1]
+    assert "7 дней" in report.text and "страница 2/" in report.text
+    buttons = [
+        button.callback_data for row in report.reply_markup.inline_keyboard for button in row
+    ]
+    assert "cfg:diagnostics:7d:1" in buttons and "cfg:catalog:7d:1" in buttons
+    assert "cfg:diagnostics:7d:0" in buttons and "cfg:diagnostics:7d:2" in buttons
+
+
+async def test_diagnostic_read_failure_shows_live_fallback_and_safe_warning(panel, caplog):
+    _, _, processor, _ = panel
+    processor.storage.get_model_diagnostics = AsyncMock(
+        side_effect=RuntimeError("PRIVATE_SECRET")
+    )
+    processor.gemini.health.persistence_failures = 2
+    report, _ = await persistent_diagnostics_view(processor, "30d")
+    assert (
+        "История SQLite недоступна" in report and "только показатели текущего запуска" in report
+    )
+    assert "Не удалось сохранить попыток за этот запуск: 2" in report
+    assert "PRIVATE_SECRET" not in caplog.text + report
+
+
+async def test_many_historical_routes_are_paginated_without_hiding_end_of_report(panel):
+    _, _, processor, _ = panel
+    snapshot = DiagnosticsSnapshot(
+        "30d",
+        int(time.time()) - 3600,
+        int(time.time()),
+        tuple(
+            RouteAggregate(
+                "google", f"route-{i}-" + "x" * 190, 2, 1, 1, 10, 0, int(time.time())
+            )
+            for i in range(30)
+        ),
+    )
+    for page in (0, 1, 99999):
+        report, markup = diagnostics_view(processor.gemini, snapshot, page=page)
+        assert len(report) < 4000
+        assert report.endswith("Карантин и последние ответы — только в ОЗУ.")
+        assert "Доля успешных попыток: 50.0%" in report
+        assert "среднее время: 5.0 сек." in report
+        assert "История SQLite: 30 дней" in report
+        assert len(markup.inline_keyboard) >= 4

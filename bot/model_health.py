@@ -1,9 +1,49 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .storage import Storage
+
+logger = logging.getLogger(__name__)
+
+DIAGNOSTIC_PERIODS = {"24h": 24, "7d": 7 * 24, "30d": 30 * 24}
+DIAGNOSTIC_RETENTION_HOURS = 30 * 24
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticObservation:
+    provider: str
+    model: str
+    seconds: float
+    at: int
+    failed: bool
+    truncated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RouteAggregate:
+    provider: str
+    model: str
+    attempts: int
+    successes: int
+    failures: int
+    total_seconds: float
+    truncated: int
+    last_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticsSnapshot:
+    period: str
+    since: int
+    until: int
+    routes: tuple[RouteAggregate, ...]
 
 
 @dataclass(slots=True)
@@ -29,12 +69,45 @@ class LastResponse:
 
 
 class ModelHealth:
-    """Bounded process-local metrics; never keep prompts, responses or API errors."""
+    """Live state in RAM, optional durable aggregates without user content or keys."""
 
     def __init__(self) -> None:
         self.started_at = datetime.now(UTC)
         self.routes: OrderedDict[tuple[str, str], RouteHealth] = OrderedDict()
         self.last_response: LastResponse | None = None
+        self._storage: Storage | None = None
+        self.persistence_failures = 0
+
+    def attach_storage(self, storage: Storage) -> None:
+        self._storage = storage
+
+    async def record_attempt(
+        self,
+        provider: str,
+        model: str,
+        started: float,
+        *,
+        error: str | None = None,
+        code: int | None = None,
+        actual_model: str | None = None,
+        truncated: bool = False,
+    ) -> None:
+        observation = self.record(
+            provider,
+            model,
+            started,
+            error=error,
+            code=code,
+            actual_model=actual_model,
+            truncated=truncated,
+        )
+        if self._storage is not None:
+            try:
+                # Await one committed UPSERT, not a task/queue that can lose data at shutdown.
+                await self._storage.record_model_diagnostic(observation)
+            except Exception as exc:
+                self.persistence_failures += 1
+                logger.warning("Could not persist AI diagnostics type=%s", type(exc).__name__)
 
     def record(
         self,
@@ -46,7 +119,7 @@ class ModelHealth:
         code: int | None = None,
         actual_model: str | None = None,
         truncated: bool = False,
-    ) -> None:
+    ) -> DiagnosticObservation:
         key = (provider, model)
         health = self.routes.setdefault(key, RouteHealth())
         self.routes.move_to_end(key)
@@ -66,6 +139,14 @@ class ModelHealth:
             self.last_response = LastResponse(
                 provider, model, actual_model, seconds, now, truncated
             )
+        return DiagnosticObservation(
+            provider,
+            model,
+            seconds,
+            int(now.timestamp()),
+            error is not None,
+            truncated and error is None,
+        )
 
 
 def error_label(code: int | None, *, blocked: bool = False) -> str:

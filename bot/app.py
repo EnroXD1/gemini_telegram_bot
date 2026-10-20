@@ -42,6 +42,7 @@ async def run_bot(settings: Settings) -> None:
 
     try:
         await storage.open()
+        gemini.health.attach_storage(storage)
         await restore_ai_settings(storage, gemini)
         owners_removed = await storage.delete_bot_users(settings.owner_ids)
         if owners_removed:

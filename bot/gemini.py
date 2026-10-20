@@ -547,7 +547,7 @@ class GeminiService:
                         history,
                         is_fallback=failed_route is not None,
                     )
-                self.health.record(
+                await self.health.record_attempt(
                     route.provider, route.model, started,
                     actual_model=result.model, truncated=result.truncated,
                 )
@@ -560,7 +560,7 @@ class GeminiService:
                     failed_route = route
                 continue
             except GeminiRequestError as exc:
-                self.health.record(
+                await self.health.record_attempt(
                     route.provider, route.model, started,
                     error=error_label(
                         exc.status_code, blocked=exc.fallback_reason == "blocked"
