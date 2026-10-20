@@ -29,7 +29,6 @@ from .storage import Storage
 from .usage import UsageTracker
 from .wall import WallService
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -83,7 +82,7 @@ async def run_bot(settings: Settings) -> None:
         dispatcher.include_router(create_moderation_router(processor))
         dispatcher.include_router(create_inline_router(inline))
         dispatcher.include_router(create_readme_router())
- dispatcher.include_router(create_control_router(processor))
+        dispatcher.include_router(create_control_router(processor))
         dispatcher.include_router(
             create_router(processor, albums, monitor, usage, emoji_theme, wall)
         )
@@ -141,8 +140,7 @@ async def _set_commands(bot: Bot) -> None:
     private_commands = [
         BotCommand(command="start", description="Запустить бота"),
         BotCommand(command="help", description="Справка и возможности"),
-        BotCommand(command="readme",
-description="Актуальная документация с GitHub",),
+        BotCommand(command="readme", description="Актуальная документация с GitHub"),
         BotCommand(command="menu", description="Показать клавиатуру"),
         BotCommand(command="inline", description="Перевод, текст и калькулятор в любом чате"),
         BotCommand(command="hidekeyboard", description="Скрыть клавиатуру"),
