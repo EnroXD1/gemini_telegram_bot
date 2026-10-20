@@ -164,6 +164,10 @@ def diagnostics_view(service: GeminiService) -> tuple[str, InlineKeyboardMarkup]
                 else "❌ последняя попытка неуспешна"
             )
         lines.append(f"{provider} / {_short(model, 60)}\n{state}")
+        key_status = service.key_pool_status(provider, model)
+        if key_status is not None:
+            ready, total = key_status
+            lines.append(f"Пул ключей: доступно {ready}/{total}; значения скрыты.")
         if stats:
             lines.append(
                 f"Успехов {stats.successes}/{stats.attempts}; ошибок {stats.failures}; "

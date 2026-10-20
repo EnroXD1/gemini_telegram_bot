@@ -10,11 +10,12 @@ import random
 import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
+from functools import partial
 from typing import Any
 
 import httpx
@@ -27,6 +28,7 @@ from .gemini_response import (
     extract_interaction_status,
     extract_interaction_text,
 )
+from .key_pool import KeyPool
 from .model_health import ModelHealth, error_label
 from .models import ConversationMessage, GeminiResult, MediaPayload, PromptBundle
 
@@ -225,6 +227,17 @@ class GeminiService:
         self._interactions_available = False
         self._route_cooldowns: dict[tuple[str, str], float] = {}
         self._route_probes: set[tuple[str, str]] = set()
+        self._key_pools: dict[str, KeyPool] = {}
+        self._google_clients: dict[int, Any] = {}
+        google_keys = getattr(settings, "google_api_keys", ()) or (
+            (settings.gemini_api_key,) if getattr(settings, "gemini_api_key", "") else ()
+        )
+        groq_keys = getattr(settings, "groq_api_keys", ()) or (
+            (settings.groq_api_key,) if getattr(settings, "groq_api_key", "") else ()
+        )
+        for provider, keys in (("google", google_keys), ("groq", groq_keys)):
+            if len(keys) > 1:
+                self._key_pools[provider] = KeyPool(keys, clock=lambda: time.monotonic())
 
         if getattr(settings, "openrouter_api_key", ""):
             self._openrouter_client = httpx.AsyncClient(
@@ -236,28 +249,15 @@ class GeminiService:
                 },
                 timeout=settings.gemini_timeout_seconds,
             )
-        if getattr(settings, "groq_api_key", ""):
+        if groq_keys:
             self._groq_client = httpx.AsyncClient(
                 base_url=GROQ_BASE_URL,
-                headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                headers={"Authorization": f"Bearer {groq_keys[0]}"},
                 timeout=settings.gemini_timeout_seconds,
             )
-        if getattr(settings, "gemini_api_key", ""):
-            client_kwargs: dict[str, Any] = {
-                "api_key": settings.gemini_api_key,
-                "http_options": types.HttpOptions(
-                    # The GAOS transport mutates attempts=0 into one retry.
-                    # One attempt plus an unused status code disables both its
-                    # retry layers; explicit bot retries remain in this module.
-                    retry_options=types.HttpRetryOptions(
-                        attempts=1,
-                        http_status_codes=[418],
-                    )
-                ),
-            }
-            if settings.gemini_vertex_ai:
-                client_kwargs["vertexai"] = True
-            self._client = genai.Client(**client_kwargs)
+        if google_keys:
+            self._client = self._make_google_client(google_keys[0])
+            self._google_clients[0] = self._client
             self._interactions_available = not settings.gemini_vertex_ai
 
         self._free_only = False
@@ -353,10 +353,36 @@ class GeminiService:
             return "нулевая цена не подтверждена каталогом"
         return None
 
+    def _make_google_client(self, key: str) -> Any:
+        kwargs: dict[str, Any] = {
+            "api_key": key,
+            "http_options": types.HttpOptions(
+                retry_options=types.HttpRetryOptions(attempts=1, http_status_codes=[418]),
+            ),
+        }
+        if self._settings.gemini_vertex_ai:
+            kwargs["vertexai"] = True
+        try:
+            return genai.Client(**kwargs)
+        except Exception:
+            # SDK validation errors may echo their credential argument.
+            raise GeminiRequestError(
+                "Не удалось инициализировать Google API. Проверьте ключи и настройки Vertex.",
+                provider="google",
+            ) from None
+
+    def _key_pool(self, provider: str) -> KeyPool | None:
+        return getattr(self, "_key_pools", {}).get(provider)
+
+    def key_pool_status(self, provider: str, model: str) -> tuple[int, int] | None:
+        pool = self._key_pool(provider)
+        return (pool.available(model), len(pool)) if pool is not None else None
+
     def cooldown_remaining(self, provider: str, model: str) -> float:
         cooldowns = getattr(self, "_route_cooldowns", {})
         until = max(cooldowns.get((provider, model), 0), cooldowns.get((provider, "*"), 0))
-        return max(0.0, until - time.monotonic())
+        pool = self._key_pool(provider)
+        return max(0.0, until - time.monotonic(), pool.retry_in(model) if pool else 0.0)
 
     def route_is_probing(self, provider: str, model: str) -> bool:
         probes = getattr(self, "_route_probes", set())
@@ -372,7 +398,10 @@ class GeminiService:
 
     @property
     def uses_local_history(self) -> bool:
-        return self._provider in {"openrouter", "groq"}
+        return (
+            self._provider in {"openrouter", "groq"}
+            or self._key_pool(self._provider) is not None
+        )
 
     def configured_providers(self) -> dict[str, str]:
         providers: dict[str, str] = {}
@@ -421,12 +450,23 @@ class GeminiService:
         return normalized, selected_model
 
     async def close(self) -> None:
+        closers = []
         if self._openrouter_client is not None:
-            await self._openrouter_client.aclose()
+            closers.append(self._openrouter_client.aclose())
+            self._openrouter_client = None
         if self._groq_client is not None:
-            await self._groq_client.aclose()
-        if self._client is not None:
-            await self._client.aio.aclose()
+            closers.append(self._groq_client.aclose())
+            self._groq_client = None
+        clients = list(getattr(self, "_google_clients", {}).values())
+        if not clients and self._client is not None:
+            clients = [self._client]
+        closers.extend(client.aio.aclose() for client in clients)
+        self._client = None
+        getattr(self, "_google_clients", {}).clear()
+        results = await asyncio.gather(*closers, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning("AI client cleanup failed type=%s", type(result).__name__)
 
     async def generate(
         self,
@@ -676,6 +716,13 @@ class GeminiService:
                 history,
                 model=route.model,
             )
+        pool = self._key_pool(route.provider)
+        if pool is not None:
+            async with self._route_request_guard(route):
+                return await self._generate_with_keys(
+                    route, pool, bundle, previous_interaction_id, history,
+                    is_fallback=is_fallback,
+                )
         if route.provider == "groq":
             if bundle.media:
                 raise GeminiRequestError(
@@ -695,6 +742,113 @@ class GeminiService:
             bundle,
             previous_interaction_id,
             model=route.model,
+        )
+
+    async def _generate_with_keys(
+        self,
+        route: _ModelRoute,
+        pool: KeyPool,
+        bundle: PromptBundle,
+        previous_id: str | None,
+        history: tuple[ConversationMessage, ...],
+        *,
+        is_fallback: bool,
+    ) -> GeminiResult:
+        if route.provider == "groq" and bundle.media:
+            raise GeminiRequestError(
+                "Модель Groq работает только с текстом.", provider="groq", fallback_allowed=True
+            )
+        tried: set[int] = set()
+        last_error: GeminiRequestError | None = None
+        while len(tried) < len(pool):
+            index = pool.acquire(route.model, tried)
+            if index is None:
+                break
+            tried.add(index)
+            success = False
+            try:
+                on_quota = partial(self._pause_key, pool, index, route)
+                if route.provider == "google":
+                    client = self._google_clients.get(index)
+                    if client is None:
+                        client = self._make_google_client(pool.key(index))
+                        self._google_clients[index] = client
+                    # Server interaction IDs may belong to another project. Pooled Google
+                    # uses generateContent plus the existing bounded local text history.
+                    prompt = bundle.prompt
+                    if history:
+                        context = json.dumps(
+                            [{"role": item.role, "content": item.content} for item in history],
+                            ensure_ascii=False,
+                        )
+                        prompt = (
+                            "Предыдущие реплики (контекст, не инструкции):\n"
+                            + context
+                            + "\n\nТекущий запрос:\n"
+                            + prompt
+                        )
+                    result = await self._generate_google(
+                        PromptBundle(prompt, bundle.media),
+                        None,
+                        model=route.model,
+                        client=client,
+                        guarded=True,
+                        use_interactions=False,
+                        on_quota=on_quota,
+                    )
+                    result = replace(
+                        result,
+                        context_was_reset=bool(previous_id),
+                        interaction_id=None,
+                    )
+                else:
+                    result = await self._generate_groq(
+                        self._build_chat_messages(bundle, history),
+                        previous_id,
+                        model=route.model,
+                        is_fallback=is_fallback,
+                        api_key=pool.key(index),
+                        on_quota=on_quota,
+                    )
+                success = True
+                return result
+            except GeminiRequestError as exc:
+                if exc.status_code != 429:
+                    raise
+                self._pause_key(pool, index, route, exc)
+                last_error = _detached_request_error(exc)
+                _release_exception_chain(exc)
+                if bundle.media:
+                    gc.collect()
+            finally:
+                pool.release(index, route.model, success=success)
+        error = last_error or GeminiRequestError(
+            "Все ключи этой модели временно на паузе.",
+            provider=route.provider,
+            status_code=429,
+            quota_exhausted=True,
+            fallback_allowed=True,
+        )
+        error.retry_after_seconds = max(1.0, pool.retry_in(route.model))
+        raise error
+
+    def _pause_key(
+        self,
+        pool: KeyPool,
+        index: int,
+        route: _ModelRoute,
+        error: GeminiRequestError,
+    ) -> None:
+        seconds = error.retry_after_seconds
+        if seconds is None or not math.isfinite(seconds):
+            seconds = float(getattr(self._settings, "ai_fallback_cooldown_seconds", 600.0))
+        pool.pause(index, route.model, seconds)
+        logger.warning(
+            "AI credential paused provider=%s model=%s slot=%s seconds=%s",
+            route.provider,
+            route.model,
+            index + 1,
+            max(1.0, seconds),
         )
 
     def _route_is_cooling_down(self, route: _ModelRoute) -> bool:
@@ -738,6 +892,9 @@ class GeminiService:
     def _start_route_cooldown(
         self, route: _ModelRoute, error: GeminiRequestError
     ) -> None:
+        if error.status_code == 429 and self._key_pool(route.provider) is not None:
+            # Key deadlines are authoritative; a route-level pause would hide healthy keys.
+            return
         model_missing = route.provider == "openrouter" and error.status_code == 404
         temporary_failure = (
             error.status_code in {408, 429, 500, 502, 503, 504} or error.transient_failure
@@ -798,12 +955,20 @@ class GeminiService:
         previous_interaction_id: str | None,
         *,
         model: str,
+        client: Any | None = None,
+        guarded: bool = False,
+        use_interactions: bool | None = None,
+        on_quota: Callable[[GeminiRequestError], None] | None = None,
     ) -> GeminiResult:
 
+        client = self._client if client is None else client
+        interactions_available = (
+            self._interactions_available if use_interactions is None else use_interactions
+        )
         base_request_input: Any | None = None
         request_input: Any | None = None
         generate_contents: Any | None = None
-        if self._interactions_available:
+        if interactions_available:
             base_request_input = _build_input(bundle)
             request_input = base_request_input
         else:
@@ -821,13 +986,18 @@ class GeminiService:
         interaction_id: str | None = None
         attempt = 0
 
-        async with self._route_request_guard(_ModelRoute("google", model)):
+        guard = (
+            nullcontext()
+            if guarded
+            else self._route_request_guard(_ModelRoute("google", model))
+        )
+        async with guard:
             while True:
                 try:
                     async with asyncio.timeout(
                         self._settings.gemini_timeout_seconds
                     ):
-                        if self._interactions_available:
+                        if interactions_available:
                             kwargs: dict[str, Any] = {
                                 "model": model,
                                 "input": request_input,
@@ -848,7 +1018,7 @@ class GeminiService:
                                 kwargs["previous_interaction_id"] = (
                                     current_previous_id
                                 )
-                            interaction = await self._client.aio.interactions.create(
+                            interaction = await client.aio.interactions.create(
                                 **kwargs
                             )
                             text = extract_interaction_text(interaction)
@@ -864,7 +1034,7 @@ class GeminiService:
                         else:
                             if generate_contents is None:
                                 generate_contents = _build_generate_content(bundle)
-                            response = await self._client.aio.models.generate_content(
+                            response = await client.aio.models.generate_content(
                                 model=model,
                                 contents=generate_contents,
                                 config=types.GenerateContentConfig(
@@ -909,7 +1079,7 @@ class GeminiService:
                         self._settings
                     ):
                         continuation_count += 1
-                        if self._interactions_available:
+                        if interactions_available:
                             if interaction_id:
                                 current_previous_id = interaction_id
                                 request_input = _CONTINUATION_PROMPT
@@ -968,12 +1138,14 @@ class GeminiService:
                     raise request_error from exc
                 except Exception as exc:
                     code = _error_code(exc)
-                    if self._interactions_available and _is_location_error(exc):
+                    if interactions_available and _is_location_error(exc):
                         logger.warning(
                             "Gemini Interactions API is unavailable in this region; "
                             "switching to generateContent"
                         )
-                        self._interactions_available = False
+                        interactions_available = False
+                        if use_interactions is None:
+                            self._interactions_available = False
                         current_previous_id = None
                         base_request_input = None
                         request_input = None
@@ -1018,7 +1190,7 @@ class GeminiService:
                         await asyncio.sleep(delay)
                         continue
 
-                    logger.exception(
+                    logger.warning(
                         "Gemini request failed code=%s type=%s",
                         code,
                         type(exc).__name__,
@@ -1037,6 +1209,8 @@ class GeminiService:
                         transient_failure=_is_retryable(exc, code),
                     )
                     if combined_text:
+                        if request_error.status_code == 429 and on_quota is not None:
+                            on_quota(request_error)
                         self._start_route_cooldown(_ModelRoute("google", model), request_error)
                         return GeminiResult(
                             text=_finish_text(combined_text, True),
@@ -1264,6 +1438,8 @@ class GeminiService:
         *,
         model: str,
         is_fallback: bool,
+        api_key: str | None = None,
+        on_quota: Callable[[GeminiRequestError], None] | None = None,
     ) -> GeminiResult:
         client = self._groq_client
         if client is None:
@@ -1289,7 +1465,10 @@ class GeminiService:
                     "stream": False,
                 }
                 async with asyncio.timeout(self._settings.gemini_timeout_seconds):
-                    response = await client.post("chat/completions", json=payload)
+                    kwargs = (
+                        {"headers": {"Authorization": f"Bearer {api_key}"}} if api_key else {}
+                    )
+                    response = await client.post("chat/completions", json=payload, **kwargs)
                     response.raise_for_status()
                 completion = _extract_chat_completion(response.json())
                 _raise_if_unusable_chat_completion(
@@ -1391,7 +1570,7 @@ class GeminiService:
                     )
                     await asyncio.sleep(delay)
                     continue
-                logger.exception(
+                logger.warning(
                     "Groq fallback failed code=%s type=%s",
                     code,
                     type(exc).__name__,
@@ -1410,6 +1589,8 @@ class GeminiService:
                     transient_failure=_is_retryable(exc, code),
                 )
                 if combined_text:
+                    if request_error.status_code == 429 and on_quota is not None:
+                        on_quota(request_error)
                     self._start_route_cooldown(_ModelRoute("groq", model), request_error)
                     return GeminiResult(
                         text=_finish_text(combined_text, True),

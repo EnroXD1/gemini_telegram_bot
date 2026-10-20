@@ -820,7 +820,9 @@ def create_router(
         interaction_id = await processor.storage.get_interaction_id(scope_key)
         has_context = has_local_context or bool(interaction_id)
         context_storage = (
-            "локально в SQLite; для Google также используется серверная цепочка"
+            "локально в SQLite; без серверной цепочки"
+            if processor.gemini.uses_local_history
+            else "локально в SQLite; для Google также используется серверная цепочка"
         )
         fallback_routes = processor.gemini.fallback_routes()
         fallback = (

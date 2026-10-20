@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -10,6 +10,22 @@ from dotenv import load_dotenv
 
 class ConfigError(RuntimeError):
     """Raised when an environment variable has an invalid value."""
+
+
+def _api_keys(*plural_names: str, singular: str) -> tuple[str, ...]:
+    raw = next(
+        (os.getenv(name, "").strip() for name in plural_names if os.getenv(name, "").strip()),
+        os.getenv(singular, "").strip(),
+    )
+    keys = tuple(dict.fromkeys(part.strip() for part in raw.split(",") if part.strip()))
+    label = "/".join((*plural_names, singular))
+    if len(keys) > 16:
+        raise ConfigError(f"{label}: разрешено не более 16 уникальных ключей")
+    if any(
+        len(key) > 2048 or any(char.isspace() or ord(char) < 32 for char in key) for key in keys
+    ):
+        raise ConfigError(f"{label}: каждый ключ должен быть отдельной строкой без пробелов")
+    return keys
 
 
 DEFAULT_SYSTEM_PROMPT = """Ты — полезный ИИ-ассистент внутри Telegram.
@@ -145,19 +161,19 @@ def _choice(name: str, default: str, allowed: set[str]) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    telegram_bot_token: str
+    telegram_bot_token: str = field(repr=False)
     ai_provider: str
-    gemini_api_key: str
+    gemini_api_key: str = field(repr=False)
     gemini_vertex_ai: bool
     gemini_model: str
-    openrouter_api_key: str
+    openrouter_api_key: str = field(repr=False)
     openrouter_model: str
     openrouter_fallback_models: tuple[str, ...]
     openrouter_history_turns: int
     openrouter_history_item_chars: int
     openrouter_history_max_chars: int
     openrouter_history_retention_days: int
-    groq_api_key: str
+    groq_api_key: str = field(repr=False)
     groq_fallback_enabled: bool
     groq_model: str
     groq_fallback_models: tuple[str, ...]
@@ -203,6 +219,8 @@ class Settings:
     drop_pending_updates: bool
     log_level: str
     ai_free_only: bool = False
+    google_api_keys: tuple[str, ...] = field(default=(), repr=False)
+    groq_api_keys: tuple[str, ...] = field(default=(), repr=False)
 
     @property
     def active_model(self) -> str:
@@ -214,7 +232,7 @@ class Settings:
 
     @property
     def groq_fallback_ready(self) -> bool:
-        return self.groq_fallback_enabled and bool(self.groq_api_key)
+        return self.groq_fallback_enabled and bool(self.groq_api_key or self.groq_api_keys)
 
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> Settings:
@@ -223,21 +241,19 @@ class Settings:
         ai_provider = _choice(
             "AI_PROVIDER", "google", {"google", "groq", "openrouter"}
         )
-        gemini_api_key = (
-            _required("GEMINI_API_KEY")
-            if ai_provider == "google"
-            else os.getenv("GEMINI_API_KEY", "").strip()
-        )
+        google_keys = _api_keys("GOOGLE_API_KEYS", "GEMINI_API_KEYS", singular="GEMINI_API_KEY")
+        if ai_provider == "google" and not google_keys:
+            raise ConfigError("Не задан GEMINI_API_KEY или GOOGLE_API_KEYS")
+        gemini_api_key = google_keys[0] if google_keys else ""
         openrouter_api_key = (
             _required("OPENROUTER_API_KEY")
             if ai_provider == "openrouter"
             else os.getenv("OPENROUTER_API_KEY", "").strip()
         )
-        groq_api_key = (
-            _required("GROQ_API_KEY")
-            if ai_provider == "groq"
-            else os.getenv("GROQ_API_KEY", "").strip()
-        )
+        groq_keys = _api_keys("GROQ_API_KEYS", singular="GROQ_API_KEY")
+        if ai_provider == "groq" and not groq_keys:
+            raise ConfigError("Не задан GROQ_API_KEY или GROQ_API_KEYS")
+        groq_api_key = groq_keys[0] if groq_keys else ""
 
         temperature = _float("GEMINI_TEMPERATURE", 0.7, 0.0)
         if temperature > 2.0:
@@ -261,6 +277,8 @@ class Settings:
             telegram_bot_token=_telegram_bot_token(),
             ai_provider=ai_provider,
             gemini_api_key=gemini_api_key,
+            google_api_keys=google_keys,
+            groq_api_keys=groq_keys,
             gemini_vertex_ai=_bool("GEMINI_VERTEX_AI", False),
             gemini_model=(
                 os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
