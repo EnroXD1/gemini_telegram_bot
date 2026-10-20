@@ -27,8 +27,7 @@ from .processor import MessageProcessor
 from .storage import Storage
 from .usage import UsageTracker
 from .wall import WallService
-from .readme import
-create_readme_router
+from .readme import create_readme_router
 
 logger = logging.getLogger(__name__)
 
