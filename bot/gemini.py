@@ -5,12 +5,16 @@ import base64
 import gc
 import json
 import logging
+import math
 import random
 import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from datetime import UTC
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -180,6 +184,8 @@ class GeminiRequestError(RuntimeError):
         fallback_allowed: bool = False,
         quota_exhausted: bool = False,
         fallback_reason: str | None = None,
+        retry_after_seconds: float | None = None,
+        transient_failure: bool = False,
     ) -> None:
         super().__init__(user_message)
         self.user_message = user_message
@@ -189,6 +195,12 @@ class GeminiRequestError(RuntimeError):
         self.fallback_allowed = fallback_allowed
         self.quota_exhausted = quota_exhausted
         self.fallback_reason = fallback_reason
+        self.retry_after_seconds = retry_after_seconds
+        self.transient_failure = transient_failure
+
+
+class _RouteCoolingDown(Exception):
+    """A queued request must skip the route; this is not another API failure."""
 
 
 class ModelSelectionError(ValueError):
@@ -212,6 +224,7 @@ class GeminiService:
             self._model = getattr(settings, "gemini_model", "gemini-3.6-flash")
         self._interactions_available = False
         self._route_cooldowns: dict[tuple[str, str], float] = {}
+        self._route_probes: set[tuple[str, str]] = set()
 
         if getattr(settings, "openrouter_api_key", ""):
             self._openrouter_client = httpx.AsyncClient(
@@ -345,6 +358,10 @@ class GeminiService:
         until = max(cooldowns.get((provider, model), 0), cooldowns.get((provider, "*"), 0))
         return max(0.0, until - time.monotonic())
 
+    def route_is_probing(self, provider: str, model: str) -> bool:
+        probes = getattr(self, "_route_probes", set())
+        return (provider, model) in probes or (provider, "*") in probes
+
     @property
     def current_provider(self) -> str:
         return self._provider
@@ -428,16 +445,17 @@ class GeminiService:
         failed_route: _ModelRoute | None = None
         notify_switch = False
         attempted = 0
+        cooling_delays: list[float] = []
 
         for route in routes:
             if self._route_is_cooling_down(route):
+                cooling_delays.append(self.cooldown_remaining(route.provider, route.model))
                 if failed_route is None:
                     failed_route = route
                     last_error = GeminiRequestError(
-                        "Лимит модели недавно был исчерпан.",
+                        "Маршрут временно на паузе после ошибки провайдера.",
                         provider=route.provider,
                         fallback_allowed=True,
-                        quota_exhausted=True,
                     )
                 continue
             if failed_route is not None and last_error is not None:
@@ -494,6 +512,13 @@ class GeminiService:
                     actual_model=result.model, truncated=result.truncated,
                 )
                 return replace(result, provider=result.provider or route.provider)
+            except _RouteCoolingDown:
+                # Another request opened the circuit while this one waited for a slot.
+                attempted -= 1
+                cooling_delays.append(self.cooldown_remaining(route.provider, route.model))
+                if failed_route is None:
+                    failed_route = route
+                continue
             except GeminiRequestError as exc:
                 self.health.record(
                     route.provider, route.model, started,
@@ -504,14 +529,22 @@ class GeminiService:
                 )
                 failed_route = route
                 notify_switch = True
+                self._start_route_cooldown(route, exc)
                 if not automatic_fallback or not exc.fallback_allowed:
                     raise
                 last_error = _detached_request_error(exc)
-                self._start_route_cooldown(route, last_error)
                 if bundle.media:
                     _release_exception_chain(exc)
                     gc.collect()
 
+        if not attempted and cooling_delays:
+            retry_after = max(1.0, min(cooling_delays))
+            raise GeminiRequestError(
+                "Все подходящие AI-маршруты временно на паузе. "
+                f"Попробуйте примерно через {math.ceil(retry_after)} сек.",
+                delete_after_seconds=20.0,
+                retry_after_seconds=retry_after,
+            )
         if last_error is not None and attempted > 1:
             raise GeminiRequestError(
                 "Все доступные модели временно недоступны, исчерпали лимит или "
@@ -651,7 +684,7 @@ class GeminiService:
                     fallback_allowed=True,
                 )
             messages = self._build_chat_messages(bundle, history)
-            async with self._semaphore:
+            async with self._route_request_guard(route):
                 return await self._generate_groq(
                     messages,
                     previous_interaction_id,
@@ -669,30 +702,64 @@ class GeminiService:
         if cooldowns is None:
             cooldowns = {}
             self._route_cooldowns = cooldowns
-        now = time.monotonic()
-        for key in ((route.provider, route.model), (route.provider, "*")):
-            until = cooldowns.get(key, 0.0)
-            if until > now:
-                return True
-            cooldowns.pop(key, None)
-        return False
+        return (
+            self.cooldown_remaining(route.provider, route.model) > 0
+            or self.route_is_probing(route.provider, route.model)
+        )
+
+    @asynccontextmanager
+    async def _route_request_guard(self, route: _ModelRoute) -> AsyncIterator[None]:
+        async with self._semaphore:
+            if self._route_is_cooling_down(route):
+                raise _RouteCoolingDown
+            cooldowns = self._route_cooldowns
+            probes = getattr(self, "_route_probes", None)
+            if probes is None:
+                probes = self._route_probes = set()
+            recovering = {
+                key: cooldowns[key]
+                for key in ((route.provider, route.model), (route.provider, "*"))
+                if key in cooldowns
+            }
+            probes.update(recovering)
+            try:
+                yield
+            except GeminiRequestError as exc:
+                # Publish the quarantine before releasing the semaphore to queued calls.
+                self._start_route_cooldown(route, exc)
+                raise
+            else:
+                for key, deadline in recovering.items():
+                    if cooldowns.get(key) == deadline:
+                        cooldowns.pop(key, None)
+            finally:
+                probes.difference_update(recovering)
 
     def _start_route_cooldown(
         self, route: _ModelRoute, error: GeminiRequestError
     ) -> None:
         model_missing = route.provider == "openrouter" and error.status_code == 404
-        if not error.quota_exhausted and not model_missing:
-            return
-        seconds = float(
-            getattr(self._settings, "ai_fallback_cooldown_seconds", 600.0)
+        temporary_failure = (
+            error.status_code in {408, 429, 500, 502, 503, 504} or error.transient_failure
         )
+        if not error.quota_exhausted and not model_missing and not temporary_failure:
+            return
+        if error.quota_exhausted or model_missing or error.status_code == 429:
+            seconds = float(getattr(self._settings, "ai_fallback_cooldown_seconds", 600.0))
+        else:
+            seconds = float(getattr(self._settings, "ai_transient_cooldown_seconds", 60.0))
+        if error.retry_after_seconds is not None and math.isfinite(error.retry_after_seconds):
+            seconds = max(1.0, error.retry_after_seconds)
         provider_wide = error.status_code == 402 and route.provider != "openrouter"
         key = (
             (route.provider, "*")
             if provider_wide
             else (route.provider, route.model)
         )
-        self._route_cooldowns[key] = time.monotonic() + max(1.0, seconds)
+        cooldowns = getattr(self, "_route_cooldowns", None)
+        if cooldowns is None:
+            cooldowns = self._route_cooldowns = {}
+        cooldowns[key] = max(cooldowns.get(key, 0), time.monotonic() + max(1.0, seconds))
 
     async def _notify_model_switch(
         self,
@@ -754,7 +821,7 @@ class GeminiService:
         interaction_id: str | None = None
         attempt = 0
 
-        async with self._semaphore:
+        async with self._route_request_guard(_ModelRoute("google", model)):
             while True:
                 try:
                     async with asyncio.timeout(
@@ -879,7 +946,15 @@ class GeminiService:
                         )
                     raise
                 except TimeoutError as exc:
+                    request_error = GeminiRequestError(
+                        "Gemini не успел ответить за отведённое время. "
+                        "Попробуйте ещё раз или отправьте файл меньшего размера.",
+                        provider="google",
+                        status_code=408,
+                        fallback_allowed=True,
+                    )
                     if combined_text:
+                        self._start_route_cooldown(_ModelRoute("google", model), request_error)
                         logger.warning(
                             "Gemini continuation timed out after partial response"
                         )
@@ -890,13 +965,7 @@ class GeminiService:
                             provider="google",
                             truncated=True,
                         )
-                    raise GeminiRequestError(
-                        "Gemini не успел ответить за отведённое время. "
-                        "Попробуйте ещё раз или отправьте файл меньшего размера.",
-                        provider="google",
-                        status_code=408,
-                        fallback_allowed=True,
-                    ) from exc
+                    raise request_error from exc
                 except Exception as exc:
                     code = _error_code(exc)
                     if self._interactions_available and _is_location_error(exc):
@@ -934,6 +1003,9 @@ class GeminiService:
                     if (
                         _is_retryable(exc, code)
                         and not _is_quota_error(exc, code)
+                        and code != 503
+                        and not isinstance(exc, httpx.TransportError)
+                        and _retry_after_seconds(exc) is None
                         and attempt < self._settings.gemini_retry_attempts
                     ):
                         delay = min(8.0, (2 ** (attempt - 1)) + random.random())
@@ -951,15 +1023,7 @@ class GeminiService:
                         code,
                         type(exc).__name__,
                     )
-                    if combined_text:
-                        return GeminiResult(
-                            text=_finish_text(combined_text, True),
-                            interaction_id=interaction_id,
-                            context_was_reset=context_was_reset,
-                            provider="google",
-                            truncated=True,
-                        )
-                    raise GeminiRequestError(
+                    request_error = GeminiRequestError(
                         _friendly_error(code),
                         delete_after_seconds=20.0 if code == 429 else None,
                         provider="google",
@@ -969,7 +1033,19 @@ class GeminiService:
                         fallback_reason=(
                             "blocked" if _is_safety_block_error(exc) else None
                         ),
-                    ) from exc
+                        retry_after_seconds=_retry_after_seconds(exc),
+                        transient_failure=_is_retryable(exc, code),
+                    )
+                    if combined_text:
+                        self._start_route_cooldown(_ModelRoute("google", model), request_error)
+                        return GeminiResult(
+                            text=_finish_text(combined_text, True),
+                            interaction_id=interaction_id,
+                            context_was_reset=context_was_reset,
+                            provider="google",
+                            truncated=True,
+                        )
+                    raise request_error from exc
 
     async def _generate_openrouter(
         self,
@@ -993,7 +1069,7 @@ class GeminiService:
         continuation_count = 0
         attempt = 0
 
-        async with self._semaphore:
+        async with self._route_request_guard(_ModelRoute("openrouter", model)):
             while True:
                 try:
                     if not self.route_allowed("openrouter", model):
@@ -1102,7 +1178,17 @@ class GeminiService:
                         )
                     raise
                 except TimeoutError as exc:
+                    request_error = GeminiRequestError(
+                        "OpenRouter не успел получить ответ модели за отведённое "
+                        "время. Попробуйте ещё раз или отправьте файл меньшего размера.",
+                        provider="openrouter",
+                        status_code=408,
+                        fallback_allowed=True,
+                    )
                     if combined_text:
+                        self._start_route_cooldown(
+                            _ModelRoute("openrouter", model), request_error,
+                        )
                         logger.warning(
                             "OpenRouter continuation timed out after partial response"
                         )
@@ -1114,19 +1200,16 @@ class GeminiService:
                             truncated=True,
                             model=actual_model,
                         )
-                    raise GeminiRequestError(
-                        "OpenRouter не успел получить ответ модели за отведённое "
-                        "время. Попробуйте ещё раз или отправьте файл меньшего размера.",
-                        provider="openrouter",
-                        status_code=408,
-                        fallback_allowed=True,
-                    ) from exc
+                    raise request_error from exc
                 except Exception as exc:
                     code = _error_code(exc)
                     attempt += 1
                     if (
                         _is_retryable(exc, code)
                         and not _is_quota_error(exc, code)
+                        and code != 503
+                        and not isinstance(exc, httpx.TransportError)
+                        and _retry_after_seconds(exc) is None
                         and attempt < self._settings.gemini_retry_attempts
                     ):
                         delay = min(8.0, (2 ** (attempt - 1)) + random.random())
@@ -1144,16 +1227,7 @@ class GeminiService:
                         code,
                         type(exc).__name__,
                     )
-                    if combined_text:
-                        return GeminiResult(
-                            text=_finish_text(combined_text, True),
-                            interaction_id=None,
-                            context_was_reset=bool(previous_interaction_id),
-                            provider="openrouter",
-                            truncated=True,
-                            model=actual_model,
-                        )
-                    raise GeminiRequestError(
+                    request_error = GeminiRequestError(
                         _friendly_openrouter_error(code),
                         delete_after_seconds=20.0 if code == 429 else None,
                         provider="openrouter",
@@ -1166,7 +1240,22 @@ class GeminiService:
                         fallback_reason=(
                             "blocked" if _is_safety_block_error(exc) else None
                         ),
-                    ) from exc
+                        retry_after_seconds=_retry_after_seconds(exc),
+                        transient_failure=_is_retryable(exc, code),
+                    )
+                    if combined_text:
+                        self._start_route_cooldown(
+                            _ModelRoute("openrouter", model), request_error,
+                        )
+                        return GeminiResult(
+                            text=_finish_text(combined_text, True),
+                            interaction_id=None,
+                            context_was_reset=bool(previous_interaction_id),
+                            provider="openrouter",
+                            truncated=True,
+                            model=actual_model,
+                        )
+                    raise request_error from exc
 
     async def _generate_groq(
         self,
@@ -1260,7 +1349,16 @@ class GeminiService:
                     )
                 raise
             except TimeoutError as exc:
+                label = "Резервная модель Groq" if is_fallback else "Модель Groq"
+                request_error = GeminiRequestError(
+                    f"{label} не успела ответить. "
+                    "Попробуйте немного позже.",
+                    provider="groq",
+                    status_code=408,
+                    fallback_allowed=True,
+                )
                 if combined_text:
+                    self._start_route_cooldown(_ModelRoute("groq", model), request_error)
                     logger.warning(
                         "Groq continuation timed out after partial response"
                     )
@@ -1272,20 +1370,16 @@ class GeminiService:
                         truncated=True,
                         model=actual_model,
                     )
-                label = "Резервная модель Groq" if is_fallback else "Модель Groq"
-                raise GeminiRequestError(
-                    f"{label} не успела ответить. "
-                    "Попробуйте немного позже.",
-                    provider="groq",
-                    status_code=408,
-                    fallback_allowed=True,
-                ) from exc
+                raise request_error from exc
             except Exception as exc:
                 code = _error_code(exc)
                 attempt += 1
                 if (
                     _is_retryable(exc, code)
                     and not _is_quota_error(exc, code)
+                    and code != 503
+                    and not isinstance(exc, httpx.TransportError)
+                    and _retry_after_seconds(exc) is None
                     and attempt < self._settings.gemini_retry_attempts
                 ):
                     delay = min(4.0, (2 ** (attempt - 1)) + random.random())
@@ -1302,16 +1396,7 @@ class GeminiService:
                     code,
                     type(exc).__name__,
                 )
-                if combined_text:
-                    return GeminiResult(
-                        text=_finish_text(combined_text, True),
-                        interaction_id=None,
-                        context_was_reset=bool(previous_interaction_id),
-                        provider="groq",
-                        truncated=True,
-                        model=actual_model,
-                    )
-                raise GeminiRequestError(
+                request_error = GeminiRequestError(
                     _friendly_groq_error(code, is_fallback=is_fallback),
                     delete_after_seconds=20.0 if code == 429 else None,
                     provider="groq",
@@ -1321,7 +1406,20 @@ class GeminiService:
                     fallback_reason=(
                         "blocked" if _is_safety_block_error(exc) else None
                     ),
-                ) from exc
+                    retry_after_seconds=_retry_after_seconds(exc),
+                    transient_failure=_is_retryable(exc, code),
+                )
+                if combined_text:
+                    self._start_route_cooldown(_ModelRoute("groq", model), request_error)
+                    return GeminiResult(
+                        text=_finish_text(combined_text, True),
+                        interaction_id=None,
+                        context_was_reset=bool(previous_interaction_id),
+                        provider="groq",
+                        truncated=True,
+                        model=actual_model,
+                    )
+                raise request_error from exc
 
     def _build_chat_messages(
         self,
@@ -1731,6 +1829,8 @@ def _detached_request_error(error: GeminiRequestError) -> GeminiRequestError:
         fallback_allowed=error.fallback_allowed,
         quota_exhausted=error.quota_exhausted,
         fallback_reason=error.fallback_reason,
+        retry_after_seconds=error.retry_after_seconds,
+        transient_failure=error.transient_failure,
     )
 
 
@@ -1850,6 +1950,28 @@ def _error_code(exc: Exception) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Read an HTTP delay or date, without keeping the response/attachment alive."""
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        return None
+    raw = headers.get("Retry-After") or headers.get("retry-after")
+    if not isinstance(raw, str) or not raw.strip() or len(raw) > 256:
+        return None
+    raw = raw.strip()
+    try:
+        if re.fullmatch(r"[0-9]+", raw):
+            seconds = float(raw)
+        else:
+            stamp = parsedate_to_datetime(raw)
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=UTC)
+            seconds = stamp.timestamp() - time.time()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return max(1.0, seconds) if math.isfinite(seconds) else None
+
+
 def _is_expired_context_error(exc: Exception, code: int | None) -> bool:
     if code not in {400, 404}:
         return False
@@ -1875,6 +1997,8 @@ def _is_location_error(exc: Exception) -> bool:
 
 
 def _is_retryable(exc: Exception, code: int | None) -> bool:
+    if isinstance(exc, httpx.TransportError):
+        return True
     if code in {408, 429, 500, 502, 503, 504}:
         return True
     text = str(exc).lower()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,6 +99,8 @@ def _float(name: str, default: float, minimum: float | None = None) -> float:
         value = default if raw is None or not raw.strip() else float(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} должен быть числом") from exc
+    if not math.isfinite(value):
+        raise ConfigError(f"{name} должен быть конечным числом")
     if minimum is not None and value < minimum:
         raise ConfigError(f"{name} должен быть не меньше {minimum}")
     return value
@@ -165,6 +168,7 @@ class Settings:
     ai_max_continuations: int
     ai_auto_fallback_enabled: bool
     ai_fallback_cooldown_seconds: float
+    ai_transient_cooldown_seconds: float
     gemini_store_interactions: bool
     database_path: Path
     group_default_mode: str
@@ -306,6 +310,9 @@ class Settings:
             ai_auto_fallback_enabled=_bool("AI_AUTO_FALLBACK_ENABLED", True),
             ai_fallback_cooldown_seconds=_float(
                 "AI_FALLBACK_COOLDOWN_SECONDS", 600.0, minimum=1.0
+            ),
+            ai_transient_cooldown_seconds=_float(
+                "AI_TRANSIENT_COOLDOWN_SECONDS", 60.0, minimum=1.0
             ),
             gemini_store_interactions=_bool("GEMINI_STORE_INTERACTIONS", True),
             database_path=Path(os.getenv("DATABASE_PATH", "data/bot.sqlite3")),

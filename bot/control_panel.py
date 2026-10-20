@@ -153,6 +153,8 @@ def diagnostics_view(service: GeminiService) -> tuple[str, InlineKeyboardMarkup]
             state = "⏸ не участвует в текущей цепочке"
         elif cooldown:
             state = f"⏳ пауза ещё {cooldown} сек."
+        elif service.route_is_probing(provider, model):
+            state = "⏳ проверка восстановления после паузы"
         elif stats is None:
             state = "⚪ запросов ещё не было"
         else:
