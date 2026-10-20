@@ -4,6 +4,8 @@ import asyncio
 import logging
 import math
 from collections import defaultdict
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
@@ -32,6 +34,13 @@ _UNAVAILABLE_BUSINESS_PEER_ERRORS = (
     "BUSINESS_CONNECTION_NOT_ALLOWED",
     "BUSINESS_PEER_USAGE_MISSING",
 )
+
+
+class InlineRequestRejected(ValueError):
+    def __init__(self, reason: str, retry_after: float) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_after = retry_after
 
 
 class MessageProcessor:
@@ -388,6 +397,31 @@ class MessageProcessor:
                 task.cancel()
                 cancelled += 1
         return cancelled
+
+    @asynccontextmanager
+    async def inline_request(self, user_id: int) -> AsyncIterator[None]:
+        """Share bot-wide per-user admission and owner bans with inline AI requests."""
+        key = str(user_id)
+        guarded = user_id not in self.settings.owner_ids
+        if guarded:
+            if key in self._active_users:
+                raise InlineRequestRejected("busy", self._rate_limiter.violate(key))
+            retry_after = self._rate_limiter.check(key)
+            if retry_after is not None:
+                raise InlineRequestRejected("rate_limit", retry_after)
+            self._active_users.add(key)
+        task = asyncio.current_task()
+        scope = f"inline:{user_id}:{id(task)}"
+        if task is not None:
+            self._active_tasks[scope] = task
+            self._active_task_users[scope] = user_id
+        try:
+            yield
+        finally:
+            self._active_tasks.pop(scope, None)
+            self._active_task_users.pop(scope, None)
+            if guarded:
+                self._active_users.discard(key)
 
     async def reply(
         self, message: Message, text: str, *, formatted: bool = True, controls: bool = False

@@ -175,6 +175,8 @@ class Settings:
     conversation_scope: str
     owner_ids: frozenset[int]
     allowed_chat_ids: frozenset[int]
+    inline_enabled: bool
+    inline_allowed_user_ids: frozenset[int]
     business_monitor_enabled: bool
     business_auto_reply_enabled: bool
     business_archive_media: bool
@@ -326,6 +328,8 @@ class Settings:
             ),
             owner_ids=_id_set("OWNER_IDS"),
             allowed_chat_ids=_id_set("ALLOWED_CHAT_IDS"),
+            inline_enabled=_bool("INLINE_ENABLED", True),
+            inline_allowed_user_ids=_id_set("INLINE_ALLOWED_USER_IDS"),
             business_monitor_enabled=_bool("BUSINESS_MONITOR_ENABLED", True),
             business_auto_reply_enabled=_bool(
                 "BUSINESS_AUTO_REPLY_ENABLED", True

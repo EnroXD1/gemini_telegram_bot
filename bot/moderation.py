@@ -133,6 +133,8 @@ def _format_user(index: int, record: BotUserRecord) -> str:
     source = (
         "личный чат"
         if record.last_chat_type == "private"
+        else "inline (чат назначения неизвестен)"
+        if record.last_chat_type == "inline"
         else (f"группа «{_short(record.last_chat_title or 'группа', 40)}»")
     )
     first = datetime.fromtimestamp(record.first_seen_at, _MOSCOW).strftime("%d.%m.%Y %H:%M")

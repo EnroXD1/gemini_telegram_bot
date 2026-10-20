@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from aiogram.types import CallbackQuery, Message, TelegramObject
+from aiogram.types import CallbackQuery, InlineQuery, Message, TelegramObject
 
 from .storage import Storage, UserActivityRecord, UserActivityStats
 
@@ -135,6 +135,33 @@ class ActivityTracker:
         except Exception:
             logger.exception("Could not finish moderation event id=%s", event_id)
 
+    async def record_inline(
+        self,
+        query: InlineQuery,
+        *,
+        kind: str = "ai",
+        outcome: str = "pending",
+        reason: str | None = None,
+    ) -> int | None:
+        user = query.from_user
+        if user.is_bot or user.id in self.owner_ids:
+            return None
+        try:
+            await self._maybe_prune()
+            # Telegram supplies neither a destination chat nor a message ID in inline mode.
+            return await self.storage.record_user_event(
+                user_id=user.id,
+                chat_id=0,
+                message_id=0,
+                kind=kind,
+                content="[Inline] " + query.query[:990],
+                outcome=outcome,
+                reason=reason,
+            )
+        except Exception:
+            logger.exception("Could not record inline event user_id=%s", user.id)
+            return None
+
     async def denied_callback(self, callback: CallbackQuery) -> None:
         if not isinstance(callback.message, Message):
             return
@@ -239,7 +266,12 @@ def history_pages(user_id: int, records: list[UserActivityRecord]) -> list[str]:
             status += ": " + reasons.get(record.reason, record.reason)
         entry = (
             f"\n\n{stamp} · {kinds[record.kind]} · {status}\n"
-            f"Чат: {record.chat_id}; сообщение: {record.message_id}\n{record.content}"
+            + (
+                "Источник: inline, чат назначения неизвестен\n"
+                if record.chat_id == 0
+                else f"Чат: {record.chat_id}; сообщение: {record.message_id}\n"
+            )
+            + record.content
         )
         if len((pages[-1] + entry).encode("utf-16-le")) // 2 > 3800:
             pages.append(title + " (продолжение)")

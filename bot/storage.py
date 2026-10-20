@@ -116,6 +116,7 @@ class BotUsageStats:
     openrouter_request_count: int
     groq_request_count: int
     google_request_count: int
+    inline_users: int = 0
 
 
 class Storage:
@@ -912,6 +913,7 @@ class Storage:
                     COALESCE(SUM(last_chat_type = 'private'), 0) AS private_users,
                     COALESCE(SUM(last_chat_type IN ('group', 'supergroup')), 0)
                         AS group_users,
+                    COALESCE(SUM(last_chat_type = 'inline'), 0) AS inline_users,
                     COALESCE(SUM(interaction_count), 0) AS interaction_count,
                     COALESCE(SUM(ai_request_count), 0) AS ai_request_count,
                     COALESCE(SUM(openrouter_request_count), 0)
@@ -932,6 +934,7 @@ class Storage:
             active_30d=int(row["active_30d"]),
             private_users=int(row["private_users"]),
             group_users=int(row["group_users"]),
+            inline_users=int(row["inline_users"]),
             interaction_count=int(row["interaction_count"]),
             ai_request_count=int(row["ai_request_count"]),
             openrouter_request_count=int(row["openrouter_request_count"]),

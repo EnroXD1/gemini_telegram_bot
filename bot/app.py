@@ -19,6 +19,7 @@ from .control_panel import create_control_router, restore_ai_settings
 from .emoji_theme import EmojiTheme
 from .gemini import GeminiService
 from .handlers import create_router
+from .inline import InlineService, create_inline_router
 from .media import MediaExtractor
 from .moderation import BanMiddleware, create_moderation_router
 from .outgoing_emoji import OutgoingEmojiMiddleware
@@ -36,6 +37,7 @@ async def run_bot(settings: Settings) -> None:
     albums = AlbumBuffer(settings.album_debounce_seconds)
     bot = Bot(token=settings.telegram_bot_token)
     dispatcher = Dispatcher()
+    inline: InlineService | None = None
 
     try:
         await storage.open()
@@ -64,6 +66,7 @@ async def run_bot(settings: Settings) -> None:
             activity=activity,
         )
         monitor = BusinessMonitor(bot=bot, settings=settings, storage=storage)
+        inline = InlineService(processor)
         wall = WallService(
             max_source_bytes=settings.wall_max_source_bytes,
             max_pixels=settings.wall_max_pixels,
@@ -76,6 +79,7 @@ async def run_bot(settings: Settings) -> None:
         dispatcher.callback_query.outer_middleware(ban_middleware)
         dispatcher.message.outer_middleware(CommandActivityMiddleware(activity))
         dispatcher.include_router(create_moderation_router(processor))
+        dispatcher.include_router(create_inline_router(inline))
         dispatcher.include_router(create_control_router(processor))
         dispatcher.include_router(
             create_router(processor, albums, monitor, usage, emoji_theme, wall)
@@ -116,6 +120,8 @@ async def run_bot(settings: Settings) -> None:
             close_bot_session=False,
         )
     finally:
+        if inline is not None:
+            await inline.close()
         results = await asyncio.gather(
             albums.close(),
             storage.close(),
@@ -133,6 +139,7 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="start", description="Запустить бота"),
         BotCommand(command="help", description="Справка и возможности"),
         BotCommand(command="menu", description="Показать клавиатуру"),
+        BotCommand(command="inline", description="Перевод, текст и калькулятор в любом чате"),
         BotCommand(command="hidekeyboard", description="Скрыть клавиатуру"),
         BotCommand(command="settings", description="Настройки бота (владелец)"),
         BotCommand(command="diagnostics", description="Диагностика моделей (владелец)"),

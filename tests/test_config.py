@@ -233,6 +233,22 @@ def test_ai_continuations_are_capped_at_five(monkeypatch, tmp_path) -> None:
         Settings.from_env(tmp_path / "missing.env")
 
 
+def test_inline_defaults_and_explicit_access_settings(monkeypatch, tmp_path):
+    for name in TOKEN_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:test-token")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.delenv("INLINE_ENABLED", raising=False)
+    monkeypatch.delenv("INLINE_ALLOWED_USER_IDS", raising=False)
+    settings = Settings.from_env(tmp_path / "missing.env")
+    assert settings.inline_enabled and settings.inline_allowed_user_ids == frozenset()
+    monkeypatch.setenv("INLINE_ENABLED", "false")
+    monkeypatch.setenv("INLINE_ALLOWED_USER_IDS", "123456789, 987654321")
+    settings = Settings.from_env(tmp_path / "missing.env")
+    assert not settings.inline_enabled
+    assert settings.inline_allowed_user_ids == frozenset({123456789, 987654321})
+
+
 def test_business_auto_reply_can_default_to_monitoring_only(
     monkeypatch, tmp_path
 ) -> None:
