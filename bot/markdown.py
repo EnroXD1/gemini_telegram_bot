@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from aiogram.types import MessageEntity
 from telegramify_markdown import convert, split_entities
 
+from .math_formatting import prepare_math_markdown
 from .text_utils import split_text
 
 logger = logging.getLogger(__name__)
@@ -22,12 +23,12 @@ def render_markdown_chunks(markdown: str, limit: int) -> list[FormattedChunk]:
     if limit < 1:
         raise ValueError("limit must be positive")
 
-    source = markdown.strip()
+    source = prepare_math_markdown(markdown).markdown.strip()
     if not source:
         return []
 
     try:
-        text, entities = convert(source)
+        text, entities = convert(source, latex_escape=False)
         chunks = split_entities(text, entities, max_utf16_len=limit)
         return [
             FormattedChunk(

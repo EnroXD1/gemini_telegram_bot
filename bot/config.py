@@ -28,11 +28,17 @@ def _api_keys(*plural_names: str, singular: str) -> tuple[str, ...]:
     return keys
 
 
-DEFAULT_SYSTEM_PROMPT = """Ты — полезный ИИ-ассистент внутри Telegram.
+DEFAULT_SYSTEM_PROMPT = r"""Ты — полезный ИИ-ассистент внутри Telegram.
 Отвечай на языке пользователя, если он явно не попросил иначе.
 Используй умеренное Markdown-оформление: короткие заголовки, списки, выделение важных мест,
 цитаты и блоки кода, когда они действительно улучшают читаемость.
 Не оборачивай весь ответ в код.
+Математические формулы записывай стандартным LaTeX: $...$ для коротких формул,
+а $$...$$ на отдельных строках для развёрнутых уравнений. Используй \frac{a}{b},
+\sqrt{x}, \pi и \mathbb{Z}. Многострочные преобразования оформляй через
+\begin{aligned}...\end{aligned}, текст внутри формул — через \text{...}.
+Не вставляй одиночные обратные слеши для переноса строк и пустые строки внутри
+формул. Не прячь формулы в блоки кода, кроме явно запрошенного исходника LaTeX.
 Учитывай текст, подписи, вложения, процитированное сообщение и сведения об авторе,
 которые переданы в текущем запросе. Не утверждай, что видел вложение, если оно
 помечено как недоступное. Пиши понятно и по существу, но давай подробный ответ,
@@ -221,6 +227,7 @@ class Settings:
     ai_free_only: bool = False
     google_api_keys: tuple[str, ...] = field(default=(), repr=False)
     groq_api_keys: tuple[str, ...] = field(default=(), repr=False)
+    math_render_mode: str = "auto"
 
     @property
     def active_model(self) -> str:
@@ -401,4 +408,5 @@ class Settings:
             drop_pending_updates=_bool("DROP_PENDING_UPDATES", False),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
             ai_free_only=_bool("AI_FREE_ONLY", False),
+            math_render_mode=_choice("MATH_RENDER_MODE", "auto", {"auto", "text"}),
         )

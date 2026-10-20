@@ -24,6 +24,7 @@ from aiogram.types import (
 
 from .calculator import CalculationError, calculate
 from .gemini import GeminiRequestError
+from .math_formatting import readable_math_text
 from .models import PromptBundle
 from .processor import InlineRequestRejected, MessageProcessor
 
@@ -244,7 +245,7 @@ class InlineService:
                         )
                     if await self._denied(query):
                         return _Reply("Доступ ограничен")
-                    content = result.text.strip()
+                    content = readable_math_text(result.text.strip())
                     if not content:
                         raise GeminiRequestError("Пустой ответ")
                     await self.processor.usage.record_inline(

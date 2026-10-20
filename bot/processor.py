@@ -8,8 +8,13 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.types import Message, User
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNotFound,
+    TelegramRetryAfter,
+)
+from aiogram.types import Message, ReplyParameters, User
 
 from .activity import ActivityTracker
 from .config import Settings
@@ -17,6 +22,7 @@ from .emoji_theme import EmojiTheme
 from .gemini import GeminiRequestError, GeminiService
 from .keyboards import answer_keyboard
 from .markdown import FormattedChunk, render_markdown_chunks
+from .math_formatting import MathRichChunk, readable_math_text, render_math_rich_chunks
 from .media import MediaExtractor
 from .models import ConversationMessage, PromptBundle
 from .rate_limit import SlidingWindowRateLimiter
@@ -237,7 +243,7 @@ class MessageProcessor:
                     return
                 sent = await self.reply(
                     lead,
-                    result.text,
+                    readable_math_text(result.text) if result.truncated else result.text,
                     formatted=not result.truncated,
                     controls=True,
                 )
@@ -426,6 +432,13 @@ class MessageProcessor:
     async def reply(
         self, message: Message, text: str, *, formatted: bool = True, controls: bool = False
     ) -> list[Message]:
+        if (
+            formatted and getattr(self.settings, "math_render_mode", "auto") == "auto"
+            and callable(getattr(message, "answer_rich", None))
+        ):
+            math_chunks = render_math_rich_chunks(text)
+            if math_chunks:
+                return await self._reply_math(message, math_chunks, controls=controls)
         if formatted:
             chunks = render_markdown_chunks(text, self.settings.reply_chunk_size)
         else:
@@ -475,6 +488,72 @@ class MessageProcessor:
                     )
                     entities = None
             if index + 1 < len(chunks):
+                await asyncio.sleep(0.05)
+        return sent_messages
+
+    async def _reply_math(
+        self, message: Message, chunks: list[MathRichChunk], *, controls: bool
+    ) -> list[Message]:
+        sent_messages: list[Message] = []
+        native = True
+        for index, chunk in enumerate(chunks):
+            last = index == len(chunks) - 1
+            if native:
+                kwargs = {}
+                if (
+                    controls
+                    and last
+                    and message.chat.type == "private"
+                    and not message.business_connection_id
+                ):
+                    kwargs["reply_markup"] = answer_keyboard()
+                while True:
+                    try:
+                        sent = await message.answer_rich(
+                            chunk.payload,
+                            reply_parameters=(
+                                ReplyParameters(
+                                    message_id=message.message_id,
+                                    allow_sending_without_reply=True,
+                                )
+                                if not sent_messages
+                                else None
+                            ),
+                            **kwargs,
+                        )
+                        sent_messages.append(sent)
+                        break
+                    except TelegramRetryAfter as exc:
+                        await asyncio.sleep(max(0.1, float(exc.retry_after)))
+                    except (
+                        TelegramBadRequest,
+                        TelegramNotFound,
+                        TelegramForbiddenError,
+                    ) as exc:
+                        if _is_unavailable_business_peer(message, exc):
+                            return sent_messages
+                        if isinstance(exc, TelegramForbiddenError) and not any(
+                            marker in str(exc).lower() for marker in ("rich", "mathematical")
+                        ):
+                            raise
+                        # The rejected chunk was not sent. Do not replay earlier rich chunks,
+                        # and do not hide network errors whose delivery status is unknown.
+                        logger.warning(
+                            "Rich math rejected; using readable text type=%s",
+                            type(exc).__name__,
+                        )
+                        native = False
+                        break
+            if not native and chunk.fallback_text:
+                sent_messages.extend(
+                    await self.reply(
+                        message,
+                        chunk.fallback_text,
+                        formatted=False,
+                        controls=controls and last,
+                    )
+                )
+            if not last:
                 await asyncio.sleep(0.05)
         return sent_messages
 

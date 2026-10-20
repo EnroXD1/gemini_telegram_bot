@@ -148,6 +148,18 @@ async def test_inline_ai_uses_isolated_prompt_without_chat_context(inline_env, t
     assert env.answers()[-1].results[0].input_message_content.parse_mode is None
 
 
+async def test_inline_latex_becomes_readable_plain_text_without_extra_ai_calls(inline_env):
+    env = inline_env
+    env.processor.gemini.generate.return_value = GeminiResult(
+        text=r"Ответ: \[x=\frac{\pi}{4}+3\pi n\]", interaction_id=None, provider="openrouter"
+    )
+    await env.ask("Реши sin(2x/3)=1/2")
+    result = env.answers()[-1].results[0].input_message_content
+    assert "x=π/4+3π n" in result.message_text and "\\frac" not in result.message_text
+    assert result.parse_mode is None
+    env.processor.gemini.generate.assert_awaited_once()
+
+
 @pytest.mark.parametrize("text", ["", "  ", "tr", "fix", "calc"])
 async def test_empty_or_incomplete_query_only_offers_private_help(inline_env, text):
     env = inline_env
