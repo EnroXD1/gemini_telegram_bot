@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -37,7 +36,6 @@ from .keyboards import (
     main_keyboard,
 )
 from .processor import MessageProcessor
-from .storage import BotUserRecord
 from .usage import BotUsageMiddleware, UsageTracker
 from .wall import (
     WALL_CALLBACK_PREFIX,
@@ -361,6 +359,9 @@ def create_router(
             "/autoreply on|off — общие Business-автоответы (только владелец)\n"
             "/chats — режимы отдельных Business-собеседников\n"
             "/users — последние пользователи самого бота (только владелец)\n"
+            "/ban ID, /unban ID — блокировка и разблокировка (только владелец); "
+            "команду можно отправить ответом на сообщение\n"
+            "/banlist — список заблокированных (только владелец)\n"
             "/stats — статистика использования (только владелец)\n\n"
             "/model — выбрать провайдера и модель (только владелец)\n\n"
             "/emoji — настроить любые эмодзи бота (только владелец)\n\n"
@@ -840,32 +841,6 @@ def create_router(
             f"⚙️ Серверное хранение контекста: {context_storage}"
         )
 
-    @router.message(Command("users"))
-    async def users_handler(message: Message, command: CommandObject) -> None:
-        user = message.from_user
-        if message.chat.type != "private" or user is None:
-            await message.reply("Отчёт доступен в личном чате с ботом.")
-            return
-        if not _is_bot_owner(processor, user.id):
-            await message.reply("Статистика доступна только владельцу бота.")
-            return
-        limit = _parse_users_limit(command.args)
-        records = await processor.storage.list_bot_users(limit)
-        stats = await processor.storage.get_bot_usage_stats()
-        if not records:
-            await message.reply(
-                "Другие пользователи пока не обращались к самому боту.\n"
-                "Business-собеседники доступны отдельно: /chats"
-            )
-            return
-        lines = [
-            f"Пользователи самого бота: {stats.total_users}",
-            f"Последние {len(records)} (Business-чаты не включены):",
-        ]
-        for index, record in enumerate(records, start=1):
-            lines.append(_format_bot_user(index, record))
-        await message.reply("\n\n".join(lines))
-
     @router.message(Command("stats"))
     async def stats_handler(message: Message) -> None:
         user = message.from_user
@@ -994,46 +969,6 @@ def _truncate_button_text(value: str, limit: int) -> str:
     return normalized[: limit - 1] + "…"
 
 
-def _parse_users_limit(argument: str | None) -> int:
-    if not argument:
-        return 10
-
-
 def _first_command_argument(argument: str | None) -> str:
     parts = (argument or "").strip().split(maxsplit=1)
     return parts[0] if parts else ""
-    try:
-        return max(1, min(15, int(argument.strip())))
-    except ValueError:
-        return 10
-
-
-def _format_bot_user(index: int, record: BotUserRecord) -> str:
-    username = f"@{record.username}" if record.username else "без username"
-    if record.last_chat_type == "private":
-        source = "личный чат"
-    else:
-        title = _truncate_button_text(record.last_chat_title or "группа", 40)
-        source = f"группа «{title}»"
-    first_seen = datetime.fromtimestamp(
-        record.first_seen_at, timezone(timedelta(hours=3))
-    ).strftime("%d.%m.%Y %H:%M")
-    last_seen = datetime.fromtimestamp(
-        record.last_seen_at, timezone(timedelta(hours=3))
-    ).strftime("%d.%m.%Y %H:%M")
-    provider_parts: list[str] = []
-    if record.openrouter_request_count:
-        provider_parts.append(f"OpenRouter: {record.openrouter_request_count}")
-    if record.groq_request_count:
-        provider_parts.append(f"Groq: {record.groq_request_count}")
-    if record.google_request_count:
-        provider_parts.append(f"Google: {record.google_request_count}")
-    providers = ", ".join(provider_parts) if provider_parts else "AI ещё не вызывался"
-    name = _truncate_button_text(record.display_name, 60)
-    return (
-        f"{index}. {name} ({username})\n"
-        f"ID: {record.user_id}; источник: {source}\n"
-        f"Первое обращение: {first_seen}; последнее: {last_seen} МСК\n"
-        f"Обращений: {record.interaction_count}; AI: {record.ai_request_count} "
-        f"({providers})"
-    )

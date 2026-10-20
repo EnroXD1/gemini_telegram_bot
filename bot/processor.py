@@ -9,6 +9,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import Message, User
 
+from .activity import ActivityTracker
 from .config import Settings
 from .emoji_theme import EmojiTheme
 from .gemini import GeminiRequestError, GeminiService
@@ -45,6 +46,7 @@ class MessageProcessor:
         media: MediaExtractor,
         usage: UsageTracker,
         emoji_theme: EmojiTheme | None = None,
+        activity: ActivityTracker | None = None,
     ) -> None:
         self.bot = bot
         self.bot_user = bot_user
@@ -54,6 +56,9 @@ class MessageProcessor:
         self.media = media
         self.usage = usage
         self.emoji_theme = emoji_theme
+        self.activity = activity or ActivityTracker(
+            storage, settings.owner_ids, bot_user.username or "",
+        )
         self._rate_limiter = SlidingWindowRateLimiter(
             settings.rate_limit_requests,
             settings.rate_limit_window_seconds,
@@ -66,6 +71,7 @@ class MessageProcessor:
         # downloaded files in RAM while waiting for the AI service.
         self._attachment_semaphore = asyncio.Semaphore(1)
         self._active_tasks: dict[str, asyncio.Task[object]] = {}
+        self._active_task_users: dict[str, int] = {}
         self._active_users: set[str] = set()
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
@@ -79,6 +85,8 @@ class MessageProcessor:
         if sender is not None and sender.is_bot and lead.sender_chat is None:
             return
         if not await self.can_respond(lead):
+            if not lead.business_connection_id:
+                await self.activity.record(ordered, outcome="rejected", reason="banned")
             return
         if not self._is_chat_allowed(lead):
             return
@@ -93,12 +101,14 @@ class MessageProcessor:
         if not await self._should_answer(ordered, force=force or explicit_ask):
             return
 
+        event_id = await self.activity.record(ordered)
         user_id = _effective_sender_id(lead)
         user_request_key: str | None = None
         if user_id not in self.settings.owner_ids:
             user_request_key = str(user_id)
             if user_request_key in self._active_users:
                 penalty = self._rate_limiter.violate(user_request_key)
+                await self.activity.finish(event_id, "rejected", "busy")
                 if penalty > self.settings.rate_limit_window_seconds:
                     text = (
                         "Из-за повторного спама во время обработки доступ к ИИ "
@@ -117,6 +127,7 @@ class MessageProcessor:
                 return
             retry_after = self._rate_limiter.check(user_request_key)
             if retry_after is not None:
+                await self.activity.finish(event_id, "rejected", "rate_limit")
                 if retry_after > self.settings.rate_limit_window_seconds:
                     text = (
                         "Из-за слишком частых запросов доступ к ИИ временно "
@@ -143,11 +154,24 @@ class MessageProcessor:
             clean_text = strip_bot_mention(clean_text, self.bot_user.username)
 
         lock = self._scope_locks[scope_key]
-        async with lock:
+        outcome, reason = "cancelled", None
+        try:
+            await lock.acquire()
+        except BaseException:
+            if user_request_key is not None:
+                self._active_users.discard(user_request_key)
+            await self.activity.finish(event_id, "cancelled")
+            raise
+        try:
             current_task = asyncio.current_task()
             if current_task is not None:
                 self._active_tasks[scope_key] = current_task
+                if not lead.business_connection_id:
+                    self._active_task_users[scope_key] = user_id
             try:
+                if not await self.can_respond(lead):
+                    outcome, reason = "rejected", "banned"
+                    return
                 previous_id = await self.storage.get_interaction_id(scope_key)
                 history: tuple[ConversationMessage, ...] = ()
                 try:
@@ -167,6 +191,9 @@ class MessageProcessor:
                 bundle = PromptBundle(prompt="")
                 history_user_content = ""
                 try:
+                    if not await self.can_respond(lead):
+                        outcome, reason = "rejected", "banned"
+                        return
                     async with show_progress(
                         lead, emoji_theme=self.emoji_theme
                     ) as progress:
@@ -196,6 +223,9 @@ class MessageProcessor:
                     bundle = PromptBundle(prompt="")
                     if has_attachment:
                         self._attachment_semaphore.release()
+                if not await self.can_respond(lead):
+                    outcome, reason = "rejected", "banned"
+                    return
                 sent = await self.reply(
                     lead,
                     result.text,
@@ -203,7 +233,9 @@ class MessageProcessor:
                     controls=True,
                 )
                 if not sent:
+                    outcome = "error"
                     return
+                outcome = "completed"
                 try:
                     await self.storage.append_conversation_exchange(
                         scope_key=scope_key,
@@ -228,6 +260,9 @@ class MessageProcessor:
                         lead.chat.id,
                     )
             except GeminiRequestError as exc:
+                outcome = "error"
+                if not await self.can_respond(lead):
+                    return
                 await self.usage.record(
                     lead, ai_provider=self.gemini.current_provider
                 )
@@ -237,11 +272,14 @@ class MessageProcessor:
             except asyncio.CancelledError:
                 logger.info("Gemini request cancelled scope=%s", scope_key)
             except Exception:
+                outcome = "error"
                 logger.exception(
                     "Unhandled message processing error chat_id=%s message_id=%s",
                     lead.chat.id,
                     lead.message_id,
                 )
+                if not await self.can_respond(lead):
+                    return
                 await self.reply(
                     lead,
                     "Не удалось обработать сообщение из-за внутренней ошибки. "
@@ -250,8 +288,12 @@ class MessageProcessor:
             finally:
                 if self._active_tasks.get(scope_key) is current_task:
                     self._active_tasks.pop(scope_key, None)
+                    self._active_task_users.pop(scope_key, None)
                 if user_request_key is not None:
                     self._active_users.discard(user_request_key)
+                await self.activity.finish(event_id, outcome, reason)
+        finally:
+            lock.release()
 
     async def _should_answer(self, messages: list[Message], *, force: bool) -> bool:
         lead = messages[0]
@@ -284,6 +326,14 @@ class MessageProcessor:
 
     async def can_respond(self, message: Message) -> bool:
         """Return whether this update may produce a reply to the interlocutor."""
+        sender = message.from_user
+        if (
+            not message.business_connection_id
+            and sender is not None
+            and sender.id not in self.settings.owner_ids
+            and await self.storage.is_user_banned(sender.id)
+        ):
+            return False
         if await _is_outgoing_business_message(self.storage, message):
             return False
         connection_id = message.business_connection_id
@@ -328,6 +378,16 @@ class MessageProcessor:
             return False
         task.cancel()
         return True
+
+    def cancel_user(self, user_id: int) -> int:
+        """Cancel this user's active bot requests without touching Business chats."""
+        cancelled = 0
+        for scope, sender_id in self._active_task_users.items():
+            task = self._active_tasks.get(scope)
+            if sender_id == user_id and task is not None and not task.done():
+                task.cancel()
+                cancelled += 1
+        return cancelled
 
     async def reply(
         self, message: Message, text: str, *, formatted: bool = True, controls: bool = False

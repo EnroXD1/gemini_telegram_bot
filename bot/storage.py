@@ -66,6 +66,41 @@ class BotUserRecord:
     openrouter_request_count: int
     groq_request_count: int
     google_request_count: int
+    is_banned: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class UserBanRecord:
+    user_id: int
+    banned_by: int
+    banned_at: int
+    display_name: str | None
+    username: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class UserActivityRecord:
+    id: int
+    user_id: int
+    chat_id: int
+    message_id: int
+    kind: str
+    content: str
+    outcome: str
+    reason: str | None
+    created_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class UserActivityStats:
+    total: int
+    ai_requests: int
+    rejected: int
+    busy: int
+    rate_limit: int
+    banned: int
+    errors: int
+    cancelled: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +238,36 @@ class Storage:
             CREATE INDEX IF NOT EXISTS idx_bot_users_last_seen
             ON bot_users(last_seen_at DESC);
 
+            CREATE TABLE IF NOT EXISTS user_bans (
+                user_id INTEGER PRIMARY KEY CHECK(user_id > 0),
+                banned_by INTEGER NOT NULL CHECK(banned_by > 0),
+                banned_at INTEGER NOT NULL,
+                display_name TEXT,
+                username TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_user_bans_created
+            ON user_bans(banned_at DESC, user_id DESC);
+
+            CREATE TABLE IF NOT EXISTS user_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL CHECK(user_id > 0),
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('ai', 'command', 'callback')),
+                content TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK(outcome IN
+                    ('pending', 'completed', 'error', 'cancelled', 'rejected')),
+                reason TEXT CHECK(reason IN ('busy', 'rate_limit', 'banned')),
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_user_activity_user_time
+            ON user_activity(user_id, created_at DESC, id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_user_activity_time
+            ON user_activity(created_at);
+
             CREATE TABLE IF NOT EXISTS runtime_settings (
                 setting_key TEXT PRIMARY KEY,
                 setting_value TEXT NOT NULL,
@@ -218,6 +283,10 @@ class Storage:
                 "ALTER TABLE bot_users ADD COLUMN "
                 "groq_request_count INTEGER NOT NULL DEFAULT 0"
             )
+        # A process restart cannot resume in-flight AI/command tasks.
+        await self._db.execute(
+            "UPDATE user_activity SET outcome = 'cancelled' WHERE outcome = 'pending'"
+        )
         await self._db.commit()
 
     def _connection(self) -> aiosqlite.Connection:
@@ -652,12 +721,9 @@ class Storage:
         async with self._lock:
             cursor = await db.execute(
                 """
-                SELECT
-                    user_id, username, display_name, first_seen_at, last_seen_at,
-                    last_chat_id, last_chat_type, last_chat_title,
-                    interaction_count, ai_request_count,
-                    openrouter_request_count, groq_request_count,
-                    google_request_count
+                SELECT bot_users.*,
+                    EXISTS(SELECT 1 FROM user_bans WHERE user_id = bot_users.user_id)
+                        AS is_banned
                 FROM bot_users
                 ORDER BY last_seen_at DESC, user_id DESC
                 LIMIT ?
@@ -667,6 +733,170 @@ class Storage:
             rows = await cursor.fetchall()
             await cursor.close()
         return [_bot_user_from_row(row) for row in rows]
+
+    async def get_bot_user(self, user_id: int) -> BotUserRecord | None:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT bot_users.*,
+                    EXISTS(SELECT 1 FROM user_bans WHERE user_id = bot_users.user_id)
+                        AS is_banned
+                FROM bot_users WHERE user_id = ?
+                """,
+                (user_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return None if row is None else _bot_user_from_row(row)
+
+    async def is_user_banned(self, user_id: int) -> bool:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute("SELECT 1 FROM user_bans WHERE user_id = ?", (user_id,))
+            row = await cursor.fetchone()
+            await cursor.close()
+        return row is not None
+
+    async def ban_user(
+        self, user_id: int, banned_by: int, *,
+        display_name: str | None = None, username: str | None = None,
+    ) -> bool:
+        """Bans also support IDs that have never appeared in the usage audit."""
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                INSERT INTO user_bans(user_id, banned_by, banned_at, display_name, username)
+                VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO NOTHING
+                """,
+                (user_id, banned_by, int(time.time()), display_name, username),
+            )
+            changed = cursor.rowcount > 0
+            await cursor.close()
+            await db.commit()
+        return changed
+
+    async def unban_user(self, user_id: int) -> bool:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute("DELETE FROM user_bans WHERE user_id = ?", (user_id,))
+            changed = cursor.rowcount > 0
+            await cursor.close()
+            await db.commit()
+        return changed
+
+    async def get_user_ban(self, user_id: int) -> UserBanRecord | None:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                _BAN_RECORD_QUERY + " WHERE b.user_id = ?", (user_id,)
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return None if row is None else _user_ban_from_row(row)
+
+    async def list_user_bans(self, limit: int = 5, offset: int = 0) -> list[UserBanRecord]:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                _BAN_RECORD_QUERY
+                + " ORDER BY b.banned_at DESC, b.user_id DESC LIMIT ? OFFSET ?",
+                (max(1, min(100, limit)), max(0, offset)),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [_user_ban_from_row(row) for row in rows]
+
+    async def count_user_bans(self) -> int:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute("SELECT COUNT(*) FROM user_bans")
+            row = await cursor.fetchone()
+            await cursor.close()
+        return int(row[0]) if row is not None else 0
+
+    async def record_user_event(
+        self, *, user_id: int, chat_id: int, message_id: int,
+        kind: str, content: str, outcome: str, reason: str | None = None,
+    ) -> int:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                INSERT INTO user_activity(
+                    user_id, chat_id, message_id, kind, content, outcome, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, chat_id, message_id, kind, content[:1000], outcome, reason,
+                 int(time.time())),
+            )
+            event_id = cursor.lastrowid
+            await cursor.close()
+            await db.commit()
+        assert event_id is not None
+        return event_id
+
+    async def finish_user_event(
+        self, event_id: int, outcome: str, reason: str | None = None,
+    ) -> None:
+        db = self._connection()
+        async with self._lock:
+            await db.execute(
+                "UPDATE user_activity SET outcome = ?, reason = ? WHERE id = ?",
+                (outcome, reason, event_id),
+            )
+            await db.commit()
+
+    async def list_user_events(self, user_id: int, limit: int = 20) -> list[UserActivityRecord]:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT * FROM user_activity WHERE user_id = ? AND created_at >= ?
+                ORDER BY created_at DESC, id DESC LIMIT ?
+                """,
+                (user_id, int(time.time()) - 30 * 86_400, max(1, min(50, limit))),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [UserActivityRecord(**dict(row)) for row in rows]
+
+    async def get_user_activity_stats(
+        self, user_id: int, *, since: int,
+    ) -> UserActivityStats:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                """
+                SELECT COUNT(*) AS total,
+                    COALESCE(SUM(kind = 'ai'), 0) AS ai_requests,
+                    COALESCE(SUM(outcome = 'rejected'), 0) AS rejected,
+                    COALESCE(SUM(reason = 'busy'), 0) AS busy,
+                    COALESCE(SUM(reason = 'rate_limit'), 0) AS rate_limit,
+                    COALESCE(SUM(reason = 'banned'), 0) AS banned,
+                    COALESCE(SUM(outcome = 'error'), 0) AS errors,
+                    COALESCE(SUM(outcome = 'cancelled'), 0) AS cancelled
+                FROM user_activity WHERE user_id = ? AND created_at >= ?
+                """,
+                (user_id, since),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        assert row is not None
+        return UserActivityStats(**{key: int(value) for key, value in dict(row).items()})
+
+    async def prune_user_events(self) -> int:
+        db = self._connection()
+        async with self._lock:
+            cursor = await db.execute(
+                "DELETE FROM user_activity WHERE created_at < ?",
+                (int(time.time()) - 30 * 86_400,),
+            )
+            removed = max(0, cursor.rowcount)
+            await cursor.close()
+            await db.commit()
+        return removed
 
     async def get_bot_usage_stats(self) -> BotUsageStats:
         db = self._connection()
@@ -1211,6 +1441,25 @@ def _bot_user_from_row(row: aiosqlite.Row) -> BotUserRecord:
         openrouter_request_count=int(row["openrouter_request_count"]),
         groq_request_count=int(row["groq_request_count"]),
         google_request_count=int(row["google_request_count"]),
+        is_banned=bool(row["is_banned"]),
+    )
+
+
+_BAN_RECORD_QUERY = """
+    SELECT b.user_id, b.banned_by, b.banned_at,
+        COALESCE(u.display_name, b.display_name) AS display_name,
+        COALESCE(u.username, b.username) AS username
+    FROM user_bans AS b LEFT JOIN bot_users AS u ON u.user_id = b.user_id
+"""
+
+
+def _user_ban_from_row(row: aiosqlite.Row) -> UserBanRecord:
+    return UserBanRecord(
+        user_id=int(row["user_id"]),
+        banned_by=int(row["banned_by"]),
+        banned_at=int(row["banned_at"]),
+        display_name=row["display_name"],
+        username=row["username"],
     )
 
 

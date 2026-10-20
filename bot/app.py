@@ -11,6 +11,7 @@ from aiogram.types import (
 )
 
 from . import __version__
+from .activity import ActivityTracker, CommandActivityMiddleware
 from .album import AlbumBuffer
 from .business import BusinessMonitor
 from .config import Settings
@@ -19,6 +20,7 @@ from .emoji_theme import EmojiTheme
 from .gemini import GeminiService
 from .handlers import create_router
 from .media import MediaExtractor
+from .moderation import BanMiddleware, create_moderation_router
 from .outgoing_emoji import OutgoingEmojiMiddleware
 from .processor import MessageProcessor
 from .storage import Storage
@@ -45,6 +47,11 @@ async def run_bot(settings: Settings) -> None:
         bot.session.middleware(OutgoingEmojiMiddleware(emoji_theme))
         bot_user = await bot.get_me()
         usage = UsageTracker(bot=bot, settings=settings, storage=storage)
+        activity = ActivityTracker(
+            storage, settings.owner_ids, bot_user.username or "",
+            bot_id=bot_user.id,
+            group_default_mode=settings.group_default_mode,
+        )
         processor = MessageProcessor(
             bot=bot,
             bot_user=bot_user,
@@ -54,6 +61,7 @@ async def run_bot(settings: Settings) -> None:
             media=MediaExtractor(settings),
             usage=usage,
             emoji_theme=emoji_theme,
+            activity=activity,
         )
         monitor = BusinessMonitor(bot=bot, settings=settings, storage=storage)
         wall = WallService(
@@ -62,6 +70,12 @@ async def run_bot(settings: Settings) -> None:
             tile_size=settings.wall_tile_size,
             download_timeout_seconds=settings.media_download_timeout_seconds,
         )
+        ban_middleware = BanMiddleware(storage, settings.owner_ids, activity)
+        dispatcher.message.outer_middleware(ban_middleware)
+        dispatcher.edited_message.outer_middleware(ban_middleware)
+        dispatcher.callback_query.outer_middleware(ban_middleware)
+        dispatcher.message.outer_middleware(CommandActivityMiddleware(activity))
+        dispatcher.include_router(create_moderation_router(processor))
         dispatcher.include_router(create_control_router(processor))
         dispatcher.include_router(
             create_router(processor, albums, monitor, usage, emoji_theme, wall)
@@ -83,6 +97,7 @@ async def run_bot(settings: Settings) -> None:
             logger.info(
                 "Pruned %s expired local conversation exchanges", history_removed
             )
+        await storage.prune_user_events()
         await _set_commands(bot)
         await bot.delete_webhook(drop_pending_updates=settings.drop_pending_updates)
 
@@ -130,6 +145,9 @@ async def _set_commands(bot: Bot) -> None:
         BotCommand(command="autoreply", description="Business-автоответы on/off"),
         BotCommand(command="chats", description="Настроить отдельные Business-чаты"),
         BotCommand(command="users", description="Кто пользуется ботом"),
+        BotCommand(command="ban", description="Заблокировать пользователя (владелец)"),
+        BotCommand(command="unban", description="Разблокировать пользователя (владелец)"),
+        BotCommand(command="banlist", description="Заблокированные пользователи (владелец)"),
         BotCommand(command="stats", description="Статистика использования"),
         BotCommand(command="model", description="Выбрать AI-модель (владелец)"),
         BotCommand(command="status", description="Модель и состояние"),
