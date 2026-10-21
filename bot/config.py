@@ -64,6 +64,7 @@ DEFAULT_GROQ_FALLBACK_MODELS = (
     "openai/gpt-oss-20b",
     "llama-3.3-70b-versatile",
 )
+DEFAULT_GROQ_VISION_MODEL = "qwen/qwen3.8-27b"
 
 
 def _required(name: str) -> str:
@@ -165,6 +166,13 @@ def _choice(name: str, default: str, allowed: set[str]) -> str:
     return value
 
 
+def _optional_model(name: str, default: str) -> str:
+    value = os.getenv(name, default).strip()
+    if len(value) > 200 or any(char.isspace() or ord(char) < 32 for char in value):
+        raise ConfigError(f"{name}: ID модели должен быть до 200 символов без пробелов")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     telegram_bot_token: str = field(repr=False)
@@ -228,6 +236,7 @@ class Settings:
     google_api_keys: tuple[str, ...] = field(default=(), repr=False)
     groq_api_keys: tuple[str, ...] = field(default=(), repr=False)
     math_render_mode: str = "auto"
+    groq_vision_model: str = DEFAULT_GROQ_VISION_MODEL
 
     @property
     def active_model(self) -> str:
@@ -320,6 +329,7 @@ class Settings:
                 os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
                 or "openai/gpt-oss-20b"
             ),
+            groq_vision_model=_optional_model("GROQ_VISION_MODEL", DEFAULT_GROQ_VISION_MODEL),
             groq_fallback_models=_model_list(
                 "GROQ_FALLBACK_MODELS", DEFAULT_GROQ_FALLBACK_MODELS
             ),

@@ -92,6 +92,26 @@ def test_groq_fallback_is_enabled_when_key_is_present(monkeypatch, tmp_path) -> 
         "llama-3.3-70b-versatile",
     )
     assert settings.groq_max_output_tokens == 1024
+    assert settings.groq_vision_model == "qwen/qwen3.8-27b"
+
+
+@pytest.mark.parametrize("model", ["", "qwen/custom-vision"])
+def test_groq_vision_model_can_be_overridden_or_disabled(monkeypatch, tmp_path, model):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:test-token")
+    monkeypatch.setenv("AI_PROVIDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setenv("GROQ_VISION_MODEL", model)
+    assert Settings.from_env(tmp_path / "missing.env").groq_vision_model == model
+
+
+@pytest.mark.parametrize("model", ["qwen/invalid model", "qwen/invalid\nmodel", "x" * 201])
+def test_invalid_groq_vision_model_fails_at_startup(monkeypatch, tmp_path, model):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:test-token")
+    monkeypatch.setenv("AI_PROVIDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setenv("GROQ_VISION_MODEL", model)
+    with pytest.raises(ConfigError, match="GROQ_VISION_MODEL"):
+        Settings.from_env(tmp_path / "missing.env")
 
 
 def test_free_model_pool_defaults_and_can_be_disabled(monkeypatch, tmp_path) -> None:

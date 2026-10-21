@@ -749,6 +749,10 @@ def create_router(
                     f"• {provider}: {model}"
                     for provider, model in fallback_routes
                 )
+            image_routes = processor.gemini.effective_routes(media=True)
+            if image_routes:
+                lines.extend(["", "Маршруты для фото (до 3 изображений для Groq):"])
+                lines.extend(f"• {provider}: {model}" for provider, model in image_routes)
             lines.extend(
                 [
                     "",

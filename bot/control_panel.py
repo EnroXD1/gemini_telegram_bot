@@ -189,10 +189,12 @@ def diagnostics_view(
     else:
         lines.extend(["Успешных AI-ответов после запуска ещё нет.", ""])
     effective = service.effective_routes()
+    media = service.effective_routes(media=True)
     routes = list(
         dict.fromkeys(
             [
                 *effective,
+                *media,
                 *service.configured_routes(),
                 *historical,
                 *health.routes,
@@ -202,7 +204,6 @@ def diagnostics_view(
     pages = max(1, math.ceil(len(routes) / _DIAGNOSTICS_PAGE_SIZE))
     page = max(0, min(page, pages - 1))
     start = page * _DIAGNOSTICS_PAGE_SIZE
-    media = service.effective_routes(media=True)
     for provider, model in routes[start : start + _DIAGNOSTICS_PAGE_SIZE]:
         key = (provider, model)
         observed = health.routes.get(key)
@@ -213,7 +214,7 @@ def diagnostics_view(
             state = "🔒 исключён бесплатным режимом"
         elif catalog_status:
             state = f"⚠️ {catalog_status}"
-        elif key not in effective:
+        elif key not in effective and key not in media:
             state = "⏸ не участвует в текущей цепочке"
         elif cooldown:
             state = f"⏳ пауза ещё {cooldown} сек."
@@ -249,6 +250,8 @@ def diagnostics_view(
             lines.append(f"Последняя ошибка после запуска: {code}{observed.last_error}.")
         if key in effective and key not in media:
             lines.append("Только текст; вложения идут другим маршрутом.")
+        elif provider == "groq" and key in media:
+            lines.append("Фото: до 3 изображений JPEG, PNG или WebP.")
         lines.append("")
     if pages > 1:
         lines.append(f"Маршруты: страница {page + 1}/{pages}. Полная цепочка: /model.")

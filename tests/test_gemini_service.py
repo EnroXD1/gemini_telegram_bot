@@ -605,6 +605,7 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
             [
                 ("openrouter", "google/gemini-3.5-flash"),
                 ("openrouter", "openrouter/free"),
+                ("groq", "qwen/qwen3.8-27b"),
             ],
         )
 
@@ -1023,6 +1024,7 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_multimodal_limit_does_not_use_text_only_groq(self) -> None:
         service = make_openrouter_service("unused")
+        service._settings.groq_vision_model = ""
         service._openrouter_client = FakeOpenRouterClient(
             [FakeOpenRouterResponse({}, error_code=429)]
         )
@@ -1043,6 +1045,137 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(service._groq_client.calls, [])
         self.assertEqual(raised.exception.delete_after_seconds, 20.0)
+
+    def groq_vision_service(self, *responses):
+        service = make_openrouter_service("резерв")
+        service._settings.groq_model = "openai/gpt-oss-20b"
+        service._groq_client = FakeOpenRouterClient(list(responses) or [
+            FakeOpenRouterResponse({
+                "model": "qwen/qwen3.8-27b",
+                "choices": [{"message": {"content": "Решение $x=2$"}}],
+            })
+        ])
+        service.select_model("groq")
+        return service
+
+    async def test_groq_photo_uses_vision_not_selected_text_model(self):
+        service = self.groq_vision_service()
+        bundle = PromptBundle("Реши", (MediaPayload("фото", "image", "image/png", b"png"),))
+        history = (ConversationMessage("user", "Предыдущий вопрос"),)
+        result = await service.generate(bundle, None, history=history)
+        self.assertEqual(result.provider, "groq")
+        self.assertEqual(result.model, "qwen/qwen3.8-27b")
+        self.assertEqual(service.current_model, "openai/gpt-oss-20b")
+        self.assertEqual(service._openrouter_client.calls, [])
+        _, payload = service._groq_client.calls[0]
+        self.assertEqual(payload["model"], "qwen/qwen3.8-27b")
+        self.assertEqual(payload["messages"][1]["content"], "Предыдущий вопрос")
+        content = payload["messages"][-1]["content"]
+        self.assertEqual(content[1]["image_url"]["url"], "data:image/png;base64,cG5n")
+        self.assertEqual(content[-1]["text"], "Реши")
+        self.assertEqual(payload["max_completion_tokens"], 256)
+        self.assertEqual(payload["reasoning_effort"], "none")
+        self.assertNotIn("max_tokens", payload)
+        self.assertEqual(service._groq_client.streamed, [True])
+        self.assertIn(("groq", "qwen/qwen3.8-27b"), service.configured_routes())
+
+    async def test_groq_vision_works_when_automatic_fallback_is_disabled(self):
+        service = self.groq_vision_service()
+        service._settings.ai_auto_fallback_enabled = False
+        bundle = PromptBundle("Реши", (MediaPayload("фото", "image", "image/jpeg", b"img"),))
+        result = await service.generate(bundle, None)
+        self.assertEqual(result.provider, "groq")
+        self.assertEqual(service._openrouter_client.calls, [])
+
+    async def test_groq_text_stays_on_selected_model_and_uses_plain_json(self):
+        service = self.groq_vision_service()
+        await service.generate(PromptBundle("Текст без фото"), None)
+        self.assertEqual(service._groq_client.calls[0][1]["model"], "openai/gpt-oss-20b")
+        self.assertEqual(service._groq_client.streamed, [False])
+
+    async def test_groq_vision_does_not_participate_when_groq_fallback_disabled(self):
+        service = self.groq_vision_service()
+        service.select_model("openrouter")
+        service._settings.groq_fallback_enabled = False
+        self.assertFalse(any(provider == "groq" for provider, _ in
+                             service.effective_routes(media=True)))
+
+    async def test_openrouter_image_failure_falls_back_to_groq_vision(self):
+        service = self.groq_vision_service()
+        service.select_model("openrouter")
+        service._openrouter_client = FakeOpenRouterClient([
+            FakeOpenRouterResponse({}, error_code=429)
+        ])
+        bundle = PromptBundle("Реши", (MediaPayload("фото", "image", "image/jpeg", b"img"),))
+        result = await service.generate(bundle, None)
+        self.assertEqual(result.provider, "groq")
+        self.assertEqual(service._groq_client.calls[0][1]["model"], "qwen/qwen3.8-27b")
+
+    async def test_groq_vision_503_cools_down_and_next_photo_skips_network_attempt(self):
+        service = self.groq_vision_service(FakeOpenRouterResponse({}, error_code=503))
+        service._openrouter_client = FakeOpenRouterClient([
+            FakeOpenRouterResponse({"choices": [{"message": {"content": "резерв"}}]}),
+            FakeOpenRouterResponse({"choices": [{"message": {"content": "резерв 2"}}]}),
+        ])
+        bundle = PromptBundle("Реши", (MediaPayload("фото", "image", "image/jpeg", b"img"),))
+        self.assertEqual((await service.generate(bundle, None)).provider, "openrouter")
+        self.assertEqual((await service.generate(bundle, None)).provider, "openrouter")
+        self.assertEqual(len(service._groq_client.calls), 1)
+        self.assertGreater(service.cooldown_remaining("groq", "qwen/qwen3.8-27b"), 0)
+        self.assertEqual(service.cooldown_remaining("groq", "openai/gpt-oss-20b"), 0)
+
+    async def test_groq_unsupported_media_are_forwarded_without_dropping_items(self):
+        image = MediaPayload("фото", "image", "image/jpeg", b"img")
+        for media in (
+            (image,) * 4,
+            (image, MediaPayload("голос", "audio", "audio/ogg", b"audio")),
+            (MediaPayload("PDF", "document", "application/pdf", b"pdf"),),
+            (MediaPayload("видео", "video", "video/mp4", b"video"),),
+            (MediaPayload("SVG", "image", "image/svg+xml", b"svg"),),
+        ):
+            with self.subTest(media=media):
+                service = self.groq_vision_service()
+                result = await service.generate(PromptBundle("разбери", media), None)
+                self.assertEqual(result.provider, "openrouter")
+                self.assertEqual(service._groq_client.calls, [])
+                content = service._openrouter_client.calls[0][1]["messages"][-1]["content"]
+                self.assertEqual(len(content), len(media) * 2 + 1)
+
+    async def test_disabled_groq_vision_has_clear_error_without_fallback(self):
+        service = self.groq_vision_service()
+        service._settings.groq_vision_model = ""
+        service._settings.ai_auto_fallback_enabled = False
+        bundle = PromptBundle("Реши", (MediaPayload("фото", "image", "image/jpeg", b"img"),))
+        with self.assertRaisesRegex(GeminiRequestError, "GROQ_VISION_MODEL"):
+            await service.generate(bundle, None)
+        self.assertEqual(service._groq_client.calls, [])
+
+    async def test_groq_three_images_continue_with_history_and_original_images(self):
+        service = self.groq_vision_service(
+            FakeOpenRouterResponse({"choices": [{
+                "message": {"content": "Начало"}, "finish_reason": "length",
+            }]}),
+            FakeOpenRouterResponse({"choices": [{
+                "message": {"content": "Конец"}, "finish_reason": "stop",
+            }]}),
+        )
+        images = tuple(
+            MediaPayload(str(i), "image", "image/webp", bytes([i])) for i in range(3)
+        )
+        result = await service.generate(PromptBundle("Реши", images), None)
+        self.assertFalse(result.truncated)
+        self.assertIn("Начало", result.text)
+        self.assertIn("Конец", result.text)
+        first, second = [payload for _, payload in service._groq_client.calls]
+        self.assertEqual(first["messages"][-1], second["messages"][-3])
+        self.assertEqual(second["messages"][-2], {"role": "assistant", "content": "Начало"})
+        self.assertEqual(service._groq_client.streamed, [True, True])
+
+    async def test_groq_large_image_body_is_encoded_in_bounded_chunks(self):
+        service = self.groq_vision_service()
+        image = MediaPayload("фото", "image", "image/jpeg", b"x" * (1024 * 1024 + 1))
+        await service.generate(PromptBundle("Реши", (image,)), None)
+        self.assertLessEqual(max(service._groq_client.stream_chunk_sizes), 65536)
 
     async def test_openrouter_limit_error_is_marked_for_auto_deletion(self) -> None:
         service = make_openrouter_service("unused")

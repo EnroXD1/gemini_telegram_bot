@@ -247,6 +247,55 @@ async def test_groq_rotation_uses_request_headers_without_mutating_shared_client
     assert env.fallback == []
 
 
+async def test_groq_vision_rotation_preserves_image_and_per_request_credentials(factory):
+    def handle(request):
+        if request.headers["Authorization"] == f"Bearer {GROQ_KEYS[0]}":
+            return httpx.Response(429, headers={"Retry-After": "60"})
+        return chat_reply("Решение")
+
+    env = await factory(groq=GROQ_KEYS, groq_handler=handle)
+    bundle = PromptBundle("Реши", (MediaPayload("фото", "image", "image/png", b"image"),))
+    first = await env.service.generate(bundle, None)
+    await env.service.generate(bundle, None)
+    assert first.provider == "groq"
+    assert [request.headers["Authorization"] for request in env.groq_calls] == [
+        f"Bearer {GROQ_KEYS[0]}", f"Bearer {GROQ_KEYS[1]}", f"Bearer {GROQ_KEYS[1]}",
+    ]
+    payloads = [json.loads(request.content) for request in env.groq_calls]
+    assert {payload["model"] for payload in payloads} == {"qwen/qwen3.8-27b"}
+    assert all("base64,aW1hZ2U=" in json.dumps(payload) for payload in payloads)
+    assert all(int(request.headers["Content-Length"]) == len(request.content)
+               for request in env.groq_calls)
+    assert env.service._groq_client.headers["Authorization"] == f"Bearer {GROQ_KEYS[0]}"
+
+
+async def test_strict_free_mode_never_sends_photos_to_groq_vision(factory):
+    env = await factory(groq=GROQ_KEYS)
+    env.service.set_free_only(True)
+    bundle = PromptBundle("Реши", (MediaPayload("фото", "image", "image/png", b"image"),))
+    await env.service.generate(bundle, None)
+    assert env.groq_calls == []
+    assert len(env.fallback) == 1
+
+
+async def test_groq_vision_all_keys_on_pause_skip_next_photo_and_diagnostics_show_it(factory):
+    env = await factory(
+        groq=GROQ_KEYS,
+        groq_handler=lambda request: httpx.Response(429, headers={"Retry-After": "45"}),
+    )
+    bundle = PromptBundle("Реши", (MediaPayload("фото", "image", "image/png", b"image"),))
+    await env.service.generate(bundle, None)
+    await env.service.generate(bundle, None)
+    assert len(env.groq_calls) == 3
+    assert len(env.fallback) == 2
+    assert env.service.cooldown_remaining("groq", "qwen/qwen3.8-27b") == 45
+    assert env.service.cooldown_remaining("groq", "groq/top") == 0
+    report, _ = diagnostics_view(env.service)
+    assert "qwen/qwen3.8-27b" in report
+    assert "Фото: до 3" in report
+    assert all(key not in report for key in GROQ_KEYS)
+
+
 @pytest.mark.parametrize("code", [401, 403, 503])
 async def test_non_quota_failures_do_not_cycle_credentials(factory, code):
     def generate(key, kwargs):

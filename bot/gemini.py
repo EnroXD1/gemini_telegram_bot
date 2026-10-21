@@ -22,7 +22,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-from .config import Settings
+from .config import DEFAULT_GROQ_VISION_MODEL, Settings
 from .gemini_response import (
     extract_interaction_id,
     extract_interaction_status,
@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/"
 OPENROUTER_APP_URL = "https://github.com/EnroXD1/gemini_telegram_bot"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1/"
+_GROQ_IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+_GROQ_MAX_IMAGES = 3
 _OPENROUTER_MEDIA_UNSUPPORTED_MODELS = frozenset(
     {"nvidia/nemotron-3.5-lightning:free"}
 )
@@ -601,6 +603,13 @@ class GeminiService:
                 "Нет доступной бесплатной модели для этого запроса. "
                 "Платные маршруты отключены. Владельцу: /diagnostics."
             )
+        if self._provider == "groq" and bundle.media:
+            raise GeminiRequestError(
+                "Нет доступного маршрута для вложений. Groq Vision принимает до трёх "
+                "изображений JPEG, PNG или WebP; проверьте GROQ_VISION_MODEL "
+                "или включите другой AI-провайдер.",
+                provider="groq",
+            )
         raise GeminiRequestError(
             "Для этого запроса нет доступной AI-модели. Владельцу бота нужно "
             "проверить настроенные API-ключи."
@@ -611,10 +620,20 @@ class GeminiService:
         return tuple((route.provider, route.model) for route in routes[1:])
 
     def configured_routes(self) -> tuple[tuple[str, str], ...]:
-        return tuple(
+        return tuple(dict.fromkeys(
             (route.provider, route.model)
-            for route in self._configured_routes(PromptBundle(prompt=""))
-        )
+            for bundle in (
+                PromptBundle(prompt=""),
+                PromptBundle("", (MediaPayload("photo", "image", "image/jpeg", b""),)),
+            )
+            for route in self._configured_routes(bundle)
+        ))
+
+    def _groq_vision_model(self) -> str:
+        return getattr(self._settings, "groq_vision_model", DEFAULT_GROQ_VISION_MODEL)
+
+    def _groq_model_supports_images(self, model: str) -> bool:
+        return bool(model) and model in {DEFAULT_GROQ_VISION_MODEL, self._groq_vision_model()}
 
     def effective_routes(self, *, media: bool = False) -> tuple[tuple[str, str], ...]:
         bundle = PromptBundle(prompt="")
@@ -633,20 +652,23 @@ class GeminiService:
 
     def _configured_routes(self, bundle: PromptBundle) -> list[_ModelRoute]:
         primary = _ModelRoute(self._provider, self._model)
-        routes = [primary]
-        if not getattr(self._settings, "ai_auto_fallback_enabled", True):
-            return routes
-
+        routes: list[_ModelRoute] = []
         available = self.configured_providers()
 
         def add(provider: str, model: str) -> None:
+            if provider == "groq" and bundle.media:
+                if not _groq_supported_images(bundle):
+                    return
+                if not self._groq_model_supports_images(model):
+                    model = self._groq_vision_model()
+                if not model:
+                    return
             route = _ModelRoute(provider, model)
             if route in routes:
                 return
-            if provider == "groq" and bundle.media:
-                return
             if (
                 provider == "openrouter"
+                and route != primary
                 and bundle.media
                 and not _openrouter_model_supports_media(model)
             ):
@@ -658,6 +680,10 @@ class GeminiService:
             ):
                 return
             routes.append(route)
+
+        add(primary.provider, primary.model)
+        if not getattr(self._settings, "ai_auto_fallback_enabled", True):
+            return routes
 
         default_model = available.get(primary.provider)
         if default_model:
@@ -716,6 +742,15 @@ class GeminiService:
                 history,
                 model=route.model,
             )
+        if route.provider == "groq" and bundle.media and (
+            not _groq_supported_images(bundle)
+            or not self._groq_model_supports_images(route.model)
+        ):
+            raise GeminiRequestError(
+                "Groq Vision принимает до трёх изображений JPEG, PNG или WebP. "
+                "Для остальных вложений нужен другой AI-маршрут.",
+                provider="groq", fallback_allowed=True,
+            )
         pool = self._key_pool(route.provider)
         if pool is not None:
             async with self._route_request_guard(route):
@@ -724,19 +759,15 @@ class GeminiService:
                     is_fallback=is_fallback,
                 )
         if route.provider == "groq":
-            if bundle.media:
-                raise GeminiRequestError(
-                    "Модель Groq работает только с текстом.",
-                    provider="groq",
-                    fallback_allowed=True,
-                )
-            messages = self._build_chat_messages(bundle, history)
+            messages = None if bundle.media else self._build_chat_messages(bundle, history)
             async with self._route_request_guard(route):
                 return await self._generate_groq(
                     messages,
                     previous_interaction_id,
                     model=route.model,
                     is_fallback=is_fallback,
+                    bundle=bundle,
+                    history=history,
                 )
         return await self._generate_google(
             bundle,
@@ -754,10 +785,6 @@ class GeminiService:
         *,
         is_fallback: bool,
     ) -> GeminiResult:
-        if route.provider == "groq" and bundle.media:
-            raise GeminiRequestError(
-                "Модель Groq работает только с текстом.", provider="groq", fallback_allowed=True
-            )
         tried: set[int] = set()
         last_error: GeminiRequestError | None = None
         while len(tried) < len(pool):
@@ -803,12 +830,14 @@ class GeminiService:
                     )
                 else:
                     result = await self._generate_groq(
-                        self._build_chat_messages(bundle, history),
+                        None if bundle.media else self._build_chat_messages(bundle, history),
                         previous_id,
                         model=route.model,
                         is_fallback=is_fallback,
                         api_key=pool.key(index),
                         on_quota=on_quota,
+                        bundle=bundle,
+                        history=history,
                     )
                 success = True
                 return result
@@ -1433,13 +1462,15 @@ class GeminiService:
 
     async def _generate_groq(
         self,
-        messages: list[dict[str, Any]],
+        messages: list[dict[str, Any]] | None,
         previous_interaction_id: str | None,
         *,
         model: str,
         is_fallback: bool,
         api_key: str | None = None,
         on_quota: Callable[[GeminiRequestError], None] | None = None,
+        bundle: PromptBundle | None = None,
+        history: tuple[ConversationMessage, ...] = (),
     ) -> GeminiResult:
         client = self._groq_client
         if client is None:
@@ -1457,18 +1488,41 @@ class GeminiService:
                         "Groq отключён режимом «Только бесплатно».",
                         provider="groq", fallback_allowed=True,
                     )
-                payload = {
-                    "model": model,
-                    "messages": request_messages,
-                    "temperature": self._settings.gemini_temperature,
-                    "max_completion_tokens": self._settings.groq_max_output_tokens,
-                    "stream": False,
-                }
                 async with asyncio.timeout(self._settings.gemini_timeout_seconds):
-                    kwargs = (
-                        {"headers": {"Authorization": f"Bearer {api_key}"}} if api_key else {}
-                    )
-                    response = await client.post("chat/completions", json=payload, **kwargs)
+                    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+                    if bundle is not None and bundle.media:
+                        body = _build_openrouter_media_body(
+                            bundle, history,
+                            system_instruction=self._settings.gemini_system_prompt,
+                            model=model,
+                            temperature=self._settings.gemini_temperature,
+                            max_tokens=self._settings.groq_max_output_tokens,
+                            combined_text=combined_text,
+                            max_tokens_field="max_completion_tokens",
+                            request_options=(
+                                {"reasoning_effort": "none"}
+                                if model.startswith("qwen/") else {}
+                            ),
+                        )
+                        response = await client.post(
+                            "chat/completions", content=body,
+                            headers={
+                                **headers,
+                                "Content-Type": "application/json",
+                                "Content-Length": str(body.content_length),
+                            },
+                        )
+                    else:
+                        payload = {
+                            "model": model,
+                            "messages": request_messages,
+                            "temperature": self._settings.gemini_temperature,
+                            "max_completion_tokens": self._settings.groq_max_output_tokens,
+                            "stream": False,
+                        }
+                        response = await client.post(
+                            "chat/completions", json=payload, headers=headers or None
+                        )
                     response.raise_for_status()
                 completion = _extract_chat_completion(response.json())
                 _raise_if_unusable_chat_completion(
@@ -1499,9 +1553,8 @@ class GeminiService:
                     self._settings
                 ):
                     continuation_count += 1
-                    request_messages = _continuation_messages(
-                        base_messages, combined_text
-                    )
+                    if base_messages is not None:
+                        request_messages = _continuation_messages(base_messages, combined_text)
                     attempt = 0
                     logger.info(
                         "Continuing truncated Groq response part=%s",
@@ -1756,6 +1809,7 @@ def _build_openrouter_media_body(
     max_tokens: int,
     combined_text: str,
     request_options: dict[str, Any] | None = None,
+    max_tokens_field: str = "max_tokens",
 ) -> _OpenRouterMediaBody:
     if not bundle.media:
         raise ValueError("Streaming OpenRouter body requires media")
@@ -1848,7 +1902,9 @@ def _build_openrouter_media_body(
         (
             b'],"temperature":',
             _json_bytes(temperature),
-            b',"max_tokens":',
+            b",",
+            _json_bytes(max_tokens_field),
+            b":",
             _json_bytes(max_tokens),
             b',"stream":false',
         )
@@ -1857,6 +1913,13 @@ def _build_openrouter_media_body(
         segments.extend((b",", _json_bytes(name), b":", _json_bytes(value)))
     segments.append(b"}")
     return _OpenRouterMediaBody(segments)
+
+
+def _groq_supported_images(bundle: PromptBundle) -> bool:
+    return 0 < len(bundle.media) <= _GROQ_MAX_IMAGES and all(
+        item.kind == "image" and item.mime_type in _GROQ_IMAGE_MIME_TYPES
+        for item in bundle.media
+    )
 
 
 def _is_free_openrouter_route(provider: str, model: str) -> bool:
