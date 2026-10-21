@@ -39,11 +39,11 @@ $$[x=π/4+3π n]\
 В градусах это `x=45°+540° n` или `x=225°+540° n`."""
 
 
-def test_original_broken_solution_becomes_two_native_math_blocks():
+def test_original_broken_solution_becomes_three_native_math_blocks():
     chunks = render_math_rich_chunks(BROKEN_SOLUTION)
     assert len(chunks) == 1
     html = chunks[0].payload.html
-    assert html.count("<tg-math-block>") == 2
+    assert html.count("<tg-math-block>") == 3
     assert r"\begin{aligned}" in html and r"\text{или}" in html
     assert "[x=π/4+3π n]" in html and "[x=5π/4+3π n]" in html
     assert "$$" not in html and "синуса:\\" not in html and "Отсюда:\\" not in html
@@ -206,3 +206,71 @@ async def test_reply_to_native_solution_keeps_latex_in_ai_context():
     )
     assert "Объясни этот шаг" in bundle.prompt and r"\frac" in bundle.prompt
     assert "mathematical_expression" in bundle.prompt and bundle.media == ()
+
+
+@pytest.mark.parametrize(
+    "source,latex",
+    [
+        ("1⁴ + 2⁴ + … + n⁴ = 1/30n(n+1)(2n+1)(3n²+3n-1)",
+         r"1^{4} + 2^{4} + \ldots  + n^{4} = 1/30n"),
+        ("S_(k+1) = (k+1)/30 [ k(2k+1)(3k²+3k-1) + 30(k+1)³ ]", r"S_{k+1}"),
+        ("= 1/30 ⋅ 6 ⋅ 5 = 30/30 = 1", r"\cdot"),
+        ("x₁ = π + 2πn", r"x_{1}"),
+        (r"x = \frac{1}{2}", r"\frac{1}{2}"),
+    ],
+)
+def test_standalone_unmarked_equations_are_native_without_guessing_fractions(source, latex):
+    chunks = render_math_rich_chunks(source)
+    assert chunks and "<tg-math-block>" in chunks[0].payload.html
+    assert latex in chunks[0].payload.html
+    if "1/30n" in source:
+        assert "1/30n" in chunks[0].payload.html  # no guess: (1/30)*n or 1/(30*n)
+
+
+@pytest.mark.parametrize("source", [
+    "API_VERSION=3", "const value = 3", "file_name = x", "x = os.system(1)",
+    "Версия v1.17.0, цена 30/30, путь C:\\temp", "Скидка 30% = 300 рублей",
+    "https://example.com/?x=1", "= -", "x=(a+b", "x=([a)]", "30/30",
+    "    x=1", "\tx=1", "```python\nx = 1\n```", "`S_(k+1) = k⁴`",
+])
+def test_unmarked_code_prices_prose_and_unbalanced_equations_are_not_rewritten(source):
+    prepared = prepare_math_markdown(source)
+    assert prepared.markdown == source and not prepared.has_math
+
+
+@pytest.mark.parametrize("tail", [
+    "$(k+1)(k+2)(2k+3)(3k^2+6k+2", r"\[x=\frac{1}{", "$$\nx=2+",
+])
+def test_truncated_answer_keeps_complete_math_native_but_does_not_complete_broken_tail(tail):
+    source = "$x^2$\n\nНезавершённая формула: " + tail + "\n\n⚠️ Ответ достиг лимита."
+    prepared = prepare_math_markdown(source, truncated=True)
+    assert "⚠️ Ответ достиг лимита." in prepared.markdown
+    assert "$x^2$" in prepared.markdown
+    assert tail not in prepared.markdown
+    chunks = render_math_rich_chunks(prepared.markdown)
+    assert chunks and chunks[0].payload.html.count("<tg-math>") == 1
+    if "3k^2+6k+2" in tail:
+        assert "3k" in prepared.markdown  # partial content is retained, not solved
+        assert "9k+5" not in prepared.markdown
+
+
+@pytest.mark.parametrize("source", [
+    "Цена $5 и $10", "`$x^2`", "```python\ns = '$x^2'", "    print('$x^2')",
+])
+def test_truncated_math_cleanup_does_not_touch_prices_or_code(source):
+    assert prepare_math_markdown(source, truncated=True).markdown == source
+
+
+def test_unmarked_equation_and_explicit_latex_are_not_double_wrapped():
+    source = "x² = 4\n\nОтвет: $x=2$ и `y=1`."
+    html = render_math_rich_chunks(source)[0].payload.html
+    assert html.count("<tg-math-block>") == 1 and html.count("<tg-math>") == 1
+    assert "<code>y=1</code>" in html
+
+
+def test_default_math_prompt_requests_consistent_formatting_and_compact_complete_solution():
+    from bot.config import DEFAULT_SYSTEM_PROMPT
+
+    assert "ВСЕ математические выражения" in DEFAULT_SYSTEM_PROMPT
+    assert r"\frac{1}{30}n" in DEFAULT_SYSTEM_PROMPT
+    assert "компактное законченное решение" in DEFAULT_SYSTEM_PROMPT

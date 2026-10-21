@@ -22,6 +22,21 @@ _MATH = re.compile(
 _RELATION = re.compile(r"[=<>≤≥∈∉]|\\(?:in|notin|leq?|geq?|neq)\b")
 _TEXT_ROW = re.compile(r"[А-Яа-яЁё ]+")
 _MEDIA_TAG = re.compile(r"<(?:img|video|audio|tg-document)\b", re.IGNORECASE)
+_PLAIN_MATH = re.compile(r"[\w\s+\-*/^=<>()\[\]{},.;!|\\]+", re.ASCII)
+_MATH_WORDS = frozenset({
+    "sin", "cos", "tan", "cot", "tg", "ctg", "ln", "log", "exp", "sqrt", "pi",
+    "frac", "sum", "prod", "int", "lim", "in", "notin", "le", "leq", "ge", "geq",
+    "ne", "neq", "cdot", "times", "div", "ldots", "cdots", "infty", "mathbb",
+})
+_SUPERSCRIPTS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁽⁾ⁿⁱ", "0123456789+-()ni")
+_SUBSCRIPTS = str.maketrans("₀₁₂₃₄₅₆₇₈₉₊₋₍₎", "0123456789+-()")
+_MATH_SYMBOLS = {
+    "−": "-", "⋅": r"\cdot ", "·": r"\cdot ", "×": r"\times ",
+    "÷": r"\div ", "…": r"\ldots ", "π": r"\pi ", "∞": r"\infty ",
+    "≤": r"\leq ", "≥": r"\geq ", "≠": r"\neq ", "∈": r"\in ",
+    "∉": r"\notin ", "ℤ": r"\mathbb{Z}", "ℕ": r"\mathbb{N}",
+    "½": r"\frac{1}{2}", "¼": r"\frac{1}{4}", "¾": r"\frac{3}{4}",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +80,43 @@ def _clean_math(body: str) -> str:
     return "\n".join(rows)
 
 
-def prepare_math_markdown(source: str) -> PreparedMath:
+def _plain_formula_latex(line: str) -> str | None:
+    """Recognise standalone algebra, never infer division precedence or solve it."""
+    if line.startswith(("    ", "\t")) or len(line) > 1500:
+        return None
+    body = line.strip()
+    body = re.sub(
+        r"[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁽⁾ⁿⁱ]+", lambda m: "^{" + m[0].translate(_SUPERSCRIPTS) + "}", body
+    )
+    body = re.sub(
+        r"[₀₁₂₃₄₅₆₇₈₉₊₋₍₎]+", lambda m: "_{" + m[0].translate(_SUBSCRIPTS) + "}", body
+    )
+    for symbol, latex in _MATH_SYMBOLS.items():
+        body = body.replace(symbol, latex)
+    if not _PLAIN_MATH.fullmatch(body):
+        return None
+    if any(word not in _MATH_WORDS for word in re.findall(r"[A-Za-z]{2,}", body)):
+        return None
+    if not re.search(r"[=<>^_]|\\(?:in|notin|leq|geq|neq|cdot|times|div)\b", body):
+        return None
+    if not re.search(r"[A-Za-z0-9]", body) or body.rstrip().endswith(
+        ("+", "-", "=", "^", "_", "/", "\\")
+    ):
+        return None
+    stack: list[str] = []
+    for char in body:
+        if char in "([{":
+            stack.append(char)
+        elif char in ")]}" and (
+            not stack or stack.pop() != {")": "(", "]": "[", "}": "{"}[char]
+        ):
+            return None
+    if stack:
+        return None
+    return re.sub(r"_\(([^()]+)\)", r"_{\1}", body)
+
+
+def prepare_math_markdown(source: str, *, truncated: bool = False) -> PreparedMath:
     """Normalise math delimiters without rewriting ordinary code, URLs or prices."""
     protected: dict[str, str] = {}
     prefix = f"\ue000{uuid4().hex}:"
@@ -110,9 +161,41 @@ def prepare_math_markdown(source: str) -> PreparedMath:
             return match.group()
         has_math = True
         display = match.group("display") is not None or match.group("bracket") is not None
-        return f"\n\n$$\n{body}\n$$\n\n" if display else f"${body}$"
+        rendered = protect(f"$$\n{body}\n$$") if display else protect(f"${body}$")
+        return f"\n\n{rendered}\n\n" if display else rendered
 
     text = _MATH.sub(normalise, text)
+    if truncated:
+        def unfinished(match: re.Match[str]) -> str:
+            delimiter, body = match.groups()
+            line_prefix = text[text.rfind("\n", 0, match.start()) + 1 : match.start()]
+            if prefix in body or not body.strip() or line_prefix.startswith(("    ", "\t")):
+                return match.group()
+            if delimiter == "$" and not (
+                re.match(r"[A-Za-z(\\]", body) and re.search(r"[=^_(){}\\]", body)
+            ):
+                return match.group()  # currency and ordinary unmatched dollar signs
+            try:
+                plain = convert(f"${body}$", latex_escape=False)[0]
+            except Exception:
+                plain = body
+            # Keep the fragment readable, without inventing missing terms/brackets.
+            return protect(plain)
+
+        text = re.sub(
+            r"(?<![\\$])(\$\$|\\\[|\\\(|\$)([^\n]*(?:\n(?!\s*\n)[^\n]+)*)",
+            unfinished, text,
+        )
+
+    def standalone(match: re.Match[str]) -> str:
+        nonlocal has_math
+        body = _plain_formula_latex(match[0])
+        if body is None:
+            return match[0]
+        has_math = True
+        return protect(f"\n\n$$\n{body}\n$$\n\n")
+
+    text = re.sub(r"(?m)^[^\n]+$", standalone, text)
     if has_math:
         text = re.sub(r"(?m)^ {0,3}\\[ \t]*(?=\n|$)", "", text)
 

@@ -15,7 +15,7 @@ from aiogram.types import Chat, InputRichMessage, Message, User
 from test_moderation import env as env
 from test_moderation import message as incoming_message
 
-from bot.math_formatting import MathRichChunk
+from bot.math_formatting import MathRichChunk, prepare_math_markdown, render_math_rich_chunks
 from bot.models import GeminiResult
 from bot.processor import MessageProcessor, _has_attachment_input
 
@@ -239,17 +239,32 @@ async def test_unavailable_business_peer_does_not_trigger_math_fallback(math_rep
     assert len(session.calls) == 1
 
 
-async def test_partial_ai_answer_has_readable_formulas_but_keeps_original_history(env):
+async def test_partial_ai_answer_keeps_native_latex_and_original_history(env):
     original = r"Часть решения: \[x=\frac{\pi}{4}\]. Ответ сокращён."
     env.processor.gemini.generate.return_value = GeminiResult(
         original, None, provider="openrouter", truncated=True
     )
     await env.processor.process([incoming_message("Реши уравнение").as_(env.bot)])
     delivered = env.processor.reply.await_args
-    assert "x=π/4" in delivered.args[1] and "\\frac" not in delivered.args[1]
-    assert delivered.kwargs["formatted"] is False
+    assert r"\frac{\pi}{4}" in delivered.args[1]
+    assert delivered.kwargs.get("formatted", True) is True
+    assert render_math_rich_chunks(delivered.args[1])
     cursor = await env.storage._connection().execute(
         "SELECT assistant_content FROM conversation_exchanges"
     )
     assert (await cursor.fetchone())[0] == original
     await cursor.close()
+
+
+async def test_partial_answer_sends_complete_equations_natively_and_keeps_limit_notice(
+    math_reply,
+):
+    processor, message, session = math_reply
+    source = "S_(k+1) = (k+1)²\n\nОтвет: $x=2$\n\nФрагмент: $(k+1)(k+2\n\n⚠️ Лимит."
+    prepared = prepare_math_markdown(source, truncated=True)
+    await processor.reply(message, prepared.markdown, controls=True)
+    assert all(isinstance(method, SendRichMessage) for method in session.calls)
+    html = "".join(method.rich_message.html for method in session.calls)
+    assert "<tg-math-block>" in html and "<tg-math>x=2</tg-math>" in html
+    assert "⚠️ Лимит." in html and "$(k+1)" not in html
+    assert session.calls[-1].reply_markup.inline_keyboard

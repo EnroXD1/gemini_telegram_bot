@@ -22,7 +22,7 @@ from .emoji_theme import EmojiTheme
 from .gemini import GeminiRequestError, GeminiService
 from .keyboards import answer_keyboard
 from .markdown import FormattedChunk, render_markdown_chunks
-from .math_formatting import MathRichChunk, readable_math_text, render_math_rich_chunks
+from .math_formatting import MathRichChunk, prepare_math_markdown, render_math_rich_chunks
 from .media import MediaExtractor
 from .models import ConversationMessage, PromptBundle
 from .rate_limit import SlidingWindowRateLimiter
@@ -243,8 +243,7 @@ class MessageProcessor:
                     return
                 sent = await self.reply(
                     lead,
-                    readable_math_text(result.text) if result.truncated else result.text,
-                    formatted=not result.truncated,
+                    prepare_math_markdown(result.text, truncated=result.truncated).markdown,
                     controls=True,
                 )
                 if not sent:
