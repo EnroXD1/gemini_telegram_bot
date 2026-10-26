@@ -29,6 +29,7 @@ from .gemini_response import (
     extract_interaction_text,
 )
 from .key_pool import KeyPool
+from .math_formatting import has_unfinished_math
 from .model_health import ModelHealth, error_label
 from .models import ConversationMessage, GeminiResult, MediaPayload, PromptBundle
 
@@ -925,7 +926,7 @@ class GeminiService:
         if error.status_code == 429 and self._key_pool(route.provider) is not None:
             # Key deadlines are authoritative; a route-level pause would hide healthy keys.
             return
-        model_missing = route.provider == "openrouter" and error.status_code == 404
+        model_missing = route.provider in {"openrouter", "groq"} and error.status_code == 404
         temporary_failure = (
             error.status_code in {408, 429, 500, 502, 503, 504} or error.transient_failure
         )
@@ -1634,7 +1635,7 @@ class GeminiService:
                     delete_after_seconds=20.0 if code == 429 else None,
                     provider="groq",
                     status_code=code,
-                    fallback_allowed=_allows_automatic_fallback(exc, code),
+                    fallback_allowed=code == 404 or _allows_automatic_fallback(exc, code),
                     quota_exhausted=_is_quota_error(exc, code),
                     fallback_reason=(
                         "blocked" if _is_safety_block_error(exc) else None
@@ -2156,8 +2157,9 @@ def _continuation_messages(
 
 
 def _merge_continuation(current: str, continuation: str) -> str:
-    current = current.strip()
-    continuation = continuation.strip()
+    math_is_open = has_unfinished_math(current)
+    current = current.lstrip() if math_is_open else current.strip()
+    continuation = continuation.rstrip() if math_is_open else continuation.strip()
     if not current:
         return continuation
     if not continuation:
@@ -2166,11 +2168,13 @@ def _merge_continuation(current: str, continuation: str) -> str:
     max_overlap = min(len(current), len(continuation), 2000)
     for overlap in range(max_overlap, 19, -1):
         if current[-overlap:] == continuation[:overlap]:
-            continuation = continuation[overlap:].lstrip()
+            continuation = continuation[overlap:]
+            if not math_is_open:
+                continuation = continuation.lstrip()
             break
     if not continuation:
         return current
-    return f"{current}\n\n{continuation}"
+    return current + continuation if math_is_open else f"{current}\n\n{continuation}"
 
 
 def _finish_text(text: str, truncated: bool) -> str:
@@ -2336,6 +2340,8 @@ def _friendly_openrouter_error(code: int | None) -> str:
 
 
 def _friendly_groq_error(code: int | None, *, is_fallback: bool = True) -> str:
+    if code == 404:
+        return "Выбранная модель Groq недоступна для этого ключа. Выберите другую модель."
     if not is_fallback:
         if code in {401, 403}:
             return (

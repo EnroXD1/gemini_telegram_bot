@@ -1141,6 +1141,22 @@ class GeminiServiceTests(unittest.IsolatedAsyncioTestCase):
                 content = service._openrouter_client.calls[0][1]["messages"][-1]["content"]
                 self.assertEqual(len(content), len(media) * 2 + 1)
 
+    async def test_groq_404_route_is_quarantined_before_next_text_request(self):
+        reply = {"choices": [{"message": {"content": "доступный резерв"}}]}
+        service = self.groq_vision_service(
+            FakeOpenRouterResponse({}, error_code=404),
+            FakeOpenRouterResponse(reply),
+            FakeOpenRouterResponse(reply),
+        )
+        service._settings.groq_fallback_models = ("openai/gpt-oss-120b",)
+        await service.generate(PromptBundle("вопрос"), None)
+        await service.generate(PromptBundle("вопрос 2"), None)
+        self.assertEqual(
+            [payload["model"] for _, payload in service._groq_client.calls],
+            ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "openai/gpt-oss-120b"],
+        )
+        self.assertGreater(service.cooldown_remaining("groq", "openai/gpt-oss-20b"), 0)
+
     async def test_disabled_groq_vision_has_clear_error_without_fallback(self):
         service = self.groq_vision_service()
         service._settings.groq_vision_model = ""

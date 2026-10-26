@@ -89,9 +89,9 @@ def test_groq_fallback_is_enabled_when_key_is_present(monkeypatch, tmp_path) -> 
     assert settings.groq_model == "openai/gpt-oss-20b"
     assert settings.groq_fallback_models == (
         "openai/gpt-oss-20b",
-        "llama-3.3-70b-versatile",
+        "openai/gpt-oss-120b",
     )
-    assert settings.groq_max_output_tokens == 1024
+    assert settings.groq_max_output_tokens == 2048
     assert settings.groq_vision_model == "qwen/qwen3.8-27b"
 
 
@@ -102,6 +102,14 @@ def test_groq_vision_model_can_be_overridden_or_disabled(monkeypatch, tmp_path, 
     monkeypatch.setenv("GROQ_API_KEY", "test-key")
     monkeypatch.setenv("GROQ_VISION_MODEL", model)
     assert Settings.from_env(tmp_path / "missing.env").groq_vision_model == model
+
+
+def test_explicit_economical_groq_token_limit_is_not_overridden(monkeypatch, tmp_path):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:test-token")
+    monkeypatch.setenv("AI_PROVIDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setenv("GROQ_MAX_OUTPUT_TOKENS", "1024")
+    assert Settings.from_env(tmp_path / "missing.env").groq_max_output_tokens == 1024
 
 
 @pytest.mark.parametrize("model", ["qwen/invalid model", "qwen/invalid\nmodel", "x" * 201])

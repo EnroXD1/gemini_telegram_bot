@@ -268,3 +268,21 @@ async def test_partial_answer_sends_complete_equations_natively_and_keeps_limit_
     assert "<tg-math-block>" in html and "<tg-math>x=2</tg-math>" in html
     assert "⚠️ Лимит." in html and "$(k+1)" not in html
     assert session.calls[-1].reply_markup.inline_keyboard
+
+
+@pytest.mark.parametrize("provider", ["google", "groq", "openrouter"])
+async def test_completed_bare_aligned_is_prepared_for_all_ai_providers(env, provider):
+    source = r"\begin{aligned}653&=2\cdot309+35\\309&=8\cdot35+29\end{aligned}"
+    env.processor.gemini.generate.return_value = GeminiResult(
+        source, None, provider=provider, truncated=False
+    )
+    await env.processor.process([incoming_message("Найди обратный элемент").as_(env.bot)])
+    delivered = env.processor.reply.await_args
+    assert delivered is not None and delivered.kwargs.get("formatted", True)
+    html = render_math_rich_chunks(delivered.args[1])[0].payload.html
+    assert "<tg-math-block>" in html and "653&amp;=2" in html
+    cursor = await env.storage._connection().execute(
+        "SELECT assistant_content FROM conversation_exchanges"
+    )
+    assert (await cursor.fetchone())[0] == source
+    await cursor.close()
